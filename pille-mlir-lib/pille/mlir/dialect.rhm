@@ -1,0 +1,460 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir
+  pille/mlir/smt
+  lib("pille/private/mlir/schema.rkt") as schema
+  lib("pille/private/mlir/query.rkt") as query
+
+meta import:
+  lib("pille/private/mlir/schema.rkt") as schema
+
+export:
+  dialect
+  declaration
+  constraint
+  semantic
+  bv
+  meta:
+    declaration_meta
+    constraint_meta
+    semantic_meta
+
+// Schema errors are reported at the form being expanded. An error that already
+// has a source location, such as one from a nested form, keeps it.
+meta fun at_source(stx :: Syntax, thunk :: Function):
+  try:
+    thunk()
+    ~catch
+    | exn :: Exn.Fail.Syntax:
+        throw exn
+    | exn :: Exn.Fail:
+        syntax_meta.error(exn.message, stx)
+
+// Compile-time descriptors are carried in packed syntax, rather than extracted
+// from printed source or inferred from arbitrary Rhombus runtime expressions.
+space.enforest constraint:
+  space_path pille/mlir/constraint
+  macro_definer macro
+  meta_namespace constraint_meta:
+    reflection space
+    description "MLIR schema constraint"
+    parse_syntax_class Parsed
+    private parsed_packer _pack
+    private parsed_unpacker _unpack
+
+    export fun pack(value) :: Term:
+      _pack(Syntax.make(schema.constraint_serialize(value)))
+
+    export fun unpack(term :: Term):
+      schema.constraint_deserialize(Syntax.unwrap(_unpack(term)))
+
+space.enforest declaration:
+  space_path pille/mlir/declaration
+  macro_definer macro
+  meta_namespace declaration_meta:
+    reflection space
+    description "MLIR dialect declaration"
+    parse_syntax_class Parsed
+    private parsed_packer _pack
+    private parsed_unpacker _unpack
+
+    export fun pack(value) :: Term:
+      _pack(Syntax.make(schema.member_serialize(value)))
+
+    export fun unpack(term :: Term):
+      schema.member_deserialize(Syntax.unwrap(_unpack(term)))
+
+// SMT semantic expressions have their own space. Its primitive macros produce
+// packed expression trees; each node keeps the syntax it came from so that a
+// later width or reference error can name its source. Operand, result, and
+// local names are not looked up here: the enclosing `operation` form binds
+// them in this space, so references resolve through ordinary lexical scope.
+space.enforest semantic:
+  space_path pille/mlir/semantic
+  macro_definer macro
+  meta_namespace semantic_meta:
+    reflection space
+    description "SMT semantic expression"
+    parse_syntax_class Parsed
+    identifier_parser:
+      fun (name):
+        syntax_meta.error("unknown operand, result, or local reference in SMT semantics", name)
+    private parsed_packer _pack
+    private parsed_unpacker _unpack
+
+    export fun pack(tree :: Syntax) :: Term:
+      _pack(tree)
+
+    export fun unpack(term :: Term) :: Syntax:
+      _unpack(term)
+
+export veneer Dialect(this :: satisfying(schema.is_dialect)):
+  constructor ~error
+
+  property name :: String:
+    schema.dialect_name(this)
+
+  property operation_names :: List:
+    schema.operation_names(this)
+
+  method to_irdl() :: String:
+    schema.dialect_irdl(this)
+
+  method operation_name(name :: ReadableString) :: String:
+    schema.operation_name(this, name)
+
+  // Operations that declare an SMT model.
+  property smt_operation_names :: List:
+    schema.smt_operation_names(this)
+
+  method module(source :: ReadableString,
+                ~toolchain: toolchain :: mlir.Toolchain = mlir.Toolchain()) :: mlir.Module:
+    mlir.Module(source, ~irdl: to_irdl(), ~toolchain: toolchain)
+
+  // Builds the query `preconditions && !property` for one function of a module
+  // verified against this dialect. A module keeps only MLIR and IRDL text, so
+  // the semantic model always comes from this dialect value: identical IRDL
+  // can carry different meanings, and there is no registry of operation names.
+  // ~inputs names every function argument, in argument order.
+  method smt_query(module :: mlir.Module,
+                   ~function: function :: ReadableString,
+                   ~inputs: inputs :: List.of(smt.Term) = [],
+                   ~property: property :: smt.Formula,
+                   ~preconditions: preconditions :: List.of(smt.Formula) = [],
+                   ~plugin: plugin :: maybe(Path || ReadableString) = #false) :: smt.Query:
+    query.make_smt_query(this, module, to_string(function), inputs, property, preconditions,
+                         plugin)
+
+// An alias binds a parsed constraint in its own space. Definition-site bindings
+// stay resolved when aliases and declaration macros are imported or renamed.
+export defn.macro 'constraint $(name :: Identifier): $(rhs :: constraint_meta.Parsed)':
+  '«constraint.macro '($name)':
+      '$rhs'»'
+
+export constraint.macro 'type_is($(text :: String))':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.type_is(text.unwrap())))
+
+// Attribute payloads use MLIR's literal syntax, e.g. attr_is("\"checked\"").
+export constraint.macro 'attr_is($(text :: String))':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.attribute_is(text.unwrap())))
+
+export constraint.macro 'any':
+  constraint_meta.pack(schema.any_constraint())
+
+export constraint.macro 'any_of($(item :: constraint_meta.Parsed), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.any_of([constraint_meta.unpack(item), ...])))
+
+export constraint.macro 'all_of($(item :: constraint_meta.Parsed), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.all_of([constraint_meta.unpack(item), ...])))
+
+export constraint.macro '$lhs || $rhs':
+  ~order: logical_disjunction
+  constraint_meta.pack(schema.any_of([constraint_meta.unpack(lhs), constraint_meta.unpack(rhs)]))
+
+export constraint.macro '$lhs && $rhs':
+  ~order: logical_conjunction
+  constraint_meta.pack(schema.all_of([constraint_meta.unpack(lhs), constraint_meta.unpack(rhs)]))
+
+export constraint.macro '#%parens($(item :: constraint_meta.Parsed))':
+  item
+
+export constraint.macro 'same($(name :: String), $(item :: constraint_meta.Parsed))':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.same(name.unwrap(), constraint_meta.unpack(item))))
+
+export constraint.macro 'type_ref($(name :: String), $(item :: constraint_meta.Parsed), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.parametric(
+    #'type, #false, name.unwrap(), [constraint_meta.unpack(item), ...])))
+
+export constraint.macro 'attr_ref($(name :: String), $(item :: constraint_meta.Parsed), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): constraint_meta.pack(schema.parametric(
+    #'attribute, #false, name.unwrap(), [constraint_meta.unpack(item), ...])))
+
+export constraint.macro 'i1': 'type_is("i1")'
+export constraint.macro 'i8': 'type_is("i8")'
+export constraint.macro 'i16': 'type_is("i16")'
+export constraint.macro 'i32': 'type_is("i32")'
+export constraint.macro 'i64': 'type_is("i64")'
+export constraint.macro 'index': 'type_is("index")'
+export constraint.macro 'f32': 'type_is("f32")'
+export constraint.macro 'f64': 'type_is("f64")'
+
+// Packed semantic trees:
+//   (ref [origin] kind index)        kind is "operand", "result", or "local"
+//   (const [origin] value width n)   a literal of an explicit width
+//   (const [origin] value like tree) a literal as wide as another expression
+//   (binary [origin] tag lhs rhs)    tag is "add", "sub", or "mul"
+//   (select [origin] lhs rhs then else)
+meta fun reference_node(origin :: Syntax, kind :: String, index :: Int) :: Term:
+  semantic_meta.pack('(ref [$origin] $kind $index)')
+
+meta fun binary_node(origin :: Syntax, tag :: String, arguments :: List.of(Syntax)) :: Term:
+  match arguments
+  | [lhs, rhs]:
+      semantic_meta.pack('(binary [$origin] $tag $(semantic_meta.unpack(lhs)) $(semantic_meta.unpack(rhs)))')
+  | ~else:
+      syntax_meta.error("bv." ++ tag ++ ": expected 2 arguments, received "
+                          ++ to_string(arguments.length()),
+                        origin)
+
+meta fun literal_value(origin :: Syntax, literal :: Syntax) :: Int:
+  match literal
+  | '$(value :: Int)': value.unwrap()
+  | '- $(value :: Int)': -value.unwrap()
+  | ~else: syntax_meta.error("bv.const: expected an integer literal", origin, literal)
+
+// Wrapping bitvector arithmetic. These are the primitives of the semantic
+// space; convenience macros expand to them through ordinary enforestation.
+namespace bv:
+  export:
+    add
+    sub
+    mul
+    const
+    if
+
+  semantic.macro 'add($(argument :: semantic_meta.Parsed), ...)':
+    ~all_stx: stx
+    binary_node(stx, "add", [argument, ...])
+
+  semantic.macro 'sub($(argument :: semantic_meta.Parsed), ...)':
+    ~all_stx: stx
+    binary_node(stx, "sub", [argument, ...])
+
+  semantic.macro 'mul($(argument :: semantic_meta.Parsed), ...)':
+    ~all_stx: stx
+    binary_node(stx, "mul", [argument, ...])
+
+  // The only choice: `then` where the two compared values are equal, `else`
+  // elsewhere. A comparison is written only here, as the test; it is not a
+  // value, so there is no Boolean to confuse with a one-bit bitvector.
+  semantic.macro
+  | 'if($lhs ... == $rhs ..., $then ..., $else ...)':
+      ~all_stx: stx
+      let [lhs, rhs, then, else]:
+        for List (part in ['$lhs ...', '$rhs ...', '$then ...', '$else ...']):
+          match part
+          | '$(parsed :: semantic_meta.Parsed)': semantic_meta.unpack(parsed)
+          | ~else: syntax_meta.error("bv.if: missing expression", stx)
+      semantic_meta.pack('(select [$stx] $lhs $rhs $then $else)')
+  | 'if $_ ...':
+      ~all_stx: stx
+      syntax_meta.error("bv.if: expected (left == right, then, else)", stx)
+
+  // A literal must state its width: an exact one, or that of another
+  // expression (typically an operand) or of the result. Its value must lie in
+  // [-2^(w-1), 2^w - 1]; a negative value denotes its two's complement residue.
+  semantic.macro
+  | 'const($literal ..., ~width: $(width :: Int))':
+      ~all_stx: stx
+      semantic_meta.pack('(const [$stx] $(literal_value(stx, '$literal ...')) width $width)')
+  | 'const($literal ..., ~like: $(target :: semantic_meta.Parsed))':
+      ~all_stx: stx
+      semantic_meta.pack('(const [$stx] $(literal_value(stx, '$literal ...')) like $(semantic_meta.unpack(target)))')
+  | 'const $_ ...':
+      ~all_stx: stx
+      syntax_meta.error("bv.const: expected (value, ~width: n) or (value, ~like: expression)", stx)
+
+export semantic.macro '#%parens($(item :: semantic_meta.Parsed))':
+  item
+
+export semantic.macro '#%literal $(literal :: Term)':
+  syntax_meta.error("a bare literal has no width; use bv.const(value, ~width: n) or bv.const(value, ~like: expression)",
+                    literal)
+
+meta syntax_class NamedConstraint:
+  kind: ~group
+| '$(name :: Identifier): $(item :: constraint_meta.Parsed)':
+    field entry = [to_string(name.unwrap()), constraint_meta.unpack(item)]
+    field id = name
+
+// Converts a packed tree to a schema expression. `record` remembers which
+// syntax each node came from, for errors found by the schema's validation.
+meta fun build_expression(tree :: Syntax,
+                          operands :: List.of(String),
+                          results :: List.of(String),
+                          record :: Function):
+  fun build(tree :: Syntax):
+    build_expression(tree, operands, results, record)
+  match tree
+  | '(ref [$origin ...] "operand" $(index :: Int))':
+      record(schema.sem_operand(operands[index.unwrap()]), '$origin ...')
+  | '(ref [$origin ...] "result" $(index :: Int))':
+      record(schema.sem_result(results[index.unwrap()]), '$origin ...')
+  | '(ref [$origin ...] "local" $(index :: Int))':
+      record(schema.sem_local(index.unwrap()), '$origin ...')
+  | '(const [$origin ...] $(value :: Int) width $(width :: Int))':
+      record(at_source('$origin ...',
+                       fun (): schema.sem_const_width(value.unwrap(), width.unwrap())),
+             '$origin ...')
+  | '(const [$origin ...] $(value :: Int) like $target)':
+      record(at_source('$origin ...',
+                       fun (): schema.sem_const_like(value.unwrap(), build(target))),
+             '$origin ...')
+  | '(binary [$origin ...] $(tag :: String) $lhs $rhs)':
+      record(schema.sem_binary(tag.unwrap(), build(lhs), build(rhs)), '$origin ...')
+  | '(select [$origin ...] $lhs $rhs $then $else)':
+      record(schema.sem_select(build(lhs), build(rhs), build(then), build(else)), '$origin ...')
+
+// Parses an `smt:` clause. Operands and results are bound as macros of the
+// semantic space inside a definition context, so a reference resolves exactly
+// as a Rhombus identifier would: a macro-introduced operand is not captured by
+// a same-spelled name from the macro's user, and an operand shadows an
+// imported semantic macro of the same name. Each `let` extends the context for
+// the statements after it.
+meta fun parse_semantics(stx :: Syntax,
+                         operation :: String,
+                         operands :: List, operand_ids :: List.of(Identifier),
+                         results :: List, result_ids :: List.of(Identifier),
+                         attributes :: List,
+                         statements :: List.of(Syntax)):
+  let operand_names :: List.of(String) = for List (entry :: List in operands): entry[0]
+  let result_names :: List.of(String) = for List (entry :: List in results): entry[0]
+  let context = syntax_meta.make_definition_context()
+  fun bind(name :: Identifier, kind :: String, index :: Int):
+    context.add_definitions('«semantic.macro '$name':
+                                 ~all_stx: use
+                                 reference_node(use, $kind, $index)»')
+  fun parse(expression :: Syntax) :: Syntax:
+    semantic_meta.unpack(
+      context.call_to_expand_using(
+        expression,
+        fun (expression):
+          match expression
+          | '$(parsed :: semantic_meta.Parsed)': parsed))
+  for (name in operand_ids, index in 0 ..):
+    bind(name, "operand", index)
+  for (name in result_ids, index in 0 ..):
+    bind(name, "result", index)
+  let mutable origins :: List = []
+  fun record(node, origin :: Syntax):
+    origins := [[node, origin], & origins]
+    node
+  fun build(expression :: Syntax, statement :: Syntax):
+    match expression
+    | '': syntax_meta.error("SMT semantics: missing expression after `=`", stx, statement)
+    | ~else: #void
+    // The statement is the most useful location for its outermost node.
+    record(build_expression(parse(expression), operand_names, result_names, record), statement)
+  let mutable bound :: List.of(Identifier) = operand_ids ++ result_ids
+  let mutable locals :: List = []
+  let mutable assignments :: List = []
+  let mutable requirements :: List = []
+  // The comparisons of one `requires`, split at each `||`.
+  fun alternatives(terms :: List.of(Syntax), statement :: Syntax) :: List:
+    let (done :: List, current :: List):
+      for values(done :: List = [], current :: List = []) (term in terms):
+        match term
+        | '||': values(done.add(current), [])
+        | ~else: values(done, current.add(term))
+    for List (comparison :: List in done.add(current)):
+      match (if comparison.length() == 0 | '' | '$(Syntax.make_group(comparison))')
+      | '$lhs ... == $rhs ...':
+          [build('$lhs ...', statement), build('$rhs ...', statement)]
+      | ~else:
+          syntax_meta.error("SMT semantics: expected `requires left == right || ...`",
+                            stx, statement)
+  for (statement in statements):
+    match statement
+    | 'let $(name :: Identifier) = $expression ...':
+        let value = build('$expression ...', statement)
+        when (for any (other in bound): syntax_meta.equal_name_and_scopes(name, other))
+        | syntax_meta.error("SMT semantics: local name is already an operand, result, or local",
+                            statement, name)
+        bind(name, "local", locals.length())
+        bound := bound.add(name)
+        locals := locals.add([to_string(name.unwrap()), value])
+    | 'requires $term ...':
+        requirements := requirements.add(alternatives([term, ...], statement))
+    | '$(name :: Identifier) = $expression ...':
+        let target:
+          match parse(name)
+          | '(ref $_ "result" $(index :: Int))': result_names[index.unwrap()]
+          | '(ref $_ "operand" $(index :: Int))': operand_names[index.unwrap()]
+          | ~else:
+              syntax_meta.error("SMT semantics: cannot assign to a local; assign to a result",
+                                statement, name)
+        assignments := assignments.add([target, build('$expression ...', statement)])
+    | ~else:
+        syntax_meta.error("SMT semantics: expected `let name = expression`, `requires left == right`, or `result = expression`",
+                          stx, statement)
+  try:
+    schema.operation_def(operation, operands, results, attributes,
+                         schema.make_semantics(locals, assignments, requirements))
+    ~catch
+    | exn :: Exn.Fail.Syntax:
+        throw exn
+    | exn :: Exn.Fail:
+        let node = schema.semantic_error_node(exn)
+        let origin:
+          for any (entry :: List in origins):
+            node && entry[0] === node && entry[1]
+        syntax_meta.error(exn.message, origin || stx)
+
+// An operation body holds at most one `attributes(...)` clause and at most one
+// `smt:` clause, in either order.
+meta fun make_operation(stx :: Syntax,
+                        name :: Identifier,
+                        operands :: List, operand_ids :: List.of(Identifier),
+                        results :: List, result_ids :: List.of(Identifier),
+                        clauses :: List.of(Syntax)):
+  let operation = to_string(name.unwrap())
+  let (attributes, statements):
+    for values(attributes = #false, statements = #false) (clause in clauses):
+      match clause
+      | 'attributes($(item :: NamedConstraint), ...)':
+          when attributes
+          | syntax_meta.error("duplicate attributes clause", stx, clause)
+          values([item.entry, ...], statements)
+      | 'smt: $statement; ...':
+          when statements
+          | syntax_meta.error("duplicate smt clause", stx, clause)
+          values(attributes, [statement, ...])
+      | ~else:
+          syntax_meta.error("expected an attributes(...) clause or an smt: clause", stx, clause)
+  // Check the signature on its own first, so that structural errors are
+  // reported as such before any semantic expression is parsed.
+  let structure:
+    at_source(stx, fun (): schema.operation_def(operation, operands, results, attributes || []))
+  declaration_meta.pack(
+    if statements
+    | parse_semantics(stx, operation, operands, operand_ids, results, result_ids,
+                      attributes || [], statements)
+    | structure)
+
+export declaration.macro 'type $(name :: Identifier)($(param :: NamedConstraint), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): declaration_meta.pack(schema.type_def(to_string(name.unwrap()), [param.entry, ...])))
+
+export declaration.macro 'attribute $(name :: Identifier)($(param :: NamedConstraint), ...)':
+  ~all_stx: stx
+  at_source(stx, fun(): declaration_meta.pack(schema.attribute_def(to_string(name.unwrap()), [param.entry, ...])))
+
+export declaration.macro
+| 'operation $(name :: Identifier)($(operand :: NamedConstraint), ...) -> ($(result :: NamedConstraint), ...):
+     $clause
+     ...':
+    ~all_stx: stx
+    make_operation(stx, name, [operand.entry, ...], [operand.id, ...],
+                   [result.entry, ...], [result.id, ...], [clause, ...])
+| 'operation $(name :: Identifier)($(operand :: NamedConstraint), ...) -> ($(result :: NamedConstraint), ...)':
+    ~all_stx: stx
+    make_operation(stx, name, [operand.entry, ...], [operand.id, ...],
+                   [result.entry, ...], [result.id, ...], [])
+
+// The enclosing form expands every declaration through its space, validates
+// their shared model, and generates IRDL at expansion time. Embedding a portable
+// descriptor avoids expansion-time files, subprocesses, and global registries.
+export defn.macro 'dialect $(name :: Identifier)($(namespace :: String)):
+                     $(member :: declaration_meta.Parsed); ...':
+  ~all_stx: stx
+  let definition = at_source(stx, fun(): schema.make_dialect(namespace.unwrap(), [declaration_meta.unpack(member), ...]))
+  let serialized = schema.dialect_serialize(definition)
+  'def $name :: Dialect = schema.dialect_deserialize($serialized)'

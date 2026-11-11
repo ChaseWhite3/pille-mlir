@@ -1,0 +1,37 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir/dialect open
+
+export constraint Integer: same("T", i32 || i64)
+
+// These names are deliberately reused, with other meanings, by hygiene.rhm.
+// Each macro below must keep referring to the definitions in this module.
+export semantic.macro 'step($(value :: semantic_meta.Parsed))':
+  'bv.const(1, ~like: $value)'
+
+export semantic.macro 'advance($(value :: semantic_meta.Parsed))':
+  'bv.add($value, step($value))'
+
+// Expands through `advance` twice, and through `step` inside each.
+export semantic.macro 'advance_twice($(value :: semantic_meta.Parsed))':
+  'advance(advance($value))'
+
+// The operand `value` and its reference are both introduced here, so they
+// resolve to each other regardless of names at the use site.
+export declaration.macro 'unary $(name :: Identifier): $meaning':
+  'operation $name(value: Integer) -> (out: Integer):
+     smt:
+       out = $meaning(value)'
+
+export declaration.macro 'counter $(name :: Identifier)':
+  'operation $name(value: Integer) -> (out: Integer):
+     smt:
+       let next = advance(value)
+       out = advance(next)'
+
+// The caller supplies the operand names and the expression that uses them.
+export declaration.macro 'binary $(name :: Identifier)($(lhs :: Identifier), $(rhs :: Identifier)): $meaning ...':
+  'operation $name($lhs: Integer, $rhs: Integer) -> (out: Integer):
+     smt:
+       out = $meaning ...'

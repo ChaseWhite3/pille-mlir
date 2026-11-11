@@ -1,0 +1,13 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+  "macros.rhm" as macros
+
+constraint Integer: f64
+
+export dialect hygienic("hygienic"):
+  macros.binary add
+  operation local(value: Integer) -> (result: Integer)
+
+export def generated = hygienic.to_irdl()

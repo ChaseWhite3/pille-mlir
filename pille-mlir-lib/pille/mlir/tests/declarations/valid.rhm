@@ -1,0 +1,25 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+// A declaration's expansion supplies the complete IRDL schema. No MLIR
+// installation is needed to import this module or generate its definitions.
+export dialect arithmetic("rhombus"):
+  type word(element: any_of(i32, i64))
+  attribute mode(value: attr_is("\"checked\""))
+  operation add(lhs: same("T", any_of(i32, i64)), rhs: same("T", any_of(i32, i64))) -> (sum: same("T", any_of(i32, i64)))
+  operation annotate(value: type_ref("word", i32)) -> (result: type_ref("word", i32)):
+    attributes(mode: attr_ref("mode", any))
+  // Repeating a structural constraint does not itself unify the operands.
+  operation independent(lhs: any_of(i32, i64), rhs: any_of(i32, i64)) -> ()
+  operation narrow(value: all_of(any_of(i32, i64), i32)) -> (result: i32)
+  // && binds more tightly than ||; parentheses override that precedence.
+  operation precedence(value: i32 || i64 && i32) -> ()
+  operation grouped(value: (i32 || i64) && i64) -> ()
+
+export def generated = arithmetic.to_irdl()
+export def dialect_name = arithmetic.name
+export def add_name = arithmetic.operation_name("add")
+export fun parse_program(source :: ReadableString):
+  arithmetic.module(source).to_ir()

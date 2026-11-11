@@ -1,0 +1,46 @@
+#lang rhombus/static
+
+import:
+  pille/mlir
+  rhombus/envvar
+
+// Optionally use the example native lowering plugin (see the package README).
+def plugin = envvar.getenv("PILLE_MLIR_ADD_PLUGIN")
+def plugins = if plugin | [plugin] | []
+def toolchain = mlir.Toolchain(~pass_plugins: plugins)
+
+// IRDL loads an actual dialect with a verifier. The same %integer constraint
+// requires both operands and the result to have the same i32 or i64 type.
+def dialect_definition = @str|{
+  module {
+    irdl.dialect @rhombus {
+      irdl.operation @add {
+        %i32 = irdl.is i32
+        %i64 = irdl.is i64
+        %integer = irdl.any_of(%i32, %i64)
+        irdl.operands(lhs: %integer, rhs: %integer)
+        irdl.results(sum: %integer)
+      }
+    }
+  }
+}|
+
+def custom_module = mlir.Module(@str|{
+  module {
+    func.func @add(%lhs: i32, %rhs: i32) -> i32 {
+      %sum = "rhombus.add"(%lhs, %rhs) : (i32, i32) -> i32
+      return %sum : i32
+    }
+  }
+}|, ~irdl: dialect_definition, ~toolchain: toolchain)
+
+// Each pass invocation retains the dialect definition and verifies the result.
+if plugin
+| println(custom_module.run_passes(
+    "builtin.module(pille-lower-add,convert-arith-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)"
+  ).to_llvm_ir())
+| println(custom_module.run_passes("builtin.module(canonicalize)").to_ir())
+
+// IRDL describes the operation's shape, not its executable semantics. A custom
+// lowering pass (such as the optional plugin) is needed for LLVM translation.
+// See add.rhm for a complete standard-dialect -> LLVM IR example.

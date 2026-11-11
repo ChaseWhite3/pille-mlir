@@ -1,0 +1,7 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  type Word(element: i32)

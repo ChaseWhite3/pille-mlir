@@ -1,0 +1,7 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation bad(value: type_ref("missing_type")) -> ()

@@ -1,0 +1,7 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation bad(lhs: same("T", i32), rhs: same("T", i64)) -> ()

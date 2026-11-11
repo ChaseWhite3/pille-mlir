@@ -1,0 +1,15 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir/dialect open
+
+// The operands are introduced by the macro. A same-spelled name written by the
+// macro's user is a different identifier and must not be captured.
+declaration.macro 'fixed $(name :: Identifier): $meaning ...':
+  'operation $name(lhs: i32, rhs: i32) -> (out: i32):
+     smt:
+       out = $meaning ...'
+
+dialect invalid("invalid"):
+  fixed bad: bv.add(lhs, // <- error
+                    rhs)

@@ -1,0 +1,228 @@
+#lang rhombus/static
+
+import:
+  pille/mlir
+  lib("pille/private/mlir/query.rkt") as query
+  lib("pille/private/mlir/solver.rkt") as solver
+  lib("pille/private/mlir/tools.rkt") as tools
+
+export:
+  Term
+  Formula
+  Query
+  Assignment
+  Outcome
+  Proved
+  Counterexample
+  Unknown
+  Timeout
+  Failure
+  input
+  result
+  const
+  add
+  sub
+  mul
+  eq
+  not
+  and
+  or
+  build_plugin
+
+// A bitvector-sorted value with an exact width. Terms and Boolean predicates
+// are separate sorts: a one-bit term is never usable as a predicate.
+veneer Term(this :: satisfying(query.is_term)):
+  constructor ~error
+
+  property width :: Int:
+    query.term_width(this)
+
+  method describe() :: String:
+    query.render_term(this)
+
+// An SMT Boolean predicate over terms.
+veneer Formula(this :: satisfying(query.is_formula)):
+  constructor ~error
+
+  method describe() :: String:
+    query.render_formula(this)
+
+// A function argument. Its position is its index in a query's ~inputs list;
+// the name is how counterexamples report it.
+fun input(name :: ReadableString, ~width: width :: Int) :: Term:
+  query.smt_input(to_string(name), width)
+
+// The value returned by the selected function.
+fun result(~width: width :: Int) :: Term:
+  query.smt_result(width)
+
+// A typed literal in [-2^(w-1), 2^w - 1]; negative values denote their two's
+// complement residue. Out-of-range values are rejected.
+fun const(value :: Int, ~width: width :: Int) :: Term:
+  query.smt_const(value, width)
+
+// Wrapping arithmetic on terms of equal width. Sorts are checked by the
+// builder so that a mistake names both operands.
+fun add(lhs, rhs) :: Term:
+  query.smt_binary(#'add, lhs, rhs)
+
+fun sub(lhs, rhs) :: Term:
+  query.smt_binary(#'sub, lhs, rhs)
+
+fun mul(lhs, rhs) :: Term:
+  query.smt_binary(#'mul, lhs, rhs)
+
+fun eq(lhs, rhs) :: Formula:
+  query.smt_eq(lhs, rhs)
+
+fun not(operand) :: Formula:
+  query.smt_not(operand)
+
+fun and(operand, ...) :: Formula:
+  query.smt_and([operand, ...])
+
+fun or(operand, ...) :: Formula:
+  query.smt_or([operand, ...])
+
+// Builds the native lowering plugin against the toolchain's own MLIR
+// installation and returns the plugin's path. Nothing calls this implicitly.
+fun build_plugin(directory :: Path || ReadableString,
+                 ~toolchain: toolchain :: mlir.Toolchain = mlir.Toolchain()) :: Path:
+  tools.build_smt_plugin(directory, toolchain)
+
+class Assignment(name :: String, width :: Int, value :: Int):
+  method describe() :: String:
+    name ++ " = " ++ query.render_term(query.smt_const(value, width))
+
+// What a solver run established. Only `Proved` means that no counterexample
+// exists, and even then only under the query's model and assumptions.
+//
+// `function`, `dialect`, `property`, and `assumptions` restate what was asked;
+// `smtlib` is the exact query text and `command` the solver invocation, which
+// together reproduce the run. `diagnostics` holds anything the solver printed.
+class Outcome(function :: String,
+              dialect :: String,
+              property :: String,
+              assumptions :: List.of(String),
+              smtlib :: String,
+              diagnostics :: String,
+              command :: List.of(String)):
+  nonfinal
+
+  property is_proved :: Boolean: #false
+
+  method subject() :: String:
+    "`" ++ property ++ "` for @" ++ function
+      ++ " under the declared SMT semantics of dialect " ++ dialect
+
+  method describe() :: String:
+    "no result for " ++ subject()
+
+// The solver answered `unsat`: no input satisfies the assumptions while
+// violating the property. With assumptions this is an implication, and
+// inconsistent assumptions make it hold vacuously.
+class Proved():
+  extends Outcome
+
+  override property is_proved :: Boolean: #true
+
+  // False when the proof depends on caller-supplied preconditions.
+  property is_unconditional :: Boolean: assumptions.length() == 0
+
+  override method describe() :: String:
+    if is_unconditional
+    | "proved for all inputs: " ++ subject()
+    | "proved only under " ++ to_string(assumptions.length()) ++ " assumption(s) ["
+        ++ String.join(assumptions, "; ") ++ "]: " ++ subject()
+
+// The solver answered `sat` and reported a complete model. `values` holds one
+// assignment per function argument, in argument order.
+class Counterexample(values :: List.of(Assignment)):
+  extends Outcome
+
+  override method describe() :: String:
+    "counterexample ["
+      ++ String.join(for List (value in values): value.describe(), ", ")
+      ++ "] to " ++ subject()
+      ++ (if assumptions.length() == 0
+          | ""
+          | " (satisfying [" ++ String.join(assumptions, "; ") ++ "])")
+
+// The solver answered `unknown`: neither a proof nor a counterexample.
+class Unknown():
+  extends Outcome
+
+  override method describe() :: String:
+    "the solver could not decide " ++ subject()
+
+// The solver exceeded `seconds` and was terminated.
+class Timeout(seconds :: Real):
+  extends Outcome
+
+  override method describe() :: String:
+    "the solver exceeded " ++ to_string(seconds) ++ " second(s) on " ++ subject()
+
+// The solver could not be run or its answer could not be trusted. `kind` is
+// #'missing_executable, #'nonzero_exit, #'malformed_response, or #'bad_model.
+class Failure(kind :: Symbol):
+  extends Outcome
+
+  override method describe() :: String:
+    "solver failure (" ++ to_string(kind) ++ ") on " ++ subject() ++ ": " ++ diagnostics
+
+// A verified SMT dialect query: `preconditions && !property` over one function
+// under one dialect's declared model. Constructing a query never runs a solver.
+veneer Query(this :: satisfying(query.is_query)):
+  constructor ~error
+
+  // The verified SMT dialect module; it contains no custom operations.
+  property module :: mlir.Module:
+    query.query_module(this)
+
+  property function :: String:
+    query.query_function(this)
+
+  // The dialect whose declared semantics the query is relative to.
+  property dialect :: String:
+    query.query_dialect(this)
+
+  // [[name, width], ...] in argument order.
+  property inputs :: List:
+    query.query_inputs(this)
+
+  property property :: String:
+    query.render_formula(query.query_property(this))
+
+  // The preconditions, as text. A proof holds only under these.
+  property assumptions :: List.of(String):
+    query.query_assumptions(this)
+
+  // The exact SMT-LIB text given to a solver by `check`.
+  method to_smtlib() :: String:
+    query.query_smtlib(this)
+
+  // Runs a solver. This is the only operation here that starts one.
+  method check(~solver: executable :: maybe(Path || ReadableString) = #false,
+               ~timeout: timeout :: PosReal = 10,
+               ~arguments: arguments :: List.of(ReadableString) = []) :: Outcome:
+    let answer = query.query_check(this, executable, timeout,
+                                   for List (argument in arguments): to_string(argument))
+    let diagnostics :: String = solver.solver_result_diagnostics(answer)
+    let command :: List = solver.solver_result_command_line(answer)
+    fun outcome(make, extra, ...) :: Outcome:
+      make(function, dialect, property, assumptions, to_smtlib(), diagnostics, command,
+           extra, ...)
+    match solver.solver_result_status(answer)
+    | #'unsat: outcome(Proved)
+    | #'sat:
+        outcome(Counterexample,
+                for List (entry in (solver.solver_result_assignments(answer) :~ List)):
+                  let [name, width, value] = entry
+                  Assignment(name, width, value))
+    | #'unknown: outcome(Unknown)
+    | #'timeout: outcome(Timeout, timeout)
+    | #'#{missing-executable}: outcome(Failure, #'missing_executable)
+    | #'#{nonzero-exit}: outcome(Failure, #'nonzero_exit)
+    | #'#{malformed-response}: outcome(Failure, #'malformed_response)
+    | #'#{bad-model}: outcome(Failure, #'bad_model)
+

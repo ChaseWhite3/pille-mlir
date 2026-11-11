@@ -1,0 +1,29 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir/dialect open
+  "macros.rhm" as macros
+
+// The same spellings as the definition-site bindings in macros.rhm.
+constraint Integer: i8
+
+semantic.macro 'step($(value :: semantic_meta.Parsed))':
+  'bv.const(2, ~like: $value)'
+
+semantic.macro 'advance($(value :: semantic_meta.Parsed))':
+  'bv.sub($value, step($value))'
+
+export dialect hygienic("hygienic"):
+  macros.unary imported: macros.advance
+  macros.unary nested: macros.advance_twice
+  macros.counter counted
+  // The consumer's own bindings apply to the consumer's own declarations.
+  operation local(value: Integer) -> (out: Integer):
+    smt:
+      out = advance(value)
+  // Use-site names reach a use-site expression through the macro.
+  macros.binary supplied(first, second): bv.sub(second, first)
+  // An operand shadows a same-spelled semantic macro inside its own model.
+  operation shadowed(step: Integer, advance: Integer) -> (out: Integer):
+    smt:
+      out = bv.mul(step, advance)

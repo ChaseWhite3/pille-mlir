@@ -1,0 +1,39 @@
+#lang rhombus/static
+
+import:
+  lib("pille/private/mlir/tools.rkt") as tools
+
+// Resolve one installation and capture optional native extensions for mlir-opt.
+// Importing this module does not require an installed toolchain.
+export veneer Toolchain(this :: satisfying(tools.is_toolchain)):
+  constructor(
+    ~prefix: prefix :: maybe(Path || ReadableString) = #false,
+    ~dialect_plugins: dialect_plugins :: Listable.to_list && [Path || ReadableString, ...] = [],
+    ~pass_plugins: pass_plugins :: Listable.to_list && [Path || ReadableString, ...] = [],
+  ):
+    tools.make_toolchain(prefix, dialect_plugins, pass_plugins)
+
+// Values hold immutable, verified textual MLIR plus their IRDL definitions.
+export veneer Module(this :: satisfying(tools.is_module)):
+  constructor(
+    source :: ReadableString,
+    ~irdl: irdl :: ReadableString = "",
+    ~toolchain: toolchain :: Toolchain = Toolchain(),
+  ):
+    tools.parse_module(source, irdl, toolchain)
+
+  method to_ir() :: String:
+    tools.module_ir(this)
+
+  method run_passes(pipeline :: ReadableString) :: Module:
+    tools.run_passes(this, pipeline)
+
+  method to_llvm_ir() :: String:
+    tools.to_llvm_ir(this)
+
+  method to_bitcode() :: ImmutableBytes:
+    tools.to_bitcode(this)
+
+  // Emits SMT-LIB for a solver; it does not invoke a solver.
+  method to_smtlib() :: String:
+    tools.to_smtlib(this)

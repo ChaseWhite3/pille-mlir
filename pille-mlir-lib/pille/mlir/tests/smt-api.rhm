@@ -1,0 +1,170 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir
+  pille/mlir/dialect open
+  pille/mlir/smt
+  lib("pille/mlir/tests/smt-support.rkt") as support
+
+// Exercises the public static-language API end to end. Like the integration
+// tests, this requires MLIR, the query plugin, and Z3 (z3 on PATH or PILLE_Z3).
+def plugin :: Path = support.smt_plugin()
+
+constraint Integer:
+  same("T", i32 || i64)
+
+dialect arithmetic("arithmetic"):
+  operation add(lhs: Integer, rhs: Integer) -> (sum: Integer):
+    smt:
+      sum = bv.add(lhs, rhs)
+  operation sub(lhs: Integer, rhs: Integer) -> (difference: Integer):
+    smt:
+      difference = bv.sub(lhs, rhs)
+  operation annotate(value: Integer) -> (result: Integer):
+    attributes(mode: attr_is("\"checked\""))
+
+check arithmetic.operation_names ~is ["arithmetic.add", "arithmetic.sub", "arithmetic.annotate"]
+check arithmetic.smt_operation_names ~is ["arithmetic.add", "arithmetic.sub"]
+
+def program :: mlir.Module = arithmetic.module(@str|{
+  module {
+    func.func @round_trip(%x: i32, %y: i32) -> i32 {
+      %sum = "arithmetic.add"(%x, %y) : (i32, i32) -> i32
+      %difference = "arithmetic.sub"(%sum, %y) : (i32, i32) -> i32
+      return %difference : i32
+    }
+    func.func @successor(%x: i32) -> i32 {
+      %one = arith.constant 1 : i32
+      %next = "arithmetic.add"(%x, %one) : (i32, i32) -> i32
+      return %next : i32
+    }
+    func.func @annotated(%x: i32) -> i32 {
+      %out = "arithmetic.annotate"(%x) {mode = "checked"} : (i32) -> i32
+      return %out : i32
+    }
+  }
+}|)
+
+def x :: smt.Term = smt.input("x", ~width: 32)
+def y :: smt.Term = smt.input("y", ~width: 32)
+def result :: smt.Term = smt.result(~width: 32)
+
+check x.width ~is 32
+check x.describe() ~is "x"
+check smt.add(x, smt.const(-1, ~width: 32)).describe() ~is "(x + 0xffffffff:bv32)"
+check smt.eq(result, smt.mul(x, y)).describe() ~is "result == (x * y)"
+check:
+  smt.and(smt.eq(x, y), smt.not(smt.eq(result, x))).describe()
+  ~is "(x == y && !(result == x))"
+check smt.or(smt.eq(x, y)).describe() ~is "x == y"
+
+// Terms and predicates are different sorts, and widths are never converted.
+check smt.not(x) ~throws "expected a Boolean predicate"
+check smt.eq(smt.eq(x, y), x) ~throws "expected bitvector terms"
+check smt.eq(x, smt.input("wide", ~width: 64)) ~throws "width mismatch"
+check smt.const(256, ~width: 8) ~throws "does not fit in 8 bits"
+check smt.input("x", ~width: 24) ~throws "unsupported bitvector width 24"
+check smt.input("check-sat", ~width: 32) ~throws "invalid input name"
+
+// A true property: the query is a verified SMT module, exported and then
+// checked by a solver only on request.
+def round_trip :: smt.Query = arithmetic.smt_query(program,
+                                                   ~function: "round_trip",
+                                                   ~inputs: [x, y],
+                                                   ~property: smt.eq(result, x),
+                                                   ~plugin: plugin)
+check round_trip.function ~is "round_trip"
+check round_trip.dialect ~is "arithmetic"
+check round_trip.inputs ~is [["x", 32], ["y", 32]]
+check round_trip.property ~is "result == x"
+check round_trip.assumptions ~is []
+check round_trip.module.to_smtlib() ~is round_trip.to_smtlib()
+check round_trip.module.to_ir().contains("arithmetic.") ~is #false
+check round_trip.to_smtlib().contains("(set-logic QF_BV)") ~is #true
+
+def proved :: smt.Outcome = round_trip.check(~timeout: 30)
+check proved ~is_a smt.Proved
+check proved.is_proved ~is #true
+check proved.smtlib ~is round_trip.to_smtlib()
+check proved.assumptions ~is []
+check:
+  proved.describe()
+  ~is "proved for all inputs: `result == x` for @round_trip under the declared SMT semantics of dialect arithmetic"
+match proved
+| unconditional :: smt.Proved:
+    check unconditional.is_unconditional ~is #true
+| ~else:
+    check "an unsat answer is a proof" ~is #false
+
+// A false property: the counterexample names the caller's inputs.
+def successor = arithmetic.smt_query(program,
+                                     ~function: "successor",
+                                     ~inputs: [x],
+                                     ~property: smt.eq(result, x),
+                                     ~plugin: plugin)
+match successor.check()
+| refuted :: smt.Counterexample:
+    check refuted.is_proved ~is #false
+    check refuted.values.length() ~is 1
+    let assignment = refuted.values[0]
+    check [assignment.name, assignment.width] ~is ["x", 32]
+    // Replay: in 32 bits, x + 1 differs from x.
+    check (assignment.value + 1) mod (2 ** 32) == assignment.value ~is #false
+    check refuted.describe().contains("counterexample [x = 0x") ~is #true
+    check refuted.command[refuted.command.length() - 1] ~is "<query.smt2>"
+| ~else:
+    check "a sat answer is a counterexample" ~is #false
+
+// With inconsistent preconditions the same false property is "proved"
+// vacuously. The outcome says so instead of presenting it as unconditional.
+def vacuous = arithmetic.smt_query(
+  program,
+  ~function: "successor",
+  ~inputs: [x],
+  ~property: smt.eq(result, x),
+  ~preconditions: [smt.eq(x, smt.const(0, ~width: 32)), smt.eq(x, smt.const(1, ~width: 32))],
+  ~plugin: plugin
+)
+check vacuous.assumptions ~is ["x == 0x00000000:bv32", "x == 0x00000001:bv32"]
+match vacuous.check()
+| conditional :: smt.Proved:
+    check conditional.is_unconditional ~is #false
+    check conditional.assumptions ~is vacuous.assumptions
+    check:
+      conditional.describe()
+      ~is ("proved only under 2 assumption(s) [x == 0x00000000:bv32; x == 0x00000001:bv32]: "
+             ++ "`result == x` for @successor under the declared SMT semantics of dialect arithmetic")
+| ~else:
+    check "inconsistent assumptions give unsat" ~is #false
+
+// Operational outcomes are values, not proofs.
+def missing = successor.check(~solver: "/pille-test/no-such-z3")
+check missing ~is_a smt.Failure
+check missing.is_proved ~is #false
+match missing
+| failure :: smt.Failure:
+    check failure.kind ~is #'missing_executable
+    check failure.describe().contains("solver failure (missing_executable)") ~is #true
+| ~else:
+    check "a missing solver is a failure" ~is #false
+
+// Boundaries: a schema-only operation, an unrelated module, and a missing plugin.
+check:
+  arithmetic.smt_query(program, ~function: "annotated", ~inputs: [x],
+                       ~property: smt.eq(result, x), ~plugin: plugin)
+  ~throws "operation 'arithmetic.annotate' has no declared SMT semantics"
+
+check:
+  arithmetic.smt_query(mlir.Module("module {}"), ~function: "f",
+                       ~property: smt.eq(result, result), ~plugin: plugin)
+  ~throws "was not verified against dialect arithmetic's generated IRDL"
+
+check:
+  arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
+                       ~property: smt.eq(result, y), ~plugin: plugin)
+  ~throws "refers to input y, which is not among the declared inputs"
+
+check:
+  arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
+                       ~property: smt.eq(result, x), ~plugin: "/pille-test/missing.so")
+  ~throws "cannot find the SMT query plugin"

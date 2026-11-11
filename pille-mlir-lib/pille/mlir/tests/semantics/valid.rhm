@@ -1,0 +1,85 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir/dialect open
+
+// Importing this module and reading its descriptors needs no MLIR, plugin, or
+// solver. The integration tests lower programs that use these dialects.
+constraint Integer:
+  same("T", i1 || i8 || i16 || i32 || i64)
+
+declaration.macro 'binary $(name :: Identifier): $meaning':
+  'operation $name(lhs: Integer, rhs: Integer) -> (out: Integer):
+     smt:
+       out = $meaning(lhs, rhs)'
+
+export dialect arithmetic("arithmetic"):
+  binary add: bv.add
+  binary sub: bv.sub
+  binary mul: bv.mul
+  // Literals take an operand's width, so one model serves every width.
+  operation increment(value: Integer) -> (out: Integer):
+    smt:
+      out = bv.add(value, bv.const(1, ~like: value))
+  operation minus_one() -> (out: Integer):
+    smt:
+      out = bv.const(-1, ~like: out)
+  // Locals and operands may be used any number of times.
+  operation square_of_sum(lhs: Integer, rhs: Integer) -> (out: Integer):
+    smt:
+      let sum = bv.add(lhs, rhs)
+      out = bv.mul(sum, sum)
+  operation forty_two() -> (out: i8):
+    smt:
+      out = bv.const(42, ~width: 8)
+  // Schema-only: structurally valid, but unusable in an SMT query.
+  operation opaque(value: Integer) -> (out: Integer)
+  // Equal-looking constraints are independent, so instances may mix widths.
+  // The model is accepted here and checked for each concrete instance.
+  operation loose(lhs: i32 || i64, rhs: i32 || i64) -> (out: i32 || i64):
+    smt:
+      out = bv.add(lhs, rhs)
+  operation anything(lhs: any, rhs: any) -> (out: any):
+    smt:
+      out = bv.add(lhs, rhs)
+
+// A second namespace with differently named operations. `plus` has the same
+// model as `arithmetic.add`; `affine` is a model of its own.
+export dialect vectorless("second"):
+  operation plus(a: Integer, b: Integer) -> (c: Integer):
+    smt:
+      c = bv.add(a, b)
+  operation affine(x: Integer, y: Integer) -> (z: Integer):
+    smt:
+      let doubled = bv.mul(x, bv.const(2, ~like: x))
+      z = bv.sub(bv.add(doubled, y), bv.const(3, ~like: y))
+  // A literal may take its width from any expression; only the width is used.
+  operation offset(x: Integer, y: Integer) -> (z: Integer):
+    smt:
+      z = bv.add(x, bv.const(5, ~like: bv.mul(x, y)))
+
+// A choice: `then` where the compared values are equal, `else` elsewhere.
+export dialect choice("choice"):
+  operation toggle(value: Integer) -> (out: Integer):
+    smt:
+      let zero = bv.const(0, ~like: value)
+      out = bv.if(value == zero, bv.const(1, ~like: value), zero)
+
+  // A model may require something of its operands. A query proves it of every
+  // use, together with the property asked about.
+  operation predecessor(value: Integer) -> (out: Integer):
+    smt:
+      let one = bv.const(1, ~like: value)
+      requires value == one || value == bv.const(2, ~like: value)
+      out = bv.sub(value, one)
+
+// Two dialect values with the same namespace, operation name, and IRDL, but
+// different meanings. Only the dialect value given to a query selects a model.
+export dialect twin_add("twin"):
+  binary combine: bv.add
+
+export dialect twin_sub("twin"):
+  binary combine: bv.sub
+
+export def irdl = arithmetic.to_irdl()
+export def modeled = arithmetic.smt_operation_names

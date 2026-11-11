@@ -1,0 +1,59 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+  pille/mlir/schema
+
+// The run-time builders produce the same descriptors as the declaration
+// forms. Nothing here needs MLIR or a solver.
+dialect declared("sample"):
+  type word(element: i32 || i64)
+  attribute mode(value: any)
+  operation add(lhs: same("T", i32 || i64), rhs: same("T", i32 || i64)) -> (sum: same("T", i32 || i64)):
+    smt:
+      let twice = bv.add(lhs, lhs)
+      sum = bv.sub(bv.add(twice, rhs), bv.const(1, ~like: lhs))
+  operation tag(value: type_ref("word", i32)) -> ():
+    attributes(mode: attr_ref("mode", attr_is("\"checked\"")))
+
+def integer = schema.same("T", schema.any_of([schema.type_is("i32"), schema.type_is("i64")]))
+def built :: Dialect:
+  schema.make_dialect(
+    "sample",
+    [schema.type("word", [["element", schema.any_of([schema.type_is("i32"), schema.type_is("i64")])]]),
+     schema.attribute("mode", [["value", schema.any]]),
+     schema.operation(
+       "add",
+       ~operands: [["lhs", integer], ["rhs", integer]],
+       ~results: [["sum", integer]],
+       ~smt: schema.semantics(
+         "sum",
+         schema.sub(schema.add(schema.local(0), schema.operand("rhs")),
+                    schema.const(1, ~like: schema.operand("lhs"))),
+         ~lets: [["twice", schema.add(schema.operand("lhs"), schema.operand("lhs"))]])),
+     schema.operation(
+       "tag",
+       ~operands: [["value", schema.type_ref("word", [schema.type_is("i32")])]],
+       ~attributes: [["mode", schema.attr_ref("mode", [schema.attr_is("\"checked\"")])]])])
+
+check built.to_irdl() ~is declared.to_irdl()
+check built.operation_names ~is declared.operation_names
+check built.smt_operation_names ~is ["sample.add"]
+
+// An operation's attribute keys may be dotted, as MLIR's usually are.
+def dotted:
+  schema.make_dialect("sample", [schema.operation("named", ~attributes: [["sample.name", schema.any]])])
+check dotted.to_irdl().contains("irdl.attributes {\"sample.name\" = %c0}") ~is #true
+check schema.operation("named", ~attributes: [["Sample.name", schema.any]]) ~throws "invalid IRDL name"
+check schema.operation("named", ~attributes: [["sample..name", schema.any]]) ~throws "identifier string"
+check schema.operation("named", ~operands: [["sample.name", schema.any]]) ~throws "identifier string"
+
+// Builders validate exactly as the declaration forms do.
+check:
+  schema.operation("bad", ~operands: [["x", schema.type_is("i32")], ["y", schema.type_is("i64")]],
+                   ~results: [["r", schema.type_is("i32")]],
+                   ~smt: schema.semantics("r", schema.add(schema.operand("x"), schema.operand("y"))))
+  ~throws "widths must be equal"
+check schema.const(1, ~width: 8, ~like: schema.operand("x")) ~throws "exactly one of"
+check schema.const(256, ~width: 8) ~throws "does not fit in 8 bits"
+check schema.make_dialect("sample", [schema.type("word"), schema.type("word")]) ~throws "duplicate dialect member"

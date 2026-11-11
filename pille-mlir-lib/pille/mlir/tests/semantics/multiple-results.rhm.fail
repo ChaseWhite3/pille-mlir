@@ -1,0 +1,10 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation bad(lhs: i32) -> (low: i32, high: i32): // <- error
+    smt:
+      low = lhs
+      high = lhs

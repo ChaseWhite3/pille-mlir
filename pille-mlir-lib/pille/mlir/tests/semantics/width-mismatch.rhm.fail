@@ -1,0 +1,11 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation bad(lhs: i32, rhs: i64) -> (out: i32):
+    smt:
+      let doubled = bv.add(lhs, lhs)
+      out = bv.sub(doubled,
+                   bv.mul(lhs, rhs)) // <- error

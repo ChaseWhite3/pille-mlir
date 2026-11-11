@@ -1,0 +1,9 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation bad(lhs: f32, rhs: f32) -> (out: f32): // <- error
+    smt:
+      out = bv.add(lhs, rhs)

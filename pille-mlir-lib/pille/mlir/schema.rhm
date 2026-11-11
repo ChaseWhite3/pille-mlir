@@ -1,0 +1,133 @@
+#lang rhombus/static
+
+import:
+  pille/mlir/dialect
+  lib("pille/private/mlir/schema.rkt") as schema
+
+export:
+  Constraint
+  Member
+  Expression
+  Semantics
+  type_is
+  attr_is
+  any
+  any_of
+  all_of
+  same
+  type_ref
+  attr_ref
+  type
+  attribute
+  operation
+  make_dialect
+  operand
+  local
+  const
+  add
+  sub
+  mul
+  if_equal
+  semantics
+
+// The declaration model as run-time values. `pille/mlir/dialect` builds the
+// same descriptors while expanding declarations; this module is for a program
+// that already holds its declarations as data, for example another language's
+// own model, and wants a `Dialect` from them. Every constructor validates as
+// the declaration forms do, and the result is the same `Dialect`: IRDL
+// generation, verification, and SMT queries behave identically.
+
+veneer Constraint(this :: satisfying(schema.is_constraint)):
+  constructor ~error
+
+veneer Member(this :: satisfying(schema.is_member)):
+  constructor ~error
+
+veneer Expression(this :: satisfying(schema.is_semantic_expression)):
+  constructor ~error
+
+veneer Semantics(this :: satisfying(schema.is_semantics)):
+  constructor ~error
+
+fun type_is(text :: ReadableString) :: Constraint:
+  schema.type_is(to_string(text))
+
+// MLIR attribute syntax: a string attribute is attr_is("\"text\"").
+fun attr_is(text :: ReadableString) :: Constraint:
+  schema.attribute_is(to_string(text))
+
+def any :: Constraint = schema.any_constraint()
+
+fun any_of(items :: List.of(Constraint)) :: Constraint:
+  schema.any_of(items)
+
+fun all_of(items :: List.of(Constraint)) :: Constraint:
+  schema.all_of(items)
+
+fun same(key :: ReadableString, item :: Constraint) :: Constraint:
+  schema.same(to_string(key), item)
+
+// A type or attribute declared in the same dialect, with constrained parameters.
+fun type_ref(name :: ReadableString, parameters :: List.of(Constraint) = []) :: Constraint:
+  schema.parametric(#'type, #false, to_string(name), parameters)
+
+fun attr_ref(name :: ReadableString, parameters :: List.of(Constraint) = []) :: Constraint:
+  schema.parametric(#'attribute, #false, to_string(name), parameters)
+
+// Ports and parameters are [[name, constraint], ...], in order.
+fun type(name :: ReadableString, parameters :: List = []) :: Member:
+  schema.type_def(to_string(name), parameters)
+
+fun attribute(name :: ReadableString, parameters :: List = []) :: Member:
+  schema.attribute_def(to_string(name), parameters)
+
+fun operation(name :: ReadableString,
+              ~operands: operands :: List = [],
+              ~results: results :: List = [],
+              ~attributes: attributes :: List = [],
+              ~smt: model :: maybe(Semantics) = #false) :: Member:
+  schema.operation_def(to_string(name), operands, results, attributes, model)
+
+fun make_dialect(namespace :: ReadableString, members :: List.of(Member)) :: dialect.Dialect:
+  schema.make_dialect(to_string(namespace), members)
+
+// SMT semantic expressions, as in an `smt:` clause.
+fun operand(name :: ReadableString) :: Expression:
+  schema.sem_operand(to_string(name))
+
+// The value of the `let` at this position among an operation's lets.
+fun local(index :: NonnegInt) :: Expression:
+  schema.sem_local(index)
+
+// Exactly one of ~width, ~like (an expression), or ~like_result (a result name).
+fun const(value :: Int,
+          ~width: width :: maybe(Int) = #false,
+          ~like: like :: maybe(Expression) = #false,
+          ~like_result: result :: maybe(ReadableString) = #false) :: Expression:
+  cond
+  | width && !like && !result: schema.sem_const_width(value, width)
+  | like && !width && !result: schema.sem_const_like(value, like)
+  | result && !width && !like: schema.sem_const_like(value, schema.sem_result(to_string(result)))
+  | ~else: error(~who: #'const, "expected exactly one of ~width, ~like, or ~like_result")
+
+fun add(lhs :: Expression, rhs :: Expression) :: Expression:
+  schema.sem_binary(#'add, lhs, rhs)
+
+fun sub(lhs :: Expression, rhs :: Expression) :: Expression:
+  schema.sem_binary(#'sub, lhs, rhs)
+
+fun mul(lhs :: Expression, rhs :: Expression) :: Expression:
+  schema.sem_binary(#'mul, lhs, rhs)
+
+// `then` where `lhs` equals `rhs`, `otherwise` elsewhere.
+fun if_equal(lhs :: Expression, rhs :: Expression,
+             then :: Expression, otherwise :: Expression) :: Expression:
+  schema.sem_select(lhs, rhs, then, otherwise)
+
+// lets is [[name, expression], ...]; the model assigns `value` to `result`.
+// requires is [[[lhs, rhs], ...], ...]: each entry is one requirement, met when
+// any of its comparisons holds. A query proves them of every use.
+fun semantics(result :: ReadableString, value :: Expression,
+              ~lets: lets :: List = [],
+              ~requires: requirements :: List = []) :: Semantics:
+  schema.make_semantics(lets, [[to_string(result), value]], requirements)

@@ -1,0 +1,7 @@
+#lang rhombus/static
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  type word(element: i32 || i64)
+  operation use(value: type_ref("word", i32) || type_ref("word", i64)) -> ()

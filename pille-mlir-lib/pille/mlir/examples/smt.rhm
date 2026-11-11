@@ -1,0 +1,25 @@
+#lang rhombus/static
+
+import:
+  pille/mlir
+
+// Ask whether any 32-bit value violates x + 0 == x. A solver should answer
+// "unsat", establishing this identity for wrapping 32-bit addition.
+def identity_query = mlir.Module(@str|{
+  module {
+    smt.solver () : () -> () {
+      smt.set_logic "QF_BV"
+      %x = smt.declare_fun "x" : !smt.bv<32>
+      %zero = smt.bv.constant #smt.bv<0> : !smt.bv<32>
+      %sum = smt.bv.add %x, %zero : !smt.bv<32>
+      %equal = smt.eq %sum, %x : !smt.bv<32>
+      %counterexample = smt.not %equal
+      smt.assert %counterexample
+      smt.check sat {} unknown {} unsat {}
+    }
+  }
+}|)
+
+// This prints SMT-LIB; it does not execute a solver. For example, pipe this
+// program's output to `z3 -in` if Z3 is installed.
+println(identity_query.to_smtlib())

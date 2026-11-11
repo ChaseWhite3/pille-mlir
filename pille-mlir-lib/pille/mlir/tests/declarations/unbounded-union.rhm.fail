@@ -1,0 +1,6 @@
+#lang rhombus/static
+import:
+  pille/mlir/dialect open
+
+dialect invalid("invalid"):
+  operation use(value: any || i32) -> ()

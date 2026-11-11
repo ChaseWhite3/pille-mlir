@@ -1,0 +1,49 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir
+  pille/mlir/dialect open
+  rhombus/envvar
+
+// Set this optional plugin to also lower the generated dialect to LLVM.
+def plugin = envvar.getenv("PILLE_MLIR_ADD_PLUGIN")
+def plugins = if plugin | [plugin] | []
+def toolchain = mlir.Toolchain(~pass_plugins: plugins)
+
+// This is a binding in the constraint space. Its expansion carries a shared
+// schema variable: all uses within an operation must select the same type.
+constraint Integer:
+  same("T", i32 || i64)
+
+// Convenience forms expand through the declaration space's normal parser.
+declaration.macro 'binary $(name :: Identifier)':
+  'operation $name(lhs: Integer, rhs: Integer) -> (sum: Integer)'
+
+// The dialect form expands the declarations and generates their IRDL schema.
+// There is no handwritten IRDL corresponding to these definitions.
+dialect arithmetic("rhombus"):
+  type word(element: any_of(i32, i64))
+  attribute mode(value: any_of(attr_is("\"checked\""), attr_is("\"wrapping\"")))
+  binary add
+  operation annotate(value: type_ref("word", i32)) -> (result: type_ref("word", i32)):
+    attributes(mode: attr_ref("mode", any))
+
+println(arithmetic.to_irdl())
+
+// Use the declared operation identity when generating program instances.
+def program = @str{
+  module {
+    func.func @"@"add(%lhs: i32, %rhs: i32) -> i32 {
+      %sum = "@(arithmetic.operation_name("add"))"(%lhs, %rhs) : (i32, i32) -> i32
+      return %sum : i32
+    }
+  }
+}
+
+// This registers the generated schema with MLIR and verifies the program.
+def verified = arithmetic.module(program, ~toolchain: toolchain)
+if plugin
+| println(verified.run_passes(
+    "builtin.module(pille-lower-add,convert-arith-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)"
+  ).to_llvm_ir())
+| println(verified.to_ir())

@@ -1,0 +1,13 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/mlir/dialect open
+
+export constraint.macro 'Shared($(item :: constraint_meta.Parsed))':
+  'same("T", $item)'
+
+export constraint Integer: Shared(i32 || i64)
+
+// The macro's Integer identifier must retain its definition-site binding.
+export declaration.macro 'binary $(name :: Identifier)':
+  'operation $name(lhs: Integer, rhs: Integer) -> (sum: Integer)'

@@ -5,6 +5,7 @@
 (define deps
   '("base"
     "pille-lib"
+    "pille-mlir-lib"
     "pille-spmd-lib"))
 
 (define build-deps

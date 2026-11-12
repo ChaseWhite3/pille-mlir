@@ -1,0 +1,192 @@
+#lang rhombus/static
+
+import:
+  pille/mlir
+  pille/mlir/dialect
+  pille/mlir/schema
+  pille/mlir/smt
+  lib("pille/mlir/tests/smt-support.rkt") as support
+  "../examples/bench-batch-support.rkt" as fixtures
+
+// Public API integration: no skipped solver tests and no fake lowering. These
+// tests require MLIR, the freshly built plugin, and Z3, like smt-api.rhm.
+def plugin :: Path = support.smt_plugin()
+def word = schema.type_is("i8")
+def arithmetic :: dialect.Dialect:
+  fun binary(name :: String, meaning):
+    schema.operation(name, ~operands: [["a", word], ["b", word]],
+                     ~results: [["out", word]], ~smt: schema.semantics("out", meaning))
+  schema.make_dialect("batch_arithmetic",
+                      [binary("add", schema.add(schema.operand("a"), schema.operand("b"))),
+                       binary("mul", schema.mul(schema.operand("a"), schema.operand("b")))])
+
+def module = arithmetic.module(fixtures.basic_source)
+def x = smt.input("x", ~width: 8)
+def out = smt.result(~width: 8)
+
+fun assumptions(index :: Int) :: List.of(smt.Formula):
+  let fixed = smt.eq(x, smt.const(index mod 256, ~width: 8))
+  if index mod 3 == 2
+  | [fixed, smt.eq(x, smt.const((index + 1) mod 256, ~width: 8))]
+  | [fixed]
+
+fun function(index :: Int) :: String:
+  if index mod 3 == 0 | "identity" | "successor"
+
+def specs:
+  for List (index in 0 .. 300):
+    smt.Spec(~function: function(index), ~inputs: [x], ~property: smt.eq(out, x),
+             ~preconditions: assumptions(index))
+def batch = arithmetic.smt_batch(module, specs, ~plugin: plugin)
+check batch.queries.length() ~is 300
+check batch.module.to_ir().contains("batch_arithmetic.") ~is #false
+check batch.to_smtlib().contains("(check-sat)") ~is #true
+def answers = batch.check(~timeout: 10)
+check answers.length() ~is 300
+
+// Every question is also lowered through the existing version 1 path and
+// solved alone. Constraining x makes counterexample equality deterministic.
+for (answer in answers, index in 0 ..):
+  let original = arithmetic.smt_query(module, ~function: function(index), ~inputs: [x],
+                                      ~property: smt.eq(out, x),
+                                      ~preconditions: assumptions(index), ~plugin: plugin)
+  let alone = original.check()
+  check answer.function ~is alone.function
+  check answer.dialect ~is alone.dialect
+  check answer.property ~is alone.property
+  check answer.assumptions ~is alone.assumptions
+  check answer.is_proved ~is alone.is_proved
+  check answer.smtlib ~is batch.queries[index].to_smtlib()
+  match answer
+  | counterexample :: smt.Counterexample:
+      check index mod 3 ~is 1
+      check counterexample.values.length() ~is 1
+      check counterexample.values[0].name ~is "x"
+      check counterexample.values[0].width ~is 8
+      check counterexample.values[0].value ~is index mod 256
+      match alone
+      | standalone :: smt.Counterexample:
+          check standalone.values[0].value ~is counterexample.values[0].value
+      | ~else: error("batch counterexample differs from a standalone answer")
+  | proof :: smt.Proved:
+      check index mod 3 != 1 ~is #true
+      check proof.is_unconditional ~is #false
+      check alone ~is_a smt.Proved
+  | ~else: error(answer.describe())
+
+// Standalone reproduction uses the exact query script, without running the
+// other 299 questions. The session also sees all repeated x names in order.
+def session = smt.Session()
+try:
+  for (index in [0, 1, 2, 3, 4, 5]):
+    let answer :: smt.Outcome = session.check(batch.queries[index])
+    check answer.is_proved ~is (index mod 3 != 1)
+  let streamed :: List.of(smt.Outcome) = session.check(batch)
+  check streamed.length() ~is answers.length()
+  for (answer in streamed, original in answers):
+    check answer.is_proved ~is original.is_proved
+  ~finally: session.close()
+session.close()
+
+// Errors name the zero-based spec index, including errors found by the native
+// pass after the pure specification builders have accepted a valid value.
+check:
+  arithmetic.smt_batch(
+    module, [specs[0], smt.Spec(~function: "missing", ~inputs: [x], ~property: smt.eq(out, x))],
+    ~plugin: plugin)
+  ~throws "spec 1"
+check:
+  arithmetic.smt_batch(
+    module, [specs[0], smt.Spec(~function: "identity", ~inputs: [], ~property: smt.eq(out, x))],
+    ~plugin: plugin)
+  ~throws "spec 1"
+
+// One batch preserves the existing missing-executable outcome classification.
+def singleton = arithmetic.smt_batch(module, [specs[1]], ~plugin: plugin)
+def missing = singleton.check(~solver: "/pille-test/no-such-z3")
+check missing.length() ~is 1
+match missing[0]
+| failure :: smt.Failure:
+    check failure.kind ~is #'missing_executable
+    check failure.is_proved ~is #false
+| ~else: error("missing solver did not return Failure")
+
+// Enumerate functions generated independently from a family of finite-width
+// formulas. Each expected set enumerates all 256 possible i8 inputs in Racket.
+def affine = arithmetic.module(fixtures.affine_source())
+def scales = [0, 1, 2, 3, 4, 7, 16, 128]
+def value_specs:
+  for List (index in 0 .. scales.length()):
+    smt.ValuesSpec(~function: "affine_" ++ to_string(index), ~inputs: [x])
+def value_batch = arithmetic.smt_values_batch(affine, value_specs, ~plugin: plugin)
+check value_batch.queries.length() ~is scales.length()
+def value_session = smt.Session()
+try:
+  for (query in value_batch.queries, scale in scales, index in 0 ..):
+    match value_session.values(query, ~limit: 257)
+    | answer :: smt.Values:
+        check answer.complete ~is #true
+        check answer.values ~is fixtures.affine_values(scale, index)
+    | answer :: smt.Outcome: error(answer.describe())
+
+  match value_session.values(value_batch.queries[1], ~limit: 5)
+  | limited :: smt.Values:
+      check limited.complete ~is #false
+      check limited.values.length() ~is 5
+      for (value in limited.values): check value >= 0 && value < 256 ~is #true
+  | answer :: smt.Outcome: error(answer.describe())
+
+  // Inconsistent assumptions mean no values, not a proof of a constant result.
+  let impossible = arithmetic.smt_values_query(
+    affine, ~function: "affine_1", ~inputs: [x],
+    ~preconditions: [smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8))],
+    ~plugin: plugin)
+  match value_session.values(impossible, ~limit: 257)
+  | empty :: smt.Values:
+      check empty.complete ~is #true
+      check empty.values ~is []
+  | answer :: smt.Outcome: error(answer.describe())
+
+  // The impossible and limited enumerations have left no assertions behind.
+  match value_session.values(value_batch.queries[0], ~limit: 2)
+  | constant :: smt.Values:
+      check constant.complete ~is #true
+      check constant.values ~is [0]
+  | answer :: smt.Outcome: error(answer.describe())
+  ~finally: value_session.close()
+
+// Keep operation requirements visible. Values must not silently discard an
+// input on which the declared operation is undefined.
+def restricted :: dialect.Dialect:
+  let input = schema.operand("x")
+  schema.make_dialect("restricted_values", [
+    schema.operation(
+      "identity", ~operands: [["x", word]], ~results: [["out", word]],
+      ~smt: schema.semantics(
+        "out", input,
+        ~requires: [[[input, schema.const(0, ~width: 8)], [input, schema.const(1, ~width: 8)]]]))])
+def restricted_module = restricted.module(@str|{
+  module {
+    func.func @identity(%x: i8) -> i8 {
+      %out = "restricted_values.identity"(%x) : (i8) -> i8
+      return %out : i8
+    }
+  }
+}|)
+def unbounded = restricted.smt_values_query(
+  restricted_module, ~function: "identity", ~inputs: [x], ~plugin: plugin)
+def restricted_session = smt.Session()
+try:
+  match restricted_session.values(unbounded, ~limit: 257)
+  | failure :: smt.Failure: check failure.kind ~is #'requirements_not_satisfied
+  | ~else: error("values silently filtered an undefined input")
+  let allowed = restricted.smt_values_query(
+    restricted_module, ~function: "identity", ~inputs: [x],
+    ~preconditions: [smt.or(smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8)))],
+    ~plugin: plugin)
+  match restricted_session.values(allowed, ~limit: 3)
+  | answer :: smt.Values:
+      check answer.complete ~is #true
+      check answer.values ~is [0, 1]
+  | answer :: smt.Outcome: error(answer.describe())
+  ~finally: restricted_session.close()

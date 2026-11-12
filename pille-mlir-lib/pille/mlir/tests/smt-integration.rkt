@@ -710,7 +710,7 @@
                (lower (manifest (operations (hasheq 'operands '("lhs" "rhs") 'result "out" 'locals '()
                                                     'value '("const" "3" ("width" 8))))))))
   (check-exn #rx"malformed SMT query manifest: expected format \"pille-smt-query\" version 1"
-             (lambda () (lower (manifest (cons 'version 2)))))
+             (lambda () (lower (manifest (cons 'version 999)))))
   (check-exn #rx"malformed SMT query manifest: missing a required field"
              (lambda () (lower "{\"format\":\"pille-smt-query\",\"version\":1}")))
   (check-exn #rx"malformed SMT query manifest" (lambda () (lower "[]")))

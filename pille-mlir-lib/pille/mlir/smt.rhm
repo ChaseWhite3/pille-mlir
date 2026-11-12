@@ -4,12 +4,20 @@ import:
   pille/mlir
   lib("pille/private/mlir/query.rkt") as query
   lib("pille/private/mlir/solver.rkt") as solver
+  lib("pille/private/mlir/session.rkt") as session
   lib("pille/private/mlir/tools.rkt") as tools
 
 export:
   Term
   Formula
   Query
+  Spec
+  Batch
+  ValuesSpec
+  ValuesQuery
+  ValuesBatch
+  Values
+  Session
   Assignment
   Outcome
   Proved
@@ -163,7 +171,8 @@ class Timeout(seconds :: Real):
     "the solver exceeded " ++ to_string(seconds) ++ " second(s) on " ++ subject()
 
 // The solver could not be run or its answer could not be trusted. `kind` is
-// #'missing_executable, #'nonzero_exit, #'malformed_response, or #'bad_model.
+// #'missing_executable, #'nonzero_exit, #'malformed_response, #'bad_model,
+// #'closed_session, or #'requirements_not_satisfied.
 class Failure(kind :: Symbol):
   extends Outcome
 
@@ -201,28 +210,140 @@ veneer Query(this :: satisfying(query.is_query)):
   method to_smtlib() :: String:
     query.query_smtlib(this)
 
-  // Runs a solver. This is the only operation here that starts one.
+  // Runs a standalone solver; batch and session APIs amortize process startup.
   method check(~solver: executable :: maybe(Path || ReadableString) = #false,
                ~timeout: timeout :: PosReal = 10,
                ~arguments: arguments :: List.of(ReadableString) = []) :: Outcome:
     let answer = query.query_check(this, executable, timeout,
                                    for List (argument in arguments): to_string(argument))
-    let diagnostics :: String = solver.solver_result_diagnostics(answer)
-    let command :: List = solver.solver_result_command_line(answer)
-    fun outcome(make, extra, ...) :: Outcome:
-      make(function, dialect, property, assumptions, to_smtlib(), diagnostics, command,
-           extra, ...)
-    match solver.solver_result_status(answer)
-    | #'unsat: outcome(Proved)
-    | #'sat:
-        outcome(Counterexample,
-                for List (entry in (solver.solver_result_assignments(answer) :~ List)):
-                  let [name, width, value] = entry
-                  Assignment(name, width, value))
-    | #'unknown: outcome(Unknown)
-    | #'timeout: outcome(Timeout, timeout)
-    | #'#{missing-executable}: outcome(Failure, #'missing_executable)
-    | #'#{nonzero-exit}: outcome(Failure, #'nonzero_exit)
-    | #'#{malformed-response}: outcome(Failure, #'malformed_response)
-    | #'#{bad-model}: outcome(Failure, #'bad_model)
+    solver_outcome(answer, function, dialect, property, assumptions, to_smtlib(), timeout)
 
+// Shared result conversion keeps old queries, batches, and sessions aligned.
+fun solver_outcome(answer, function :: String, dialect :: String,
+                   property :: String, assumptions :: List.of(String),
+                   script :: String, timeout :: Real) :: Outcome:
+  let diagnostics :: String = solver.solver_result_diagnostics(answer)
+  let command :: List = solver.solver_result_command_line(answer)
+  fun outcome(make, extra, ...) :: Outcome:
+    make(function, dialect, property, assumptions, script, diagnostics, command, extra, ...)
+  match solver.solver_result_status(answer)
+  | #'unsat: outcome(Proved)
+  | #'sat:
+      outcome(Counterexample,
+              for List (entry in (solver.solver_result_assignments(answer) :~ List)):
+                let [name, width, value] = entry
+                Assignment(name, width, value))
+  | #'unknown: outcome(Unknown)
+  | #'timeout: outcome(Timeout, timeout)
+  | #'#{missing-executable}: outcome(Failure, #'missing_executable)
+  | #'#{nonzero-exit}: outcome(Failure, #'nonzero_exit)
+  | #'#{malformed-response}: outcome(Failure, #'malformed_response)
+  | #'#{bad-model}: outcome(Failure, #'bad_model)
+  | #'#{closed-session}: outcome(Failure, #'closed_session)
+  | #'#{requirements-not-satisfied}: outcome(Failure, #'requirements_not_satisfied)
+
+// A spec holds the same arguments as Dialect.smt_query. Semantic validation
+// happens in the batch so errors can identify the zero-based spec index.
+veneer Spec(this :: satisfying(query.is_spec)):
+  constructor(~function: function :: ReadableString,
+              ~inputs: inputs :: List.of(Term) = [],
+              ~property: property :: Formula,
+              ~preconditions: preconditions :: List.of(Formula) = []):
+    query.make_spec(to_string(function), inputs, property, preconditions)
+
+veneer Batch(this :: satisfying(query.is_batch)):
+  constructor ~error
+
+  property module :: mlir.Module: query.batch_module(this)
+  property queries :: List.of(Query): query.batch_queries(this)
+
+  // Exact exported problem script; per-question scripts are on .queries.
+  // Execution additionally sends timeout options, framing and conditional
+  // get-value requests, which do not change the asserted problem.
+  method to_smtlib() :: String: query.batch_smtlib(this)
+
+  method check(~solver: executable :: maybe(Path || ReadableString) = #false,
+               ~timeout: timeout :: PosReal = 10,
+               ~arguments: arguments :: List.of(ReadableString) = [],
+               ~overall_timeout: overall_timeout :: maybe(PosReal) = #false) :: List.of(Outcome):
+    let answers :: List = query.batch_check(this, executable, timeout,
+                                            for List (argument in arguments): to_string(argument),
+                                            overall_timeout)
+    batch_outcomes(this, answers, timeout_bound(timeout, overall_timeout))
+
+fun timeout_bound(timeout :: Real, overall :: maybe(Real)) :: Real:
+  match overall
+  | bound :: Real:
+      if bound < timeout
+      | bound
+      | timeout
+  | ~else: timeout
+
+fun batch_outcomes(batch :: Batch, answers :: List, timeout :: Real) :: List.of(Outcome):
+  for List (member :: Query in batch.queries, answer in answers):
+    solver_outcome(answer, member.function, member.dialect, member.property,
+                   member.assumptions, member.to_smtlib(), timeout)
+
+// Values specs have no property: enumeration asks for the result itself.
+veneer ValuesSpec(this :: satisfying(query.is_values_spec)):
+  constructor(~function: function :: ReadableString,
+              ~inputs: inputs :: List.of(Term) = [],
+              ~preconditions: preconditions :: List.of(Formula) = []):
+    query.make_values_spec(to_string(function), inputs, preconditions)
+
+veneer ValuesQuery(this :: satisfying(query.is_values_query)):
+  constructor ~error
+  property module :: mlir.Module: query.values_query_module(this)
+  property function :: String: query.values_query_function(this)
+  property dialect :: String: query.values_query_dialect(this)
+  property inputs :: List: query.values_query_inputs(this)
+  property assumptions :: List.of(String): query.values_query_assumptions(this)
+  property width :: Int: query.values_query_width(this)
+  method to_smtlib() :: String: query.values_query_smtlib(this)
+
+veneer ValuesBatch(this :: satisfying(query.is_values_batch)):
+  constructor ~error
+  property module :: mlir.Module: query.batch_module(this)
+  property queries :: List.of(ValuesQuery): query.batch_queries(this)
+  method to_smtlib() :: String: query.batch_smtlib(this)
+
+// Values are unsigned bitvector residues, sorted for deterministic reporting.
+// An empty complete set means inconsistent preconditions, never a proof.
+class Values(values :: List.of(Int), complete :: Boolean):
+  property is_inconsistent :: Boolean: complete && values.length() == 0
+
+  method describe() :: String:
+    if is_inconsistent
+    | "inconsistent preconditions: no possible result values"
+    | "possible result values " ++ to_string(values)
+        ++ (if complete | " (complete)" | " (limit reached; incomplete)")
+
+// A session serializes concurrent access. Its child process is started lazily,
+// closed by close() or custodian shutdown, and restarted after a timeout.
+veneer Session(this :: satisfying(session.is_session)):
+  constructor(~solver: executable :: maybe(Path || ReadableString) = #false,
+              ~arguments: arguments :: List.of(ReadableString) = []):
+    session.make_session(executable, for List (argument in arguments): to_string(argument))
+
+  method close(): session.close_session(this)
+
+  method check(value :: Query || Batch,
+               ~timeout: timeout :: PosReal = 10,
+               ~overall_timeout: overall_timeout :: maybe(PosReal) = #false) :: Outcome || List.of(Outcome):
+    match value
+    | batch :: Batch:
+        let answers :: List = query.batch_session_check(this, batch, timeout, overall_timeout)
+        batch_outcomes(batch, answers, timeout_bound(timeout, overall_timeout))
+    | single :: Query:
+        solver_outcome(query.query_session_check(this, single, timeout, overall_timeout), single.function,
+                       single.dialect, single.property, single.assumptions, single.to_smtlib(),
+                       timeout_bound(timeout, overall_timeout))
+
+  method values(value :: ValuesQuery,
+                ~limit: limit :: Int,
+                ~timeout: timeout :: PosReal = 10) :: Values || Outcome:
+    let answer = query.values_query_check(this, value, limit, timeout)
+    if session.is_enumeration(answer)
+    | Values(session.enumeration_values(answer), session.enumeration_complete(answer))
+    | solver_outcome(answer, value.function, value.dialect, "possible result values",
+                     value.assumptions, value.to_smtlib(), timeout)

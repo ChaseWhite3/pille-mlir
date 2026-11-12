@@ -1,4 +1,4 @@
-// Lowers one function of a verified MLIR module into an SMT dialect query.
+// Lowers selected functions of a verified MLIR module into SMT dialect queries.
 //
 // The pass is driven entirely by a JSON manifest generated from Rhombus
 // declarations: it has no built-in knowledge of any custom operation. For every
@@ -14,6 +14,8 @@
 #include "mlir/Dialect/SMT/IR/SMTTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -22,6 +24,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 #include <optional>
 #include <string>
 #include <vector>
@@ -73,20 +76,44 @@ struct Scope {
   bool semantic = false;
 };
 
+// The first query for a function owns these operations. Later queries clone
+// this already-lowered body, renaming declarations for their display names.
+// Every query has its own SolverOp, so none of its assertions can affect any
+// other query. The cache is local to one manifest and therefore one model.
+struct LoweredFunction {
+  SmallVector<Operation *> operations;
+  SmallVector<Value> inputs;
+  Value returned;
+  SmallVector<Value> obligations;
+};
+
+using FunctionCache = llvm::StringMap<LoweredFunction>;
+
 class QueryBuilder {
 public:
-  QueryBuilder(ModuleOp module, const json::Object &manifest)
-      : module(module), manifest(manifest), builder(module.getContext()) {}
+  QueryBuilder(ModuleOp module, const json::Object &manifest,
+               const json::Object &specification, FunctionCache &cache,
+               std::optional<unsigned> index = std::nullopt)
+      : module(module), manifest(manifest), specification(specification),
+        cache(cache), index(index), builder(module.getContext()) {}
 
   LogicalResult run();
+  LogicalResult checkResult();
 
 private:
   InFlightDiagnostic malformed(const Twine &message) {
-    return module.emitError()
-           << "malformed SMT query manifest: " << message;
+    auto diagnostic = module.emitError();
+    if (index)
+      diagnostic << "SMT batch spec " << *index << ": ";
+    diagnostic << "malformed SMT query manifest: " << message;
+    return diagnostic;
   }
   InFlightDiagnostic error(Location location, const Twine &message) {
-    return emitError(location) << message;
+    auto diagnostic = emitError(location);
+    if (index)
+      diagnostic << "SMT batch spec " << *index << ": ";
+    diagnostic << message;
+    return diagnostic;
   }
 
   LogicalResult readManifest();
@@ -94,7 +121,6 @@ private:
   LogicalResult lowerBody();
   LogicalResult lowerModeled(Operation *op, const OperationModel &model);
   LogicalResult lowerConstant(arith::ConstantOp op);
-  LogicalResult checkResult();
 
   Value lowerTerm(const json::Value &expression, const Scope &scope,
                   Location location);
@@ -109,6 +135,9 @@ private:
 
   ModuleOp module;
   const json::Object &manifest;
+  const json::Object &specification;
+  FunctionCache &cache;
+  std::optional<unsigned> index;
   OpBuilder builder;
 
   std::string functionName;
@@ -118,6 +147,9 @@ private:
   llvm::StringSet<> unmodeled;
   const json::Array *preconditions = nullptr;
   const json::Value *property = nullptr;
+  bool enumerateValues = false;
+  std::string resultSymbol;
+  std::string definedSymbol;
 
   func::FuncOp function;
   llvm::DenseMap<Value, Value> values;
@@ -129,19 +161,20 @@ private:
 };
 
 LogicalResult QueryBuilder::readManifest() {
-  if (manifest.getString("format") != StringRef("pille-smt-query") ||
-      manifest.getInteger("version") != int64_t(1)) {
-    malformed("expected format \"pille-smt-query\" version 1");
-    return failure();
-  }
-  auto name = manifest.getString("function");
-  const json::Array *inputList = manifest.getArray("inputs");
+  auto name = specification.getString("function");
+  const json::Array *inputList = specification.getArray("inputs");
   const json::Object *operations = manifest.getObject("operations");
   const json::Array *unmodeledList = manifest.getArray("unmodeled");
-  preconditions = manifest.getArray("preconditions");
-  property = manifest.get("property");
+  preconditions = specification.getArray("preconditions");
+  property = specification.get("property");
+  auto mode = specification.getString("mode");
+  enumerateValues = mode == StringRef("values");
+  if (mode && *mode != "values" && *mode != "proof") {
+    malformed("unknown query mode");
+    return failure();
+  }
   if (!name || !inputList || !operations || !unmodeledList || !preconditions ||
-      !property) {
+      (!property && !enumerateValues)) {
     malformed("missing a required field");
     return failure();
   }
@@ -157,7 +190,24 @@ LogicalResult QueryBuilder::readManifest() {
     }
     inputs.emplace_back(inputName->str(), unsigned(*width));
   }
-  if (const json::Value *width = manifest.get("result_width")) {
+  if (enumerateValues) {
+    auto resultName = specification.getString("result_symbol");
+    auto definedName = specification.getString("defined_symbol");
+    if (!resultName || resultName->empty() || !definedName ||
+        definedName->empty() || *resultName == *definedName) {
+      malformed("values queries require distinct result_symbol and defined_symbol names");
+      return failure();
+    }
+    for (const auto &input : inputs) {
+      if (input.first == *resultName || input.first == *definedName) {
+        malformed("a values query output symbol collides with an input name");
+        return failure();
+      }
+    }
+    resultSymbol = resultName->str();
+    definedSymbol = definedName->str();
+  }
+  if (const json::Value *width = specification.get("result_width")) {
     if (!width->getAsNull()) {
       auto number = width->getAsInteger();
       if (!number || !isSupportedWidth(*number)) {
@@ -774,8 +824,34 @@ LogicalResult QueryBuilder::run() {
   builder.setInsertionPointToEnd(&body);
   smt::SetLogicOp::create(builder, location, StringRef("QF_BV"));
 
-  if (failed(lowerBody()))
-    return failure();
+  auto existing = cache.find(functionName);
+  if (existing == cache.end()) {
+    if (failed(lowerBody()))
+      return failure();
+    LoweredFunction prepared;
+    // Capture exactly the body, before adding this question's assertions.
+    // The first operation is set_logic, whose scope belongs to each query.
+    for (Operation &op : llvm::drop_begin(body))
+      prepared.operations.push_back(&op);
+    prepared.inputs = inputValues;
+    prepared.returned = returned;
+    prepared.obligations = obligations;
+    cache.try_emplace(functionName, std::move(prepared));
+  } else {
+    IRMapping mapping;
+    const LoweredFunction &prepared = existing->second;
+    for (Operation *op : prepared.operations)
+      builder.clone(*op, mapping);
+    for (auto [position, input] : llvm::enumerate(prepared.inputs)) {
+      Value cloned = mapping.lookup(input);
+      cloned.getDefiningOp<smt::DeclareFunOp>().setNamePrefixAttr(
+          builder.getStringAttr(inputs[position].first));
+      inputValues.push_back(cloned);
+    }
+    returned = mapping.lookup(prepared.returned);
+    for (Value obligation : prepared.obligations)
+      obligations.push_back(mapping.lookup(obligation));
+  }
 
   // Assert the preconditions and the negation of what is to be shown: the
   // property, and that every operation was used within what its model
@@ -792,18 +868,44 @@ LogicalResult QueryBuilder::run() {
       return failure();
     smt::AssertOp::create(builder, location, assumption);
   }
-  scope.description = "the property";
-  Value goal = lowerFormula(*property, scope, location);
-  if (!goal)
-    return failure();
-  if (!obligations.empty()) {
-    obligations.push_back(goal);
-    goal = smt::AndOp::create(builder, location,
-                              smt::BoolType::get(module.getContext()),
-                              obligations);
+  if (enumerateValues) {
+    // Expose the result and definedness separately. The caller first asks if
+    // any admitted input violates a requirement, so enumeration cannot hide
+    // partial functions by filtering away their undefined inputs.
+    Value result = smt::DeclareFunOp::create(
+        builder, location, returned.getType(), builder.getStringAttr(resultSymbol));
+    smt::AssertOp::create(
+        builder, location, smt::EqOp::create(builder, location, result, returned));
+    Value one = smt::BVConstantOp::create(builder, location, llvm::APInt(1, 1));
+    Value definedValue = one;
+    if (!obligations.empty()) {
+      Value condition = obligations.size() == 1
+                            ? obligations.front()
+                            : smt::AndOp::create(
+                                  builder, location,
+                                  smt::BoolType::get(module.getContext()),
+                                  obligations);
+      Value zero = smt::BVConstantOp::create(builder, location, llvm::APInt(1, 0));
+      definedValue = smt::IteOp::create(builder, location, condition, one, zero);
+    }
+    Value defined = smt::DeclareFunOp::create(
+        builder, location, one.getType(), builder.getStringAttr(definedSymbol));
+    smt::AssertOp::create(
+        builder, location, smt::EqOp::create(builder, location, defined, definedValue));
+  } else {
+    scope.description = "the property";
+    Value goal = lowerFormula(*property, scope, location);
+    if (!goal)
+      return failure();
+    if (!obligations.empty()) {
+      obligations.push_back(goal);
+      goal = smt::AndOp::create(builder, location,
+                                smt::BoolType::get(module.getContext()),
+                                obligations);
+    }
+    smt::AssertOp::create(builder, location,
+                          smt::NotOp::create(builder, location, goal));
   }
-  smt::AssertOp::create(builder, location,
-                        smt::NotOp::create(builder, location, goal));
 
   smt::CheckOp check = smt::CheckOp::create(builder, location, TypeRange{});
   for (Region &region : check->getRegions()) {
@@ -812,12 +914,7 @@ LogicalResult QueryBuilder::run() {
   }
   smt::SolverOp::ensureTerminator(solver.getBodyRegion(), builder, location);
 
-  // The query is self-contained. Remove the source program so that no custom
-  // operation can reach the exporter, which knows neither IRDL nor plugins.
-  for (Operation &op : llvm::make_early_inc_range(*module.getBody()))
-    if (&op != solver.getOperation())
-      op.erase();
-  return checkResult();
+  return success();
 }
 
 class SmtQueryPass
@@ -830,7 +927,7 @@ public:
 
   StringRef getArgument() const final { return "pille-smt-query"; }
   StringRef getDescription() const final {
-    return "Lower one function to an SMT dialect query using declared "
+    return "Lower functions to isolated SMT dialect queries using declared "
            "operation semantics";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -857,8 +954,74 @@ public:
       module.emitError() << "malformed SMT query manifest: expected an object";
       return signalPassFailure();
     }
-    if (failed(QueryBuilder(module, *root).run()))
-      signalPassFailure();
+    auto version = root->getInteger("version");
+    if (root->getString("format") != StringRef("pille-smt-query") ||
+        (version != int64_t(1) && version != int64_t(2))) {
+      module.emitError() << "malformed SMT query manifest: expected format "
+                           "\"pille-smt-query\" version 1 or 2";
+      return signalPassFailure();
+    }
+    SmallVector<Operation *> sourceOperations;
+    for (Operation &op : *module.getBody())
+      sourceOperations.push_back(&op);
+    FunctionCache cache;
+    if (version == int64_t(1)) {
+      if (failed(QueryBuilder(module, *root, *root, cache).run()))
+        return signalPassFailure();
+    } else {
+      const json::Array *queries = root->getArray("queries");
+      if (!queries) {
+        module.emitError() << "malformed SMT query manifest: missing queries array";
+        return signalPassFailure();
+      }
+      for (auto [index, entry] : llvm::enumerate(*queries)) {
+        const json::Object *specification = entry.getAsObject();
+        if (!specification) {
+          module.emitError() << "SMT batch spec " << index
+                             << ": expected a query object";
+          return signalPassFailure();
+        }
+        if (failed(QueryBuilder(module, *root, *specification, cache, index).run()))
+          return signalPassFailure();
+      }
+    }
+    // Remove the source only after every selected body has been prepared. Its
+    // custom operations must never reach the stock SMT-LIB exporter.
+    for (Operation *op : sourceOperations)
+      op->erase();
+    if (failed(QueryBuilder(module, *root, *root, cache).checkResult()) ||
+        failed(verify(module)))
+      return signalPassFailure();
+
+    // Optional private sidecar: one standalone module per solver, printed by
+    // MLIR itself. The host can expose members lazily without N subprocesses
+    // or having to split/parse MLIR text.
+    if (auto path = root->getString("query_modules")) {
+      json::Array printed;
+      for (Operation &solver : *module.getBody()) {
+        OwningOpRef<ModuleOp> standalone = ModuleOp::create(module.getLoc());
+        standalone->getBody()->push_back(solver.clone());
+        std::string text;
+        llvm::raw_string_ostream stream(text);
+        standalone->print(stream, OpPrintingFlags().enableDebugInfo());
+        stream << '\n';
+        printed.push_back(std::move(text));
+      }
+      std::error_code code;
+      llvm::raw_fd_ostream output(*path, code);
+      if (code) {
+        module.emitError() << "cannot write SMT query modules '" << *path
+                           << "': " << code.message();
+        return signalPassFailure();
+      }
+      output << json::Value(std::move(printed));
+      output.close();
+      if (output.has_error()) {
+        module.emitError() << "cannot finish writing SMT query modules '" << *path << "'";
+        output.clear_error();
+        return signalPassFailure();
+      }
+    }
   }
 
   Option<std::string> manifest{

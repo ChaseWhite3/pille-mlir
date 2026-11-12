@@ -12,6 +12,8 @@
          smtlib-declarations
          model-script
          parse-model
+         find-solver
+         solver-result
          run_solver
          (rename-out [solver-result? is_solver_result]
                      [solver-result-status solver_result_status]

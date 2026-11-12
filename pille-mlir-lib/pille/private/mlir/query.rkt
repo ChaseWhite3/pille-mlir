@@ -3,28 +3,45 @@
 (require json
          racket/list
          racket/match
+         racket/promise
          racket/string
          racket/treelist
          "schema.rkt"
          "semantics.rkt"
          "solver.rkt"
+         "session.rkt"
          "tools.rkt")
 
 (provide smt_input smt_result smt_const smt_binary
          smt_eq smt_not smt_and smt_or
          render_term render_formula
          make_smt_query
+         make_spec make_values_spec make_smt_batch make_smt_values_batch make_smt_values_query
+         batch_queries batch_check batch_session_check query_session_check values_query_check
+         values_query_inputs values_query_assumptions
          query_inputs query_assumptions query_check
          (rename-out [term? is_term]
                      [term-width term_width]
                      [formula? is_formula]
                      [query? is_query]
-                     [query-module query_module]
+                     [get-query-module query_module]
                      [query-smtlib query_smtlib]
                      [query-function query_function]
                      [query-dialect query_dialect]
                      [query-property query_property]
-                     [query-preconditions query_preconditions]))
+                     [query-preconditions query_preconditions]
+                     [spec? is_spec]
+                     [values-spec? is_values_spec]
+                     [batch? is_batch]
+                     [values-batch? is_values_batch]
+                     [get-batch-module batch_module]
+                     [get-batch-smtlib batch_smtlib]
+                     [values-query? is_values_query]
+                     [get-values-query-module values_query_module]
+                     [values-query-smtlib values_query_smtlib]
+                     [values-query-function values_query_function]
+                     [values-query-dialect values_query_dialect]
+                     [values-query-result-width values_query_width]))
 
 ;; Properties are built from two distinct sorts. A term is a bitvector with an
 ;; exact width; a formula is an SMT Boolean. A one-bit term is not a formula,
@@ -39,6 +56,20 @@
 (struct formula (tag args) #:transparent)
 
 (struct query (module smtlib dialect function inputs property preconditions))
+(struct spec (function inputs property preconditions) #:transparent)
+(struct values-spec (function inputs preconditions) #:transparent)
+(struct batch (module smtlib queries))
+(struct values-batch (module smtlib queries))
+(struct values-query (module smtlib dialect function inputs preconditions result-name result-width defined-name))
+
+(define (get-query-module value) (force (query-module value)))
+(define (get-values-query-module value) (force (values-query-module value)))
+(define (get-batch-module value)
+  (if (batch? value) (batch-module value) (values-batch-module value)))
+(define (get-batch-smtlib value)
+  (if (batch? value) (batch-smtlib value) (values-batch-smtlib value)))
+(define (batch_queries value)
+  (list->treelist (if (batch? value) (batch-queries value) (values-batch-queries value))))
 
 (define (builder-error who message . arguments)
   (apply raise-user-error who message arguments))
@@ -199,61 +230,187 @@
     [(term _ arguments _) (append-map result-widths (filter term? arguments))]
     [(formula _ operands) (append-map result-widths operands)]))
 
-;; The dialect value supplies the semantic model explicitly. The module only
-;; carries IRDL text, and identical IRDL can have different meanings attached,
-;; so the module is checked for structural compatibility and nothing more.
-(define (make_smt_query dialect module function inputs property preconditions [plugin #f])
-  (unless (is_dialect dialect) (raise-argument-error 'smt_query "dialect" dialect))
-  (unless (is_module module) (raise-argument-error 'smt_query "module" module))
+(define (validate-inputs function inputs preconditions)
   (unless (and (string? function) (non-empty-string? function))
     (raise-argument-error 'smt_query "nonempty function symbol name" function))
   (define declared (entries 'smt_query inputs))
   (for ([input (in-list declared)])
     (unless (and (term? input) (eq? (term-tag input) 'input))
       (raise-argument-error 'smt_query "list of inputs" inputs)))
-  (let ([duplicate (check-duplicates (map (lambda (input) (car (term-args input))) declared))])
-    (when duplicate
-      (builder-error 'smt_query "duplicate input name ~a; each argument needs a distinct display name"
-                     duplicate)))
-  (check-formula 'smt_query property)
+  (define duplicate (check-duplicates (map (lambda (input) (car (term-args input))) declared)))
+  (when duplicate
+    (builder-error 'smt_query "duplicate input name ~a; each argument needs a distinct display name" duplicate))
   (define assumptions (entries 'smt_query preconditions))
   (for ([assumption (in-list assumptions)]) (check-formula 'smt_query assumption))
-  (unless (equal? (module_irdl module) (dialect_irdl dialect))
-    (builder-error 'smt_query
-                   "the module was not verified against dialect ~a's generated IRDL definitions; construct it with this dialect's module method"
-                   (dialect_name dialect)))
-  (define widths (remove-duplicates (append-map result-widths (cons property assumptions))))
+  (values declared assumptions))
+
+;; Specs retain immutable property descriptors. Batch validation resolves their
+;; references with an index in each error; native lowering checks signatures.
+(define (make_spec function inputs property [preconditions '()])
+  (spec (string->immutable-string function) (entries 'Spec inputs) property
+        (entries 'Spec preconditions)))
+
+(define (make_values_spec function inputs [preconditions '()])
+  (values-spec (string->immutable-string function) (entries 'ValuesSpec inputs)
+               (entries 'ValuesSpec preconditions)))
+
+(define (spec-fields value)
+  (if (spec? value)
+      (values (spec-function value) (spec-inputs value) (spec-property value) (spec-preconditions value))
+      (values (values-spec-function value) (values-spec-inputs value) #f (values-spec-preconditions value))))
+
+(define (fresh-name initial inputs)
+  (define names (map (lambda (input) (car (term-args input))) inputs))
+  (let loop ([name initial])
+    (if (member name names) (loop (string-append name "_")) name)))
+
+(define (spec-manifest value)
+  (define-values (function declared property assumptions) (spec-fields value))
+  (validate-inputs function declared assumptions)
+  (when (spec? value) (check-formula 'smt_query property))
+  (define widths (remove-duplicates (append-map result-widths
+                                               (if property (cons property assumptions) assumptions))))
   (when (> (length widths) 1)
     (builder-error 'smt_query "the result is referenced with conflicting widths: ~a"
                    (string-join (map number->string widths) ", ")))
-  (define manifest
-    (hasheq 'format "pille-smt-query"
-            'version 1
-            'function function
+  (define base
+    (hasheq 'function function
             'inputs (for/list ([input (in-list declared)])
                       (hasheq 'name (car (term-args input)) 'width (term-width input)))
             'result_width (if (null? widths) (json-null) (car widths))
-            'operations (for/hasheq ([model (in-list (operation_models dialect))])
-                          (values (string->symbol (car model)) (cdr model)))
-            'unmodeled (unmodeled_operation_names dialect)
             'preconditions (for/list ([assumption (in-list assumptions)])
                              (formula->manifest assumption declared))
-            'property (formula->manifest property declared)))
+            'property (if property (formula->manifest property declared) (json-null))))
+  (if property base
+      (hash-set* base 'mode "values"
+                 'result_symbol (fresh-name "pille_result" declared)
+                 'defined_symbol (fresh-name "pille_defined" declared))))
+
+;; Identical IRDL can describe different meanings: the supplied dialect owns
+;; the model. Structural compatibility does not establish semantic identity.
+(define (check-context who dialect module)
+  (unless (is_dialect dialect) (raise-argument-error who "dialect" dialect))
+  (unless (is_module module) (raise-argument-error who "module" module))
+  (unless (equal? (module_irdl module) (dialect_irdl dialect))
+    (builder-error who
+                   "the module was not verified against dialect ~a's generated IRDL definitions; construct it with this dialect's module method"
+                   (dialect_name dialect))))
+
+(define (context-manifest dialect version)
+  (hasheq 'format "pille-smt-query" 'version version
+          'operations (for/hasheq ([model (in-list (operation_models dialect))])
+                        (values (string->symbol (car model)) (cdr model)))
+          'unmodeled (unmodeled_operation_names dialect)))
+
+(define (expected-inputs declared)
+  (for/list ([input (in-list declared)])
+    (cons (car (term-args input)) (term-width input))))
+
+(define (make_smt_query dialect module function inputs property preconditions [plugin #f])
+  (check-context 'smt_query dialect module)
+  (define description (make_spec function inputs property preconditions))
+  (define manifest
+    (for/fold ([manifest (context-manifest dialect 1)])
+              ([(key value) (in-hash (spec-manifest description))])
+      (hash-set manifest key value)))
   (define lowered
     (run_smt_query_pass module (resolve_smt_plugin plugin) (jsexpr->string manifest)))
-  ;; Re-verify with the stock tools and export once, so that a query value
-  ;; always holds a verified SMT module and the exact text given to a solver.
   (define verified (parse_stock_module lowered module))
   (define smtlib (to_smtlib verified))
-  (define expected
-    (for/list ([input (in-list declared)])
-      (cons (car (term-args input)) (term-width input))))
-  (unless (equal? (smtlib-declarations smtlib) expected)
-    (builder-error 'smt_query
-                   "internal error: the exported SMT-LIB does not declare exactly the query's inputs:\n~a"
-                   smtlib))
-  (query verified smtlib (dialect_name dialect) (string->immutable-string function)
-         declared property assumptions))
+  (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
+    (builder-error 'smt_query "internal error: the exported SMT-LIB does not declare exactly the query's inputs:\n~a" smtlib))
+  (query verified smtlib (dialect_name dialect) (spec-function description)
+         (spec-inputs description) property (spec-preconditions description)))
+
+;; Every smt.solver region exports a self-contained script ending in reset.
+;; Split on parsed commands, never on text inside strings, comments, or terms.
+(define (split-queries text)
+  (define start 0)
+  (define chunks
+    (for/list ([command (in-list (smtlib-commands text))]
+               #:when (equal? (car command) '("reset")))
+      (define end (cdr command))
+      (define part (string->immutable-string (string-append (substring text start end) "\n")))
+      (set! start end)
+      part))
+  (unless (null? (smtlib-commands (substring text start)))
+    (builder-error 'smt_batch "exported SMT batch has commands after the last query's reset"))
+  chunks)
+
+(define (make-batch dialect module specifications plugin values?)
+  (define who (if values? 'smt_values_batch 'smt_batch))
+  (check-context who dialect module)
+  (define specs (entries who specifications))
+  (when (null? specs) (builder-error who "expected at least one query spec"))
+  (define descriptions
+    (for/list ([value (in-list specs)] [index (in-naturals)])
+      (with-handlers ([exn:fail? (lambda (error)
+                                 (builder-error who "spec ~a: ~a" index (exn-message error)))])
+        (unless ((if values? values-spec? spec?) value)
+          (raise-argument-error who (if values? "ValuesSpec" "Spec") value))
+        (spec-manifest value))))
+  (define manifest (hash-set (context-manifest dialect 2) 'queries descriptions))
+  (define-values (lowered standalone)
+    (run_smt_batch_pass module (resolve_smt_plugin plugin) manifest))
+  (define verified (parse_stock_module lowered module))
+  (define text (to_smtlib verified))
+  (define chunks (split-queries text))
+  (unless (and (= (length specs) (length chunks)) (= (length specs) (length standalone)))
+    (builder-error who "internal error: lowered/exported query count does not match the specs"))
+  (define queries
+    (for/list ([value (in-list specs)] [description (in-list descriptions)]
+               [script (in-list chunks)] [ir (in-list standalone)] [index (in-naturals)])
+      (define-values (function inputs property assumptions) (spec-fields value))
+      (define declarations (smtlib-declarations script))
+      (define expected (expected-inputs inputs))
+      ;; Construction checks the whole batch once. Accessing a member's module
+      ;; can verify the native printer's isolated module lazily, without adding
+      ;; processes to ordinary batch construction or solver execution.
+      (define member-module (delay (parse_stock_module ir module)))
+      (cond
+        [values?
+         (define result-name (hash-ref description 'result_symbol))
+         (define defined-name (hash-ref description 'defined_symbol))
+         (define result-entry (assoc result-name declarations))
+         (unless (and result-entry (memv (cdr result-entry) supported-widths)
+                      (equal? declarations (append expected (list result-entry (cons defined-name 1)))))
+           (builder-error who "spec ~a: unexpected declarations in exported values query" index))
+         (values-query member-module script (dialect_name dialect) function inputs assumptions
+                       result-name (cdr result-entry) defined-name)]
+        [else
+         (unless (equal? declarations expected)
+           (builder-error who "spec ~a: exported declarations do not match the inputs" index))
+         (query member-module script (dialect_name dialect) function inputs property assumptions)])))
+  ((if values? values-batch batch) verified text queries))
+
+(define (make_smt_batch dialect module specs [plugin #f])
+  (make-batch dialect module specs plugin #f))
+(define (make_smt_values_batch dialect module specs [plugin #f])
+  (make-batch dialect module specs plugin #t))
+(define (make_smt_values_query dialect module function inputs preconditions [plugin #f])
+  (car (values-batch-queries
+        (make_smt_values_batch dialect module
+                              (list (make_values_spec function inputs preconditions)) plugin))))
+
+(define (batch-requests value)
+  (for/list ([member (in-list (batch-queries value))])
+    (list (query-smtlib member) (expected-inputs (query-inputs member)))))
+
+(define (batch_check value [executable #f] [timeout 10] [arguments '()] [overall-timeout #f])
+  (list->treelist (run_solver_batch (batch-requests value) executable timeout arguments overall-timeout)))
+(define (batch_session_check session value [timeout 10] [overall-timeout #f])
+  (list->treelist (session_check_batch session (batch-requests value) timeout overall-timeout)))
+(define (query_session_check session value [timeout 10] [overall-timeout #f])
+  (session_check session (query-smtlib value) (expected-inputs (query-inputs value))
+                 (if overall-timeout (min timeout overall-timeout) timeout)))
+(define (values_query_check session value limit [timeout 10])
+  (session_values session (values-query-smtlib value) (values-query-result-name value)
+                  (values-query-result-width value) limit timeout (values-query-defined-name value)))
+(define (values_query_inputs value)
+  (list->treelist (for/list ([input (in-list (values-query-inputs value))])
+                   (treelist (car (term-args input)) (term-width input)))))
+(define (values_query_assumptions value)
+  (list->treelist (map render_formula (values-query-preconditions value))))
 
 (define (query_inputs value)
   (list->treelist

@@ -126,6 +126,23 @@ export veneer Dialect(this :: satisfying(schema.is_dialect)):
     query.make_smt_query(this, module, to_string(function), inputs, property, preconditions,
                          plugin)
 
+  // One manifest and one lowering/export for all questions. Specs are checked
+  // in order; diagnostics identify their zero-based index.
+  method smt_batch(module :: mlir.Module, specs :: List.of(smt.Spec),
+                   ~plugin: plugin :: maybe(Path || ReadableString) = #false) :: smt.Batch:
+    query.make_smt_batch(this, module, specs, plugin)
+
+  method smt_values_batch(module :: mlir.Module, specs :: List.of(smt.ValuesSpec),
+                          ~plugin: plugin :: maybe(Path || ReadableString) = #false) :: smt.ValuesBatch:
+    query.make_smt_values_batch(this, module, specs, plugin)
+
+  method smt_values_query(module :: mlir.Module,
+                          ~function: function :: ReadableString,
+                          ~inputs: inputs :: List.of(smt.Term) = [],
+                          ~preconditions: preconditions :: List.of(smt.Formula) = [],
+                          ~plugin: plugin :: maybe(Path || ReadableString) = #false) :: smt.ValuesQuery:
+    query.make_smt_values_query(this, module, to_string(function), inputs, preconditions, plugin)
+
 // An alias binds a parsed constraint in its own space. Definition-site bindings
 // stay resolved when aliases and declaration macros are imported or renamed.
 export defn.macro 'constraint $(name :: Identifier): $(rhs :: constraint_meta.Parsed)':

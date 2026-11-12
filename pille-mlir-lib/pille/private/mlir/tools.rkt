@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require racket/file racket/path racket/runtime-path racket/string racket/system
+(require json racket/file racket/path racket/runtime-path racket/string racket/system
          racket/treelist
          "temporary.rkt")
 
@@ -11,6 +11,7 @@
                      [mlir-module-ir module_ir]
                      [mlir-module-irdl module_irdl]
                      [run-smt-query-pass run_smt_query_pass]
+                     [run-smt-batch-pass run_smt_batch_pass]
                      [parse-stock-module parse_stock_module]
                      [resolve-smt-plugin resolve_smt_plugin]
                      [build-smt-plugin build_smt_plugin]
@@ -65,7 +66,8 @@
 
 (define (run-tool chain name input arguments #:irdl [irdl ""] #:binary? [binary? #f]
                   #:pass-plugins [extra-plugins '()]
-                  #:in-directory [extra-arguments (lambda (_directory) '())])
+                  #:in-directory [extra-arguments (lambda (_directory) '())]
+                  #:read-output [read-output (lambda (_directory value) value)])
   ;; Files avoid pipe-buffer deadlocks for large modules and diagnostics. Run
   ;; directly, without a shell, so paths and pipelines remain literal arguments.
   (define executable (tool-path chain name))
@@ -105,9 +107,10 @@
                                  (list "-" "-o" (path->string output))))))))))
       (unless ok?
         (raise-user-error 'pille/mlir "~a failed:\n~a" name (file->string diagnostics)))
-      (if binary?
-          (bytes->immutable-bytes (file->bytes output))
-          (string->immutable-string (file->string output))))
+      (read-output directory
+                   (if binary?
+                       (bytes->immutable-bytes (file->bytes output))
+                       (string->immutable-string (file->string output)))))
     (lambda () (delete-directory/files directory))))
 
 (define (parse-module source [irdl ""] [chain (make-toolchain)])
@@ -193,6 +196,33 @@
                      "--pass-pipeline=builtin.module(pille-smt-query{manifest="
                      (quote-pass-option 'smt_query (path->string path))
                      "})")))))
+
+;; One lowering invocation for all specs. The plugin also prints standalone
+;; query modules through MLIR's printer into one JSON sidecar. Keeping these
+;; texts avoids parsing MLIR here or launching a process per batch member.
+(define (run-smt-batch-pass module plugin manifest)
+  (unless (mlir-module? module) (raise-argument-error 'smt_batch "mlir-module?" module))
+  (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
+            '("--verify-each" "--mlir-print-debuginfo")
+            #:irdl (mlir-module-irdl module)
+            #:pass-plugins (list plugin)
+            #:in-directory
+            (lambda (directory)
+              (define path (build-path directory "manifest.json"))
+              (call-with-output-file path #:exists 'truncate
+                (lambda (out)
+                  (write-json
+                   (hash-set manifest 'query_modules
+                             (path->string (build-path directory "queries.json"))) out)))
+              (list (string-append
+                     "--pass-pipeline=builtin.module(pille-smt-query{manifest="
+                     (quote-pass-option 'smt_batch (path->string path)) "})")))
+            #:read-output
+            (lambda (directory output)
+              (define modules (call-with-input-file (build-path directory "queries.json") read-json))
+              (unless (and (list? modules) (andmap string? modules))
+                (raise-user-error 'smt_batch "invalid standalone query modules from lowering plugin"))
+              (values output (map string->immutable-string modules)))))
 
 ;; Verify with the stock tools only: no IRDL definitions and no plugins. This
 ;; is what mlir-translate sees, so a residual custom operation fails here.

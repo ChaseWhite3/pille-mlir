@@ -1,0 +1,162 @@
+#lang rhombus/static
+
+import:
+  pille/mlir
+  pille/mlir/dialect
+  pille/mlir/schema
+  pille/mlir/smt
+  rhombus/envvar
+  "bench-batch-support.rkt" as support
+
+// Run with the selected MLIR installation and Z3 available. Building the
+// plugin is excluded; module verification is reported separately and included
+// once in each end-to-end total. Set
+// PILLE_MLIR_SMT_PLUGIN to use an already rebuilt plugin. The optional
+// PILLE_SMT_BENCH_SKIP_SINGLE skips only the slow legacy baseline during
+// development; leave it unset for the complete benchmark.
+def plugin :: Path = support.plugin()
+def word = schema.type_is("i8")
+def arithmetic :: dialect.Dialect:
+  fun binary(name :: String, meaning):
+    schema.operation(name, ~operands: [["a", word], ["b", word]],
+                     ~results: [["out", word]], ~smt: schema.semantics("out", meaning))
+  schema.make_dialect("batch_arithmetic",
+                      [binary("add", schema.add(schema.operand("a"), schema.operand("b"))),
+                       binary("mul", schema.mul(schema.operand("a"), schema.operand("b")))])
+
+def [module_ms :: Real, program :: mlir.Module] = support.measure(fun(): arithmetic.module(support.basic_source))
+println("mode\tquestions\ttotal_ms\tms_per_question")
+support.row("module_verify", 1, module_ms)
+
+def x = smt.input("x", ~width: 8)
+def returned = smt.result(~width: 8)
+fun spec(index :: Int) :: smt.Spec:
+  let fixed = smt.eq(x, smt.const(index mod 256, ~width: 8))
+  match index mod 3
+  | 0: smt.Spec(~function: "identity", ~inputs: [x], ~property: smt.eq(returned, x),
+                ~preconditions: [fixed])
+  | 1: smt.Spec(~function: "successor", ~inputs: [x], ~property: smt.eq(returned, x),
+                ~preconditions: [fixed])
+  | ~else:
+      smt.Spec(~function: "successor", ~inputs: [x], ~property: smt.eq(returned, x),
+               ~preconditions: [fixed, smt.eq(x, smt.const((index + 1) mod 256, ~width: 8))])
+
+fun check_answer(answer :: smt.Outcome, index :: Int):
+  match answer
+  | _ :: smt.Proved:
+      unless index mod 3 != 1 | error("expected a counterexample")
+  | counterexample :: smt.Counterexample:
+      unless index mod 3 == 1 | error("expected a proof")
+      unless counterexample.values[0].value == index mod 256 | error("wrong counterexample")
+  | ~else: error(answer.describe())
+
+for (n in [1, 10, 100, 1000]):
+  let specs = for List (index in 0 .. n): spec(index)
+  unless envvar.getenv("PILLE_SMT_BENCH_SKIP_SINGLE")
+  | let started :: Real = support.milliseconds()
+    for (index in 0 .. n):
+      // Keep the legacy path intact: lower/export each property separately.
+      let fixed = smt.eq(x, smt.const(index mod 256, ~width: 8))
+      let assumptions:
+        if index mod 3 == 2
+        | [fixed, smt.eq(x, smt.const((index + 1) mod 256, ~width: 8))]
+        | [fixed]
+      let query = arithmetic.smt_query(program,
+                                       ~function: (if index mod 3 == 0 | "identity" | "successor"),
+                                       ~inputs: [x], ~property: smt.eq(returned, x),
+                                       ~preconditions: assumptions, ~plugin: plugin)
+      check_answer(query.check(), index)
+    support.row("single", n, module_ms + support.milliseconds() - started)
+
+  let [lower_ms :: Real, batch :: smt.Batch] = support.measure(fun(): arithmetic.smt_batch(program, specs, ~plugin: plugin))
+  let [solve_ms :: Real, answers :: List.of(smt.Outcome)] = support.measure(fun(): batch.check())
+  for (answer in answers, index in 0 ..): check_answer(answer, index)
+  support.row("batch_lower", n, lower_ms)
+  support.row("batch", n, module_ms + lower_ms + solve_ms)
+
+  let session = smt.Session()
+  try:
+    // Warm the already open solver before measuring questions as they arrive.
+    session.check(batch.queries[0])
+    let started :: Real = support.milliseconds()
+    for (query in batch.queries, index in 0 ..):
+      let answer :: smt.Outcome = session.check(query)
+      check_answer(answer, index)
+    let elapsed :: Real = support.milliseconds() - started
+    support.row("session_check", n, elapsed)
+    support.row("session_with_lowering", n, module_ms + lower_ms + elapsed)
+    ~finally: session.close()
+
+// Closer's model uses leave for state transitions and four Boolean recipes
+// over 0/1. Generate 500 independent chains of 0 through 30 leave operations.
+def strength_dialect :: dialect.Dialect:
+  let one = schema.const(1, ~width: 8)
+  let zero = schema.const(0, ~width: 8)
+  fun operation(name :: String, operands :: List, meaning):
+    schema.operation(name, ~operands: for List (operand in operands): [operand, word],
+                     ~results: [["out", word]], ~smt: schema.semantics("out", meaning))
+  schema.make_dialect(
+    "closer_strengths",
+    [operation("leave", ["before", "state"], schema.operand("state")),
+     operation("is", ["value", "wanted"],
+               schema.if_equal(schema.operand("value"), schema.operand("wanted"), one, zero)),
+     operation("both", ["a", "b"], schema.if_equal(schema.operand("a"), one, schema.operand("b"), zero)),
+     operation("either", ["a", "b"], schema.if_equal(schema.operand("a"), one, one, schema.operand("b"))),
+     operation("none", ["a"], schema.if_equal(schema.operand("a"), one, zero, one))])
+
+def [closer_module_ms :: Real, closer_program :: mlir.Module] = support.measure(fun(): strength_dialect.module(support.closer_source(500)))
+def start = smt.input("start", ~width: 8)
+def domain = [smt.or(& (for List (value in 0 .. 8): smt.eq(start, smt.const(value, ~width: 8))))]
+def comparison_specs:
+  for List:
+    each index in 0 .. 500
+    each value in 0 .. 8
+    smt.Spec(~function: "chain_" ++ to_string(index), ~inputs: [start],
+             ~property: smt.eq(returned, smt.const(value, ~width: 8)), ~preconditions: domain)
+def [closer_lower_ms :: Real, closer_batch :: smt.Batch] = support.measure(fun(): strength_dialect.smt_batch(closer_program, comparison_specs, ~plugin: plugin))
+def [closer_solve_ms :: Real, closer_answers :: List.of(smt.Outcome)] = support.measure(fun(): closer_batch.check())
+for (answer in closer_answers, question in 0 ..):
+  let index = question div 8
+  let wanted = question mod 8
+  let length = index mod 31
+  let should_prove = length > 0 && (index + length - 1) mod 8 == wanted
+  match answer
+  | _ :: smt.Proved:
+      unless should_prove | error("wrong Closer proof")
+  | _ :: smt.Counterexample:
+      when should_prove | error("wrong Closer counterexample")
+  | ~else: error(answer.describe())
+support.row("closer_module_verify", 1, closer_module_ms)
+support.row("closer_batch_lower", 4000, closer_lower_ms)
+support.row("closer_batch", 4000, closer_module_ms + closer_lower_ms + closer_solve_ms)
+
+def value_specs:
+  for List (index in 0 .. 500):
+    smt.ValuesSpec(~function: "chain_" ++ to_string(index), ~inputs: [start], ~preconditions: domain)
+def [values_lower_ms :: Real, values_batch :: smt.ValuesBatch] = support.measure(fun(): strength_dialect.smt_values_batch(closer_program, value_specs, ~plugin: plugin))
+def values_session = smt.Session()
+try:
+  values_session.values(values_batch.queries[0], ~limit: 9)
+  let started :: Real = support.milliseconds()
+  for (query in values_batch.queries, index in 0 ..):
+    match values_session.values(query, ~limit: 9)
+    | answer :: smt.Values:
+        let length = index mod 31
+        let expected:
+          if length == 0
+          | [0, 1, 2, 3, 4, 5, 6, 7]
+          | [(index + length - 1) mod 8]
+        unless answer.complete && answer.values == expected | error("wrong Closer value set")
+    | answer :: smt.Outcome: error(answer.describe())
+  let elapsed :: Real = support.milliseconds() - started
+  support.row("closer_values_lower", 500, values_lower_ms)
+  support.row("closer_values_session", 500, elapsed)
+  support.row("closer_values", 500, closer_module_ms + values_lower_ms + elapsed)
+  ~finally: values_session.close()
+
+// The Boolean recipes also go through the generic declaration model.
+def relation = strength_dialect.smt_query(
+  closer_program, ~function: "relation", ~inputs: [start],
+  ~property: smt.eq(returned, smt.const(1, ~width: 8)),
+  ~preconditions: domain, ~plugin: plugin)
+unless relation.check().is_proved | error("Closer Boolean recipes were not proved")

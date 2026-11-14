@@ -1,0 +1,17 @@
+raco test: (file "pille/pille/tests/float.rhm")
+raco test: (file "pille/pille/tests/simd.rhm")
+raco test: (file "pille/pille/tests/interop.rhm")
+raco test: (file "pille/pille/tests/pointer.rhm")
+raco test: (file "pille/pille/tests/public_math.rhm")
+raco test: (file "pille/pille/tests/buffer.rhm")
+raco test: (file "pille/pille/tests/spmd/basics.rhm")
+raco test: (file "pille/pille/tests/spmd/checked-integers.rhm")
+  84 pille/pille/tests/float.rhm
+  80 pille/pille/tests/simd.rhm
+  59 pille/pille/tests/buffer.rhm
+  41 pille/pille/tests/interop.rhm
+  40 pille/pille/tests/pointer.rhm
+  18 pille/pille/tests/spmd/checked-integers.rhm
+   8 pille/pille/tests/public_math.rhm
+   1 pille/pille/tests/spmd/basics.rhm
+331 tests passed

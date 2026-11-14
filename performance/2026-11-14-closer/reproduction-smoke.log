@@ -1,0 +1,6 @@
+Isolated work directory: /var/folders/0z/3fgyb_z17ls2clpvc8zvmrxh0000gn/T/pille-perf-reproduce-3r8bqbaq
+[1200, 300, "first ms", 128.14800000000105, "baseline median ms", 2.5939999999973224, "candidate median ms", 0.6379999999990105]
+[1200, 340, "first ms", 1.4389999999984866, "baseline median ms", 2.805000000000291, "candidate median ms", 0.6299999999973807]
+[100, 600, "first ms", 0.0900000000037835, "baseline median ms", 0.4110000000000582, "candidate median ms", 0.07899999999790452]
+[288, 576, "first ms", 0.23999999999796273, "baseline median ms", 1.1300000000046566, "candidate median ms", 0.20200000000477303]
+[33, 31, "first ms", 0.006000000001222361, "baseline median ms", 0.006999999997788109, "candidate median ms", 0.00399999999353895]

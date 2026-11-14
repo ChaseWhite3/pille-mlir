@@ -4,8 +4,7 @@ Notes on API added by Claude, kept apart from the human-written manual. The
 Scribble docs and README do not cover any of this yet.
 
 Source: the Closer performance investigation of 2026-11-14. Its patch, measurements and
-reproduction script were kept in the working tree under `performance/2026-11-14-closer/`,
-which is not part of the repository's history.
+reproduction script are under `performance/2026-11-14-closer/`.
 
 ## `log(x)` and `tanh(x)`
 

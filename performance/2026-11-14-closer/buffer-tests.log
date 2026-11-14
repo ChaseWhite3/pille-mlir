@@ -1,0 +1,2 @@
+raco test: (file "pille/pille/tests/buffer.rhm")
+50 tests passed

@@ -1,0 +1,66 @@
+--- a/closer-exports/closer_exports/reader/tagger.rhm
++++ b/closer-exports/closer_exports/reader/tagger.rhm
+@@ -2,8 +2,6 @@
+ 
+ import:
+   pille/hosted open
+-  // Pille exposes these LLVM operations internally before its public math API.
+-  lib("pille/private/kernel/prim/unop.rhm") as prim
+ 
+ export:
+   score_sentence
+@@ -97,12 +95,12 @@
+       k := k + 4
+     j := 0
+     while j < 300:
+-      let candidate = prim.tanh(gates[j])
+-      let input_gate = prim.tanh(gates[300 + j] * 0.5) * 0.5 + 0.5
+-      let forget_gate = prim.tanh(gates[600 + j] * 0.5) * 0.5 + 0.5
+-      let output_gate = prim.tanh(gates[900 + j] * 0.5) * 0.5 + 0.5
++      let candidate = tanh(gates[j])
++      let input_gate = tanh(gates[300 + j] * 0.5) * 0.5 + 0.5
++      let forget_gate = tanh(gates[600 + j] * 0.5) * 0.5 + 0.5
++      let output_gate = tanh(gates[900 + j] * 0.5) * 0.5 + 0.5
+       c[j] := forget_gate * c[j] + input_gate * candidate
+-      h[j] := output_gate * prim.tanh(c[j])
++      h[j] := output_gate * tanh(c[j])
+       output[row * 300 + j] := h[j]
+       j := j + 1
+     t := t + 1
+@@ -246,7 +244,7 @@
+     while i < 425:
+       total := total + exp(acc[i] - mx)
+       i := i + 1
+-    let lse = mx + prim.log(total)
++    let lse = mx + log(total)
+     i := 0
+     while i < 425:
+       acc[i] := acc[i] - lse
+@@ -264,7 +262,7 @@
+     while j < length - 1:
+       head_total := head_total + exp((head_scores[t * length + j] :: Double) - head_max)
+       j := j + 1
+-    let head_lse = prim.log(head_total)
++    let head_lse = log(head_total)
+     j := 0
+     while j < length - 1:
+       deps[(t - 1) * (length - 1) + j] := Float.cast((head_scores[t * length + j] :: Double) - head_max - head_lse)
+--- a/closer-exports/closer_exports/reader/pos.rhm
++++ b/closer-exports/closer_exports/reader/pos.rhm
+@@ -2,7 +2,6 @@
+ 
+ import:
+   pille/hosted open
+-  lib("pille/private/kernel/prim/unop.rhm") as prim
+   "tagger.rhm" open
+ 
+ export:
+@@ -51,7 +50,7 @@
+       let d = out[r * 96 + j] - mean
+       spread := spread + d * d
+       j := j + 1
+-    let scale = 1.0 / prim.sqrt(spread / 96.0 + 0.00000001)
++    let scale = 1.0 / sqrt(spread / 96.0 + 0.00000001)
+     j := 0
+     while j < 96:
+       out[r * 96 + j] := (out[r * 96 + j] - mean) * scale * gain[j] + shift[j]

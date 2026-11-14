@@ -1,0 +1,125 @@
+Pille / Closer numerical performance investigation — 2026-11-14
+
+Outcome
+
+Implemented and tested changes in an isolated Pille clone, with a frozen copy
+of Closer. The active Pille and Closer libraries were not changed. This folder
+contains reviewable patches, measurements, source provenance and a reproduction
+script. Nothing was committed or installed globally. Closer's working agent
+was not interrupted.
+
+Closer has replaced Python/NumPy in its English parser with Rhombus preparation
+and Pille-compiled kernels. This is not a NumPy dependency inside Pille.
+
+Retained changes: pille.patch
+
+* Public natural log and tanh for Float, Double and SIMD, following the existing
+  generic dispatch. Four implementation lines expose existing LLVM primitives.
+  sqrt was already public.
+* Optional pille/buffer.transpose_copy, using existing typed slices and tiled
+  element copying. It checks shape, slice lengths, byte/address overflow and
+  overlapping ranges before writing, under every UB policy. Zero-sized matrices
+  are supported. Element types must have positive byte stride. It copies values;
+  it makes no promise to preserve arbitrary structure padding.
+* Regression tests for checked SPMD arithmetic. The reported overflow-check
+  problem did not reproduce: current Pille already handles active/inactive lanes.
+  No arithmetic implementation was changed and Closer's workaround was retained.
+
+Optional Closer adoption: closer-public-math.patch
+
+This removes private primitive imports from the two tagger modules in favor of
+public log, tanh and sqrt. Apply after the Pille API additions, when the Closer
+owner is ready. It was tested on an isolated Closer copy. It does not introduce
+the transpose helper or change model inference, parser rules, resolver records,
+SMT behavior or published package contracts.
+
+Measurements
+
+Apple M4 Pro Mac mini, 14 cores, 64 GB; Racket 9.3 CS; LLVM 23.1.5.
+Five recorded sentences of 3–12 tokens; first calls separated from two warm
+passes. These are parser measurements, not whole-editor latency or Windows data.
+
+Quiet baseline warm medians per sentence:
+  annotation                  0.712 ms
+  neural supertagger           4.662 ms
+  score-buffer copying        0.003 ms
+  request construction        0.324 ms
+  request-to-pointer copying  0.001 ms
+  decoding                    0.035 ms
+  formula construction        1.193 ms
+
+The five-sentence warm passes took 40.739 and 40.283 ms. Parser initialization
+took 1.201 s with cached modules. First annotation, supertagging and decoding
+took approximately 0.762, 1.417 and 0.342 s, including JIT compilation. Initial
+uncached Rhombus dependency compilation is excluded from these values.
+
+Copying is therefore a poor optimization target on this sample. No buffer
+ownership rewrite or zero-copy adoption was made in Closer.
+
+Actual transpose_copy API versus Closer's Rhombus element-copy loop, including
+allocation and copying into/out of the native buffers (median of seven calls):
+  shape          existing       helper        warm speedup
+  1200 x 300      2.432 ms       0.514 ms       4.73x
+  1200 x 340      2.750 ms       0.530 ms       5.19x
+   100 x 600      0.411 ms       0.073 ms       5.63x
+   288 x 576      1.110 ms       0.201 ms       5.52x
+
+The first helper invocation cost 108.83 ms including compilation. That can
+exceed the savings for a single model load. The helper remains opt-in; these
+numbers do not establish an end-to-end Closer startup improvement and are not
+a comparison against Python/NumPy.
+
+Rejected experiments
+
+Two dense multiplication loop variants held more partial results in registers.
+Both retained exact recorded annotations, features, raw scores, requests and
+readings over all 15 benchmark calls. The 16-column variant also passed 155
+matrix shapes against the original and an independent float32 rounding oracle.
+
+* Candidate16: approximately 14% slower in paired warm total time.
+* Candidate64: approximately 2.2% slower, with no consistent benefit and higher
+  first-call JIT cost.
+
+They are preserved only as explicitly REJECTED patches and evidence. Neither
+belongs in the proposed implementation.
+
+Validation
+
+Final validation counts and log references are recorded in VALIDATION.txt.
+The staged Pille patch passes git apply --check against the unchanged checkout.
+The source archive is the frozen working-tree input, not an assumed clean
+Closer revision. source-manifest.json records all 409 source-file digests.
+
+Reproduction
+
+Requires a compatible local Racket/Rhombus installation and LLVM 23.1. Model
+files are not bundled; parser runs require the existing converted parser model.
+No network downloads, global package installation, active-branch switching or
+active-process termination are performed by the script.
+
+  python3 reproduce.py --mode tests
+  python3 reproduce.py --mode transpose
+  python3 reproduce.py --mode baseline --model /path/to/parser-model
+  python3 reproduce.py --mode public-api --model /path/to/parser-model
+
+Options --source, --work, --racket and --llvm select local inputs. Each run
+creates a fresh checkout at the recorded Pille commit, applies pille.patch,
+verifies the Closer source snapshot, and uses its own collections and compiled
+cache. candidate16 and candidate64 modes reproduce the rejected variants.
+Observed JSON results remain historical; reruns write to their new directory.
+
+Human documentation follow-up
+
+Repository instructions prohibit editing the human-written README and Scribble
+documentation. Neither was edited. The floating-point section should document
+public log(x), tanh(x), $log and $tanh. A new section should describe importing
+pille/buffer, transpose_copy's shapes and disjoint-buffer contract, caller-owned
+lifetimes, supported element types, and its JIT startup tradeoff.
+
+Recommended handoff
+
+Adopt the additive public math API and its small Closer call-site patch when
+the Closer owner is ready. Keep transpose_copy optional until a repeated-use
+workload justifies its compilation cost. Preserve the current dense kernels.
+Keep startup/JIT and inference separate in future profiles. Do not remove
+Closer's UB-policy workaround solely on the isolated arithmetic regression.

@@ -1,0 +1,391 @@
+diff --git a/pille-lib/pille/buffer.rhm b/pille-lib/pille/buffer.rhm
+new file mode 100644
+index 0000000..e1c8754
+--- /dev/null
++++ b/pille-lib/pille/buffer.rhm
+@@ -0,0 +1,45 @@
++#lang pille/private/kernel
++
++import:
++  "main.rhm" open
++
++// Copy a row-major matrix to its row-major transpose. The caller owns both
++// buffers; their element counts must match the shape and their byte ranges
++// must be disjoint. These preconditions do not depend on the UB policy.
++export fun transpose_copy(source :: SliceOf(α), target :: SliceMut(α),
++                          rows :: USize, cols :: USize) :: Void:
++  specl.assert(α.byte_stride > 0)
++  when cols != 0 && rows > USize.max_value /↓ cols
++  | panic("transpose_copy: shape product overflows")
++  let count = rows * cols
++  unless source.len == count && target.len == count
++  | panic("transpose_copy: slice lengths do not match the shape")
++
++  when count != 0
++  | when count > USize.max_value /↓ α.byte_stride
++    | panic("transpose_copy: byte count overflows")
++    let bytes = count * α.byte_stride
++    let src = prim.ptrtoint(source.ptr.raw, ~to: USize)
++    let dst = prim.ptrtoint(target.ptr.raw, ~to: USize)
++    when src > USize.max_value - bytes || dst > USize.max_value - bytes
++    | panic("transpose_copy: address range overflows")
++    when src < dst + bytes && dst < src + bytes
++    | panic("transpose_copy: source and target overlap")
++
++    // Bound each tile by the remaining rows/columns before adding its size,
++    // so even the tile endpoints cannot overflow for a valid shape.
++    var rb :: USize = 0
++    while rb < rows:
++      let rend = rb + (if rows - rb < 32 | rows - rb | 32)
++      var cb :: USize = 0
++      while cb < cols:
++        let cend = cb + (if cols - cb < 32 | cols - cb | 32)
++        var r = rb
++        while r < rend:
++          var c = cb
++          while c < cend:
++            target.ptr[c * rows + r] := source.ptr[r * cols + c]
++            c := c + 1
++          r := r + 1
++        cb := cend
++      rb := rend
+diff --git a/pille-lib/pille/private/float.rhm b/pille-lib/pille/private/float.rhm
+index 4ea679c..c7f41c2 100644
+--- a/pille-lib/pille/private/float.rhm
++++ b/pille-lib/pille/private/float.rhm
+@@ -192,11 +192,13 @@ unary_ops:
+   $cos: cos
+   $exp: exp
+   $floor: floor
++  $log: log
+   $neg: fneg
+   $round: roundeven
+   $sin: sin
+   $sqrt: sqrt
+   $tan: tan
++  $tanh: tanh
+   $trunc: ftrunc
+ 
+ //==============================================================================
+diff --git a/pille-lib/pille/private/generic_ops.rhm b/pille-lib/pille/private/generic_ops.rhm
+index 0acb8ba..4442b8a 100644
+--- a/pille-lib/pille/private/generic_ops.rhm
++++ b/pille-lib/pille/private/generic_ops.rhm
+@@ -28,10 +28,12 @@ export generic_funops:
+   cos(x)
+   exp(x)
+   floor(x)
++  log(x)
+   round(x)
+   sin(x)
+   sqrt(x)
+   tan(x)
++  tanh(x)
+   trunc(x)
+ 
+ //==============================================================================
+diff --git a/pille/pille/tests/buffer.rhm b/pille/pille/tests/buffer.rhm
+new file mode 100644
+index 0000000..de79b6a
+--- /dev/null
++++ b/pille/pille/tests/buffer.rhm
+@@ -0,0 +1,99 @@
++#lang rhombus/static
++
++import:
++  ffi open
++  pille/hosted open
++  pille/buffer open
++
++fun transpose_u32(input, output, rows, cols, source_len, target_len):
++  pille(source :: Slice(UInt(32)) = [input, source_len],
++        target :: SliceMut(UInt(32)) = [output, target_len],
++        rows :: USize, cols :: USize):
++    transpose_copy(source, target, rows, cols)
++
++fun read_u32(buffer, length) :: List:
++  for List (i in 0..length): mem (cast (uint32_t*) buffer)[i]
++
++fun sequence_buffer(length):
++  let buffer = new uint32_t[length]
++  for (i in 0..length): mem buffer[i] := i + 1
++  buffer
++
++// Check both orientations, full tiles, tails and degenerate dimensions.
++def shapes = [[1, 1], [1, 65], [65, 1], [2, 3], [3, 2], [32, 32], [33, 31], [31, 33], [65, 67], [0, 0], [0, 7], [7, 0]]
++for ([rows, cols] in shapes):
++  check:
++    let count = rows * cols
++    let input = sequence_buffer(math.max(1, count))
++    let output = sequence_buffer(math.max(1, count))
++    transpose_u32(input, output, rows, cols, count, count)
++    read_u32(output, count)
++    ~is (for List:
++           each c in 0..cols
++           each r in 0..rows
++           r * cols + c + 1)
++
++// Float/Double storage is checked through integer views, including signed
++// zero, infinity, and NaN payloads: the transpose must perform no arithmetic.
++def float_patterns = [0x80000000, 0x7fc12345, 0x7f800000, 0x3f800000, 0xffc54321, 0x00000000, 0x7f812345, 0xff800000]
++check:
++  let input = new uint32_t[8]
++  let output = new uint32_t[8]
++  for (i in 0..8): mem input[i] := float_patterns[i]
++  pille(source :: Slice(Float) = [input, 8], target :: SliceMut(Float) = [output, 8]):
++    transpose_copy(source, target, 2 :: USize, 4 :: USize)
++  read_u32(output, 8)
++  ~is (for List (i in [0, 4, 1, 5, 2, 6, 3, 7]): float_patterns[i])
++
++def double_patterns = [0x8000000000000000, 0x7ff8123456789abc, 0x7ff0000000000000, 0x3ff0000000000000, 0xfff8abcdef123456, 0x0000000000000000, 0x7ff0123456789abc, 0xfff0000000000000]
++check:
++  let input = new uint64_t[8]
++  let output = new uint64_t[8]
++  for (i in 0..8): mem input[i] := double_patterns[i]
++  pille(source :: SliceMut(Double) = [input, 8], target :: SliceMut(Double) = [output, 8]):
++    transpose_copy(source, target, 2 :: USize, 4 :: USize)
++  (for List (i in 0..8): mem output[i])
++  ~is (for List (i in [0, 4, 1, 5, 2, 6, 3, 7]): double_patterns[i])
++
++// Every rejection must precede writes even when normal UB checks are off.
++for (policy in [#'check, #'suppress, #'allow]):
++  pille.configure_jit(~ub_policy: policy)
++  let input = sequence_buffer(12)
++  let output = sequence_buffer(12)
++  let before = read_u32(output, 12)
++  check transpose_u32(input, output, 2, 3, 5, 6) ~throws "slice lengths do not match"
++  check transpose_u32(input, output, 2, 3, 6, 7) ~throws "slice lengths do not match"
++  check read_u32(output, 12) ~is before
++
++  let maximum = pille: USize.max_value
++  check transpose_u32(input, output, maximum, 2, 6, 6) ~throws "shape product overflows"
++  check transpose_u32(input, output, maximum, 1, maximum, maximum) ~throws "byte count overflows"
++  check read_u32(output, 12) ~is before
++
++  // A correctly aligned address whose claimed range wraps must be refused
++  // before either buffer is read or written. This pointer is never valid
++  // memory and must not be dereferenced, even with UB checks disabled.
++  let near_end = uintptr_to_ptr(maximum - 3)
++  check transpose_u32(near_end, output, 2, 3, 6, 6) ~throws "address range overflows"
++  check transpose_u32(input, near_end, 2, 3, 6, 6) ~throws "address range overflows"
++  check read_u32(output, 12) ~is before
++
++  let shifted = pille(p :: PtrMut(UInt(32)) = input): p + 1
++  check transpose_u32(input, input, 2, 3, 6, 6) ~throws "source and target overlap"
++  check transpose_u32(input, shifted, 2, 3, 6, 6) ~throws "source and target overlap"
++  check transpose_u32(shifted, input, 2, 3, 6, 6) ~throws "source and target overlap"
++  check read_u32(input, 12) ~is before
++
++  // Adjacent ranges in one allocation are disjoint; an empty range may
++  // share its pointer with the other empty range.
++  check:
++    let adjacent = pille(p :: PtrMut(UInt(32)) = input): p + 6
++    transpose_u32(input, adjacent, 2, 3, 6, 6)
++    read_u32(adjacent, 6)
++    ~is [1, 4, 2, 5, 3, 6]
++  check:
++    transpose_u32(input, input, 0, maximum, 0, 0)
++    read_u32(input, 6)
++    ~is [1, 2, 3, 4, 5, 6]
++
++pille.configure_jit()
+diff --git a/pille/pille/tests/public_math.rhm b/pille/pille/tests/public_math.rhm
+new file mode 100644
+index 0000000..4895d1a
+--- /dev/null
++++ b/pille/pille/tests/public_math.rhm
+@@ -0,0 +1,124 @@
++#lang rhombus/static
++
++import:
++  ffi open
++  pille/hosted open
++
++// Exercise only the public API, with runtime inputs so LLVM must lower the
++// operations rather than folding literal calls during compilation.
++pille.fun scalar_math(x :: FloatingPoint):
++  specl.assert(type_of(tanh(x)) == type_of(x))
++  specl.assert(type_of(sqrt(x)) == type_of(x))
++  specl.assert(type_of(log(x)) == type_of(x))
++  [tanh(x), sqrt(abs(x)), log(abs(x) + 1.0)]
++
++pille.fun special_values(zero :: FloatingPoint):
++  let inf = 1.0 / zero
++  let nan = zero / zero
++  let negative_zero = -zero
++  let tanh_nan = tanh(nan)
++  let sqrt_negative = sqrt(-1.0 :: type_of(zero))
++  let log_negative = log(-1.0 :: type_of(zero))
++  let log_nan = log(nan)
++  [tanh(inf) == 1.0,
++   tanh(-inf) == -1.0,
++   !(tanh_nan == tanh_nan),
++   1.0 / tanh(negative_zero) < -1.0e30,
++   1.0 / sqrt(negative_zero) < -1.0e30,
++   !(sqrt_negative == sqrt_negative),
++   log(zero) == -inf,
++   log(negative_zero) == -inf,
++   !(log_negative == log_negative),
++   log(inf) == inf,
++   !(log_nan == log_nan)]
++
++def samples = [-1.0, 0.0, 0.5, 1.0]
++def expected_tanh = [-0.7615941559557649, 0.0, 0.46211715726000974, 0.7615941559557649]
++def expected_sqrt = [1.0, 0.0, 0.7071067811865476, 1.0]
++def expected_log = [0.6931471805599453, 0.0, 0.4054651081081644, 0.6931471805599453]
++
++fun near(actual :: List, expected :: List, tolerance) :: Boolean:
++  actual.length() == expected.length()
++    && (for all (a in actual, e in expected): math.abs(a - e) <= tolerance)
++
++check:
++  for all (x in samples, t in expected_tanh, s in expected_sqrt, l in expected_log):
++    near(pille(x :: Float): scalar_math(x), [t, s, l], 1.0e-6)
++  ~is #true
++
++check:
++  for all (x in samples, t in expected_tanh, s in expected_sqrt, l in expected_log):
++    near(pille(x :: Double): scalar_math(x), [t, s, l], 1.0e-14)
++  ~is #true
++
++check:
++  let zero = 0.0
++  pille(zero :: Float): special_values(zero)
++  ~is [#true, #true, #true, #true, #true, #true, #true, #true, #true, #true, #true]
++
++check:
++  let zero = 0.0
++  pille(zero :: Double): special_values(zero)
++  ~is [#true, #true, #true, #true, #true, #true, #true, #true, #true, #true, #true]
++
++// Distinct lanes exercise vector lowering and lane independence for both
++// element types. Buffer alignment is explicitly that of the element type.
++check:
++  let input = new float_t[4]
++  let output_tanh = new float_t[4]
++  let output_sqrt = new float_t[4]
++  let output_log = new float_t[4]
++  for (i in 0..4): mem input[i] := samples[i]
++  pille(input :: RawPtr, output_tanh :: RawPtr, output_sqrt :: RawPtr, output_log :: RawPtr):
++    let x = input.load(Simd(Float, 4), 4)
++    specl.assert(type_of(tanh(x)) == Simd(Float, 4))
++    specl.assert(type_of(sqrt(x)) == Simd(Float, 4))
++    specl.assert(type_of(log(x)) == Simd(Float, 4))
++    output_tanh.store(tanh(x), 4)
++    output_sqrt.store(sqrt(abs(x)), 4)
++    output_log.store(log(abs(x) + 1.0), 4)
++  [near(for List (i in 0..4): mem output_tanh[i], expected_tanh, 1.0e-6),
++   near(for List (i in 0..4): mem output_sqrt[i], expected_sqrt, 1.0e-6),
++   near(for List (i in 0..4): mem output_log[i], expected_log, 1.0e-6)]
++  ~is [#true, #true, #true]
++
++check:
++  let input = new double_t[4]
++  let output_tanh = new double_t[4]
++  let output_sqrt = new double_t[4]
++  let output_log = new double_t[4]
++  for (i in 0..4): mem input[i] := samples[i]
++  pille(input :: RawPtr, output_tanh :: RawPtr, output_sqrt :: RawPtr, output_log :: RawPtr):
++    let x = input.load(Simd(Double, 4), 8)
++    specl.assert(type_of(tanh(x)) == Simd(Double, 4))
++    specl.assert(type_of(sqrt(x)) == Simd(Double, 4))
++    specl.assert(type_of(log(x)) == Simd(Double, 4))
++    output_tanh.store(tanh(x), 8)
++    output_sqrt.store(sqrt(abs(x)), 8)
++    output_log.store(log(abs(x) + 1.0), 8)
++  [near(for List (i in 0..4): mem output_tanh[i], expected_tanh, 1.0e-14),
++   near(for List (i in 0..4): mem output_sqrt[i], expected_sqrt, 1.0e-14),
++   near(for List (i in 0..4): mem output_log[i], expected_log, 1.0e-14)]
++  ~is [#true, #true, #true]
++
++// Vector log must preserve each lane's domain behavior: log(1), log(0),
++// log(-1), and log(+infinity), with inputs loaded at runtime.
++check:
++  let input = new uint32_t[4]
++  let output = new float_t[4]
++  for (i in 0..4, bits in [0x3f800000, 0, 0xbf800000, 0x7f800000]): mem input[i] := bits
++  pille(input :: RawPtr, output :: PtrMut(Float)):
++    output.raw.store(log(input.load(Simd(Float, 4), 4)), 4)
++    let inf = 1.0 / (0.0 :: Float)
++    [output[0] == 0.0, output[1] == -inf, !(output[2] == output[2]), output[3] == inf]
++  ~is [#true, #true, #true, #true]
++
++check:
++  let input = new uint64_t[4]
++  let output = new double_t[4]
++  for (i in 0..4, bits in [0x3ff0000000000000, 0, 0xbff0000000000000, 0x7ff0000000000000]): mem input[i] := bits
++  pille(input :: RawPtr, output :: PtrMut(Double)):
++    output.raw.store(log(input.load(Simd(Double, 4), 8)), 8)
++    let inf = 1.0 / (0.0 :: Double)
++    [output[0] == 0.0, output[1] == -inf, !(output[2] == output[2]), output[3] == inf]
++  ~is [#true, #true, #true, #true]
+diff --git a/pille/pille/tests/spmd/checked-integers.rhm b/pille/pille/tests/spmd/checked-integers.rhm
+new file mode 100644
+index 0000000..7989e8a
+--- /dev/null
++++ b/pille/pille/tests/spmd/checked-integers.rhm
+@@ -0,0 +1,64 @@
++#lang rhombus/static
++
++import:
++  ffi open
++  pille/hosted open
++  pille/spmd/embedded open
++
++// Arithmetic in a varying branch checks only the lanes that execute it.
++// Keep the overflowing lane last: reducing only the first lane would miss it.
++pille.fun arithmetic(input :: Ptr(α), output :: PtrMut(α), active :: UInt(32), op :: UInt(32)) :: Void:
++  spmd(4):
++    par_for (i in 0 .. 4):
++      let value = input[i]
++      when i < active
++      | cond
++        | op == 0: output[i] := value + 1
++        | op == 1: output[i] := value - 1
++        | ~else: output[i] := value * 2
++
++fun signed(op :: Int, active :: Int, edge :: Int) :: List:
++  let input = new int8_t[4]
++  let output = new int8_t[4]
++  for (i in 0 .. 4):
++    mem input[i] := if i == 3 | edge | i + 2
++    mem output[i] := 99
++  pille(input :: Ptr(Int(8)), output :: PtrMut(Int(8)), active :: UInt(32), op :: UInt(32)):
++    arithmetic(input, output, active, op)
++  for List (i in 0 .. 4): mem output[i]
++
++fun unsigned(op :: Int, active :: Int, edge :: Int) :: List:
++  let input = new uint8_t[4]
++  let output = new uint8_t[4]
++  for (i in 0 .. 4):
++    mem input[i] := if i == 3 | edge | i + 2
++    mem output[i] := 99
++  pille(input :: Ptr(UInt(8)), output :: PtrMut(UInt(8)), active :: UInt(32), op :: UInt(32)):
++    arithmetic(input, output, active, op)
++  for List (i in 0 .. 4): mem output[i]
++
++pille.configure_jit(~ub_policy: #'check)
++
++check signed(0, 3, 127) ~is [3, 4, 5, 99]
++check signed(1, 3, -128) ~is [1, 2, 3, 99]
++check signed(2, 3, 64) ~is [4, 6, 8, 99]
++check unsigned(0, 3, 255) ~is [3, 4, 5, 99]
++check unsigned(1, 3, 0) ~is [1, 2, 3, 99]
++check unsigned(2, 3, 128) ~is [4, 6, 8, 99]
++
++check signed(0, 4, 127) ~throws "integer overflow/underflow"
++check signed(1, 4, -128) ~throws "integer overflow/underflow"
++check signed(2, 4, 64) ~throws "integer overflow/underflow"
++check unsigned(0, 4, 255) ~throws "integer overflow/underflow"
++check unsigned(1, 4, 0) ~throws "integer overflow/underflow"
++check unsigned(2, 4, 128) ~throws "integer overflow/underflow"
++
++// Suppression keeps its existing wrapping behavior, without throwing.
++pille.configure_jit(~ub_policy: #'suppress)
++
++check signed(0, 4, 127) ~is [3, 4, 5, -128]
++check signed(1, 4, -128) ~is [1, 2, 3, 127]
++check signed(2, 4, 64) ~is [4, 6, 8, -128]
++check unsigned(0, 4, 255) ~is [3, 4, 5, 0]
++check unsigned(1, 4, 0) ~is [1, 2, 3, 255]
++check unsigned(2, 4, 128) ~is [4, 6, 8, 0]

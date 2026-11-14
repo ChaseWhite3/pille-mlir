@@ -1,0 +1,7 @@
+{"monotonic_ms":134.008,"stage":"process_started"}
+{"monotonic_ms":10788.004,"stage":"module_loaded"}
+{"index":-1,"ms":1310.9770000000008,"pass":0,"stage":"parser_init"}
+1736
+{"index":0,"ms":959.9329999999991,"pass":0,"stage":"annotate"}
+{"index":0,"ms":1737.933000000001,"pass":0,"stage":"supertag"}
+{"index":0,"ms":0.006999999999607098,"pass":0,"stage":"pointer_bytes"}

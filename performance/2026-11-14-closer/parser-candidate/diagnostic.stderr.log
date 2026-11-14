@@ -1,0 +1,6 @@
+raw tag scores differ for vector 0
+  context...:
+   /Users/chasewhite/Library/Racket/9.3/pkgs/rhombus-lib/rhombus/private/error.rhm:41:0: error
+   .../amalgam/effect.rkt:22:19
+   body of "/tmp/pille-perf-bw1z4aif/artifacts/parser-candidate/bench.rhm"
+   body of "/tmp/pille-perf-bw1z4aif/artifacts/parser-candidate/run.rkt"

@@ -1,0 +1,96 @@
+#lang rhombus/static/and_meta
+import:
+  lib("racket/base.rkt") as rkt
+  lib("racket/file.rkt") as rfile
+  lib("file/sha1.rkt") as sha1
+  rhombus/json
+  closer_exports/reader/parser open
+  closer_exports/reader/annotate open
+  closer_exports/reader/supertag open
+  closer_exports/reader/request open
+  closer_exports/reader/weights.pointer_bytes
+  file("/tmp/pille-perf-bw1z4aif/closer/closer-lang/ccg2lambda.rhm").formulas_all
+
+def output = Path("/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline")
+def vectors :: Map = json.from_string(to_string(rfile.#{file->string}("/tmp/pille-perf-bw1z4aif/closer/closer-exports/closer_exports/reader/tests/parser/vectors.json")))
+def indices = [0, 8, 12, 34, 38]
+def mutable events :: List = []
+fun emit(event :: Map):
+  events := events.add(event)
+  println(json.to_string(event))
+  rkt.#{flush-output}()
+fun timed(stage :: String, index :: Int, pass :: Int, work :: Function):
+  let started :: Real = rkt.#{current-inexact-monotonic-milliseconds}()
+  let result = work()
+  emit({"stage": stage, "index": index, "pass": pass,
+        "ms": rkt.#{current-inexact-monotonic-milliseconds}() - started})
+  result
+fun saved(name :: String, b :: Bytes):
+  rkt.#{call-with-output-file}(output.add(name), fun (port): rkt.#{write-bytes}(b, port), ~exists: #'truncate)
+fun save_json(name :: String, value):
+  saved(name, rkt.#{string->bytes/utf-8}(json.to_string(value)))
+fun hex(b :: Bytes) :: String: to_string(sha1.#{bytes->hex-string}(b))
+fun digest(b :: Bytes) :: String: hex(rkt.#{sha256-bytes}(b))
+fun quoted(s :: String) :: String:
+  "\"" ++ s.replace("\\", "\\\\", ~all: #true).replace("\"", "\\\"", ~all: #true) ++ "\""
+fun u32(v :: Int) :: Bytes: rkt.#{integer->integer-bytes}(v, 4, #false, #false)
+fun i32(v :: Int) :: Bytes: rkt.#{integer->integer-bytes}(v, 4, #true, #false)
+fun f32(v :: Flonum) :: Bytes: rkt.#{real->floating-point-bytes}(v, 4, #false)
+fun frame(tokens :: List, r :: Request) :: Bytes:
+  let rows :: List:
+    for List (t :: Map in tokens):
+      "{\"word\": " ++ quoted(t["word"]) ++ ", \"pos\": " ++ quoted(t["pos"]) ++ ", \"lemma\": " ++ quoted(t["lemma"]) ++ ", \"chunk\": \"XX\"}"
+  let metadata :: Bytes = rkt.#{string->bytes/utf-8}("[" ++ String.join(rows, ", ") ++ "]")
+  let body :: Bytes:
+    Bytes.append(u32(1), u32(metadata.length()), metadata, u32(r.length), u32(r.nbest), i32(r.keep), u32(r.max_steps),
+                 f32(r.leaf_out), f32(r.penalty), u32(r.leaf_count), r.leaves, r.leaf_scores, r.deps, r.best_dep, r.tag_out, r.dep_out)
+  Bytes.append(u32(body.length()), body)
+fun annotated_tree(node :: Map, tokens :: List) :: Map:
+  if node.has_key("children")
+  | {"cat": node["cat"], "type": node["type"],
+     "children": for List (child in (node["children"] :~ List)): annotated_tree(child, tokens)}
+  | (tokens[node["token"]] :~ Map) ++ {"cat": node["cat"]}
+
+emit({"stage": "module_loaded", "monotonic_ms": rkt.#{current-inexact-monotonic-milliseconds}()})
+def p :: Parser = timed("parser_init", -1, 0, fun(): parser_of(parser_model()))
+save_json("config.json", {"config": p.config, "keep": p.keep, "tag_ids": p.tag_ids})
+for (pass in 0 .. 3):
+  for (index :: Int in indices):
+    let row :: Map = (vectors["vectors"] :~ List)[index]
+    let sentence :: String = row["sentence"]
+    let tokens :: List = timed("annotate", index, pass, fun(): annotations(p.annotator, sentence))
+    let expected_tokens :: List = for List ([text, _, _, tag, _, _, lemma :: String] in (row["analyses"] :~ List)): {"word": text, "pos": tag, "lemma": lemma.downcase(), "chunk": "XX"}
+    unless tokens == expected_tokens | error("annotations differ for vector " +& index)
+    let [feature_words, feature_suffixes, feature_prefixes] = features_of(p.supertagger, for List (t :: Map in tokens): t["word"])
+    unless {"words": feature_words, "suffixes": feature_suffixes, "prefixes": feature_prefixes} == row["features"] | error("features differ for vector " +& index)
+    let Array(tags, deps) = timed("supertag", index, pass, fun(): p.supertagger.score(for List (t :: Map in tokens): t["word"]))
+    let n = tokens.length()
+    let [tag_bytes :: Bytes, dep_bytes :: Bytes] = timed("pointer_bytes", index, pass, fun(): [pointer_bytes(tags, n * 425), pointer_bytes(deps, n * (n + 1))])
+    unless rkt.#{equal?}(tag_bytes, rfile.#{file->bytes}(Path("/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline/vector-" +& index +& "-tags.f32"))) | error("raw tag scores differ for vector " +& index)
+    unless rkt.#{equal?}(dep_bytes, rfile.#{file->bytes}(Path("/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline/vector-" +& index +& "-deps.f32"))) | error("raw dependency scores differ for vector " +& index)
+    let allowed :: List = for List (t :: Map in tokens): p.allowed.get(t["word"], #false)
+    let request :: Request = timed("request_of", index, pass, fun(): request_of(tag_bytes, dep_bytes, n, allowed, p.tag_ids, p.config, p.keep))
+    let array :: Array = timed("request_array", index, pass, fun(): request_array(request))
+    let decoded :: List = timed("decode", index, pass, fun(): p.decode(array))
+    let trees :: List = for List (found :: Map in decoded): annotated_tree(found["tree"], tokens)
+    let formulas :: Map = timed("formula", index, pass, fun(): formulas_all({"sentences": [{"trees": trees}], "templates": "/tmp/pille-perf-bw1z4aif/closer/rules/ccg2lambda-en-event.json"}))
+    let terms :: List = (formulas["formulas"] :~ List)[0]
+    let readings :: List:
+      for List (found :: Map in decoded, tree :: Map in trees, term in terms):
+        {"tree": tree ++ {"log_prob": found["log_prob"]}, "log_prob": found["log_prob"], "term": term}
+    let bytes = frame(tokens, request)
+    unless digest(bytes) == (row["request"] :~ Map)["sha256"] | error("request differs for vector " +& index)
+    unless readings == row["readings"] | error("readings differ for vector " +& index)
+    when pass == 0
+    | let name = "vector-" +& index
+      saved(name ++ "-tags.f32", tag_bytes)
+      saved(name ++ "-deps.f32", dep_bytes)
+      saved(name ++ "-request.bin", bytes)
+      save_json(name ++ ".json", {"index": index, "sentence": sentence, "n": n, "tokens": tokens, "allowed": allowed,
+                                  "tags": name ++ "-tags.f32", "deps": name ++ "-deps.f32", "request": name ++ "-request.bin",
+                                  "request_sha256": digest(bytes), "config": p.config, "keep": p.keep, "tag_ids": p.tag_ids,
+                                  "request_scalars": [request.length, request.nbest, request.keep, request.max_steps, request.leaf_out, request.penalty, request.leaf_count],
+                                  "request_blocks_hex": [hex(request.leaves), hex(request.leaf_scores), hex(request.deps), hex(request.best_dep), hex(request.tag_out), hex(request.dep_out)],
+                                  "readings": readings})
+    emit({"stage": "validated", "index": index, "pass": pass, "tokens": n, "request_sha256": digest(bytes)})
+save_json("events.json", events)

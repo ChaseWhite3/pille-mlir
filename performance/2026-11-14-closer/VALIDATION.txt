@@ -1,0 +1,39 @@
+Validation completed 2026-11-14
+
+331 focused Pille tests passed, in sequential isolated processes:
+  float.rhm                         84
+  simd.rhm                          80
+  buffer.rhm                        59
+  interop.rhm                       41
+  pointer.rhm                       40
+  spmd/checked-integers.rhm          18
+  public_math.rhm                    8
+  spmd/basics.rhm                    1
+See focused-regressions.log. New buffer tests include invalid source/target
+address ranges, refused before dereferencing, under every UB policy.
+
+Closer public-math adoption patch: 16 parser checks passed. The checks cover
+54 annotation examples and 42 parsed sentences, request framing/digests,
+features, trees, scores and formulas. See public-api-parser-check.log.
+
+Baseline and each rejected matrix variant: 15 calls on five sentences match
+annotations, features, raw tag/dependency bytes, requests and complete readings.
+Candidate16 also passed 155 matrix shapes against both the old kernel and an
+independent float32 oracle. The variants were rejected for performance.
+
+transpose_copy matched Closer's transposed bytes on all benchmark shapes.
+
+Fresh reproduction smoke: reproduce.py --mode transpose succeeded after a
+local clone, detached checkout, patch application and verification of all
+409 source-file digests. See reproduction-smoke.log. Its timing was taken
+while correctness checks were running; use transpose-api-bench.log for the
+quiet performance measurements.
+
+pille.patch passes git apply --check against the active Pille checkout.
+The active Pille HEAD remains 7c0b0cf7548136a81581438ad5c250a64de7dd66.
+No active library, Closer source, model, installed package or server changed.
+Only this performance artifact folder was added to the active Pille checkout.
+
+The entire Pille/MLIR/Closer application suites were not run: changed public
+numeric APIs, buffer behavior, interop, SIMD and the actual parser consumer
+were covered by the focused checks above.

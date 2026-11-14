@@ -1,0 +1,56 @@
+{
+  "machine": {
+    "model": "Mac mini",
+    "chip": "Apple M4 Pro",
+    "cores": 14,
+    "performance_cores": 10,
+    "efficiency_cores": 4,
+    "memory_gb": 64,
+    "racket": "9.3 [cs]",
+    "os": "Darwin25.6.0 arm64"
+  },
+  "stages": {
+    "annotate": {
+      "count": 10,
+      "median_ms": 0.7824999999997999,
+      "min_ms": 0.4030000000002474,
+      "max_ms": 1.0690000000004147
+    },
+    "supertag": {
+      "count": 10,
+      "median_ms": 5.0044999999995525,
+      "min_ms": 3.0309999999990396,
+      "max_ms": 8.735999999999876
+    },
+    "pointer_bytes": {
+      "count": 10,
+      "median_ms": 0.0039999999999054126,
+      "min_ms": 0.001999999999497959,
+      "max_ms": 0.007999999999810825
+    },
+    "request_of": {
+      "count": 10,
+      "median_ms": 0.37900000000036016,
+      "min_ms": 0.11599999999998545,
+      "max_ms": 0.7989999999999782
+    },
+    "request_array": {
+      "count": 10,
+      "median_ms": 0.0019999999999527063,
+      "min_ms": 0.0009999999992942321,
+      "max_ms": 0.0020000000004074536
+    },
+    "decode": {
+      "count": 10,
+      "median_ms": 0.03600000000005821,
+      "min_ms": 0.023999999999432475,
+      "max_ms": 0.5430000000005748
+    },
+    "formula": {
+      "count": 10,
+      "median_ms": 1.237500000000182,
+      "min_ms": 0.602999999999156,
+      "max_ms": 2.3090000000001965
+    }
+  }
+}

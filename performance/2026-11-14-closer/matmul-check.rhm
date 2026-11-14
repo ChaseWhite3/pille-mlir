@@ -1,0 +1,52 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/hosted open
+  lib("racket/base.rkt") as rkt
+  lib("racket/flonum.rkt") as fl
+  "../closer/closer-exports/closer_exports/reader/tagger.rhm" as old
+  "../closer-candidate/closer-exports/closer_exports/reader/tagger.rhm" as candidate
+  "../closer/closer-exports/closer_exports/reader/weights.rhm" as buffers
+
+pille.configure_jit(~ub_policy: #'suppress)
+
+fun before(a, b, output, rows :: Int, inner :: Int, cols :: Int):
+  pille(a :: Ptr(Float), b :: Ptr(Float), o :: PtrMut(Float) = output,
+        r :: Int(32) = rows, k :: Int(32) = inner, c :: Int(32) = cols):
+    old.multiply(a, b, o, r, k, c)
+
+fun after(a, b, output, rows :: Int, inner :: Int, cols :: Int):
+  pille(a :: Ptr(Float), b :: Ptr(Float), o :: PtrMut(Float) = output,
+        r :: Int(32) = rows, k :: Int(32) = inner, c :: Int(32) = cols):
+    candidate.multiply(a, b, o, r, k, c)
+
+def mutable cases = 0
+def shapes = (for List:
+                each rows in [0, 1, 3]
+                each inner in [0, 1, 3, 4, 5, 16, 17]
+                each cols in [0, 1, 15, 16, 17, 32, 37]
+                [rows, inner, cols]) ++ [[8, 340, 1200], [8, 300, 1200], [8, 600, 100], [8, 100, 425], [8, 101, 100], [8, 576, 288], [8, 288, 288], [8, 96, 50]]
+for ([rows :: Int, inner :: Int, cols :: Int] in shapes):
+  let av :: List = for List (i in 0 .. rows * inner): fl.flsingle(if i mod 9 == 0 | 0.0 | math.sin(math.inexact(i + 1)))
+  let bv :: List = for List (i in 0 .. inner * cols): fl.flsingle(math.cos(math.inexact(i + 3)))
+  let a = new float_t[math.max(1, rows * inner)]
+  let b = new float_t[math.max(1, inner * cols)]
+  let o1 = new float_t[math.max(1, rows * cols)]
+  let o2 = new float_t[math.max(1, rows * cols)]
+  for (v in av, i in 0 ..): mem a[i] := v
+  for (v in bv, i in 0 ..): mem b[i] := v
+  before(a, b, o1, rows, inner, cols)
+  after(a, b, o2, rows, inner, cols)
+  unless rkt.#{equal?}(buffers.pointer_bytes(o1, rows * cols), buffers.pointer_bytes(o2, rows * cols))
+  | error("candidate differs for " +& [rows, inner, cols])
+  for:
+    each r in 0 .. rows
+    each c in 0 .. cols
+    let expected :: Flonum:
+      for values(total :: Flonum = 0.0) (k in 0 .. inner):
+        fl.flsingle(total + fl.flsingle((av[r * inner + k] :~ Flonum) * (bv[k * cols + c] :~ Flonum)))
+    unless (mem o2[r * cols + c]) .= expected
+    | error("float32 reference differs for " +& [rows, inner, cols, r, c])
+  cases := cases + 1
+println("matrix shapes passed: " +& cases)

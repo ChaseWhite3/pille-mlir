@@ -1,0 +1,2 @@
+raco test: (file "/tmp/pille-perf-bw1z4aif/closer-public-api/closer-exports/closer_exports/reader/parser_check.rhm")
+16 tests passed

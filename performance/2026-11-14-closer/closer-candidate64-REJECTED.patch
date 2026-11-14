@@ -1,0 +1,101 @@
+--- a/closer-exports/closer_exports/reader/tagger.rhm
++++ b/closer-exports/closer_exports/reader/tagger.rhm
+@@ -61,18 +61,88 @@
+ 
+ pille.fun multiply(a :: PtrTo(Float), b :: PtrTo(Float), out :: PtrMut(Float),
+                    rows :: Int(32), inner, cols) :: Void:
+-  clear(out, rows * cols)
+   var r :: Int(32) = 0
+   while r < rows:
+-    var k :: Int(32) = 0
+-    while k + 4 <= inner:
+-      let at = r * inner + k
+-      axpy4(out + r * cols, a[at], a[at + 1], a[at + 2], a[at + 3], b + k * cols, cols, cols)
+-      k := k + 4
+-    while k < inner:
+-      let v = a[r * inner + k]
+-      when v != 0.0 | axpy(out + r * cols, v, b + k * cols, cols)
+-      k := k + 1
++    var col :: Int(32) = 0
++    while col + 64 <= cols:
++      var total0 :: Simd(Float, 16) = 0.0
++      var total1 :: Simd(Float, 16) = 0.0
++      var total2 :: Simd(Float, 16) = 0.0
++      var total3 :: Simd(Float, 16) = 0.0
++      var k :: Int(32) = 0
++      while k + 4 <= inner:
++        let v0 :: Simd(Float, 16) = a[r * inner + k + 0]
++        total0 := total0 + v0 * (b + (k + 0) * cols + col + 0).raw.load(Simd(Float, 16), 4)
++        total1 := total1 + v0 * (b + (k + 0) * cols + col + 16).raw.load(Simd(Float, 16), 4)
++        total2 := total2 + v0 * (b + (k + 0) * cols + col + 32).raw.load(Simd(Float, 16), 4)
++        total3 := total3 + v0 * (b + (k + 0) * cols + col + 48).raw.load(Simd(Float, 16), 4)
++        let v1 :: Simd(Float, 16) = a[r * inner + k + 1]
++        total0 := total0 + v1 * (b + (k + 1) * cols + col + 0).raw.load(Simd(Float, 16), 4)
++        total1 := total1 + v1 * (b + (k + 1) * cols + col + 16).raw.load(Simd(Float, 16), 4)
++        total2 := total2 + v1 * (b + (k + 1) * cols + col + 32).raw.load(Simd(Float, 16), 4)
++        total3 := total3 + v1 * (b + (k + 1) * cols + col + 48).raw.load(Simd(Float, 16), 4)
++        let v2 :: Simd(Float, 16) = a[r * inner + k + 2]
++        total0 := total0 + v2 * (b + (k + 2) * cols + col + 0).raw.load(Simd(Float, 16), 4)
++        total1 := total1 + v2 * (b + (k + 2) * cols + col + 16).raw.load(Simd(Float, 16), 4)
++        total2 := total2 + v2 * (b + (k + 2) * cols + col + 32).raw.load(Simd(Float, 16), 4)
++        total3 := total3 + v2 * (b + (k + 2) * cols + col + 48).raw.load(Simd(Float, 16), 4)
++        let v3 :: Simd(Float, 16) = a[r * inner + k + 3]
++        total0 := total0 + v3 * (b + (k + 3) * cols + col + 0).raw.load(Simd(Float, 16), 4)
++        total1 := total1 + v3 * (b + (k + 3) * cols + col + 16).raw.load(Simd(Float, 16), 4)
++        total2 := total2 + v3 * (b + (k + 3) * cols + col + 32).raw.load(Simd(Float, 16), 4)
++        total3 := total3 + v3 * (b + (k + 3) * cols + col + 48).raw.load(Simd(Float, 16), 4)
++        k := k + 4
++      while k < inner:
++        let v = a[r * inner + k]
++        when v != 0.0
++        | let av :: Simd(Float, 16) = v
++          total0 := total0 + av * (b + k * cols + col + 0).raw.load(Simd(Float, 16), 4)
++          total1 := total1 + av * (b + k * cols + col + 16).raw.load(Simd(Float, 16), 4)
++          total2 := total2 + av * (b + k * cols + col + 32).raw.load(Simd(Float, 16), 4)
++          total3 := total3 + av * (b + k * cols + col + 48).raw.load(Simd(Float, 16), 4)
++        k := k + 1
++      (out + r * cols + col + 0).raw.store(total0, 4)
++      (out + r * cols + col + 16).raw.store(total1, 4)
++      (out + r * cols + col + 32).raw.store(total2, 4)
++      (out + r * cols + col + 48).raw.store(total3, 4)
++      col := col + 64
++    while col + 16 <= cols:
++      var total :: Simd(Float, 16) = 0.0
++      var k :: Int(32) = 0
++      while k + 4 <= inner:
++        let at = r * inner + k
++        let a0 :: Simd(Float, 16) = a[at]
++        let a1 :: Simd(Float, 16) = a[at + 1]
++        let a2 :: Simd(Float, 16) = a[at + 2]
++        let a3 :: Simd(Float, 16) = a[at + 3]
++        total := total + a0 * (b + k * cols + col).raw.load(Simd(Float, 16), 4)
++        total := total + a1 * (b + (k + 1) * cols + col).raw.load(Simd(Float, 16), 4)
++        total := total + a2 * (b + (k + 2) * cols + col).raw.load(Simd(Float, 16), 4)
++        total := total + a3 * (b + (k + 3) * cols + col).raw.load(Simd(Float, 16), 4)
++        k := k + 4
++      while k < inner:
++        let v = a[r * inner + k]
++        when v != 0.0
++        | let av :: Simd(Float, 16) = v
++          total := total + av * (b + k * cols + col).raw.load(Simd(Float, 16), 4)
++        k := k + 1
++      (out + r * cols + col).raw.store(total, 4)
++      col := col + 16
++    while col < cols:
++      var total :: Float = 0.0
++      var k :: Int(32) = 0
++      while k + 4 <= inner:
++        total := total + a[r * inner + k] * b[k * cols + col]
++        total := total + a[r * inner + k + 1] * b[(k + 1) * cols + col]
++        total := total + a[r * inner + k + 2] * b[(k + 2) * cols + col]
++        total := total + a[r * inner + k + 3] * b[(k + 3) * cols + col]
++        k := k + 4
++      while k < inner:
++        let v = a[r * inner + k]
++        when v != 0.0 | total := total + v * b[k * cols + col]
++        k := k + 1
++      out[r * cols + col] := total
++      col := col + 1
+     r := r + 1
+ 
+ pille.fun lstm(xs :: PtrTo(Float), output :: PtrMut(Float), weights :: Ptr(Float),

@@ -1,0 +1,32 @@
+#lang rhombus/static
+
+import:
+  pille/hosted open
+  pille/buffer open
+  lib("racket/base.rkt") as rkt
+  "../closer/closer-exports/closer_exports/reader/weights.rhm" as old
+
+fun candidate(block :: Bytes, rows :: Int, cols :: Int) :: Bytes:
+  let src = old.floats_pointer(block)
+  let dst = old.floats_pointer(rkt.#{make-bytes}(block.length()))
+  pille(s :: Slice(UInt(32)) = [src, rows * cols],
+        d :: SliceMut(UInt(32)) = [dst, rows * cols],
+        r :: USize = rows, c :: USize = cols):
+    transpose_copy(s, d, r, c)
+  old.pointer_bytes(dst, rows * cols)
+
+fun measured(thunk :: Function) :: Real:
+  let started = rkt.#{current-inexact-monotonic-milliseconds}()
+  thunk()
+  rkt.#{current-inexact-monotonic-milliseconds}() - started
+
+fun median(samples :: List): samples.sort()[samples.length() div 2]
+
+for ([rows :: Int, cols :: Int] in [[1200, 300], [1200, 340], [100, 600], [288, 576], [33, 31]]):
+  let block :: Bytes = rkt.#{make-bytes}(4 * rows * cols)
+  for (i in 0 .. rows * cols): rkt.#{integer->integer-bytes}(i, 4, #false, #false, block, i * 4)
+  let expected = old.transposed(block, rows, cols)
+  let first_ms = measured(fun(): unless rkt.#{equal?}(candidate(block, rows, cols), expected) | error("transpose differs"))
+  let old_times = for List (_ in 0 .. 7): measured(fun(): old.transposed(block, rows, cols))
+  let new_times = for List (_ in 0 .. 7): measured(fun(): candidate(block, rows, cols))
+  println([rows, cols, "first ms", first_ms, "baseline median ms", median(old_times), "candidate median ms", median(new_times)])

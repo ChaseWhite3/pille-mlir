@@ -1,0 +1,8 @@
+{
+  "pille_commit": "7c0b0cf7548136a81581438ad5c250a64de7dd66",
+  "original_isolated_root": "/tmp/pille-perf-bw1z4aif",
+  "machine": "Apple M4 Pro Mac mini, 14 cores, 64 GB",
+  "racket": "9.3 [cs]",
+  "llvm": "23.1.5",
+  "source_manifest_sha256": "d72292002903bc5b1c9f5ff39bbaf1911d040c9eaee7870225e8aadac4d68b9c"
+}

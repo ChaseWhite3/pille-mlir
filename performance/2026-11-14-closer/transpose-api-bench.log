@@ -1,0 +1,5 @@
+[1200, 300, "first ms", 108.83000000000015, "baseline median ms", 2.4320000000000164, "candidate median ms", 0.5139999999998963]
+[1200, 340, "first ms", 0.5940000000000509, "baseline median ms", 2.75, "candidate median ms", 0.5299999999999727]
+[100, 600, "first ms", 0.08600000000001273, "baseline median ms", 0.4110000000000582, "candidate median ms", 0.07300000000009277]
+[288, 576, "first ms", 0.22199999999998, "baseline median ms", 1.1100000000001273, "candidate median ms", 0.20100000000002183]
+[33, 31, "first ms", 0.0060000000000854925, "baseline median ms", 0.007000000000061846, "candidate median ms", 0.0029999999999290594]

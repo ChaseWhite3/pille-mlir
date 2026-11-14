@@ -1,0 +1,29 @@
+{
+  "schema": "isolated-closer-parser-benchmark/1",
+  "vector_indices": [
+    0,
+    8,
+    12,
+    34,
+    38
+  ],
+  "passes": 3,
+  "warm_passes": [
+    1,
+    2
+  ],
+  "source_sha256": {
+    "/tmp/pille-perf-bw1z4aif/source-manifest.json": "d72292002903bc5b1c9f5ff39bbaf1911d040c9eaee7870225e8aadac4d68b9c",
+    "/tmp/pille-perf-bw1z4aif/closer/closer-exports/closer_exports/reader/request.rhm": "7406fe338f7de5083c53baeee9ee85d6bbe5d84608c1c7e1a0d77a11709e43db",
+    "/tmp/pille-perf-bw1z4aif/closer/closer-exports/closer_exports/reader/weights.rhm": "318dd99ebc36613717810783b9db677e1cdcf7938d0abf130e06950ae055f2cb",
+    "/tmp/pille-perf-bw1z4aif/closer/closer-exports/closer_exports/reader/tagger.rhm": "8c2aa73232e19cdd5623c5c8202ecc46952e30e6e4aa26f509b97be38871b1fd",
+    "/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline/bench.rhm": "682e561c18f830c737667d77ffc1c8b476e65a7e7566a7c7c94644fcdf602593"
+  },
+  "model_directory": "/Users/chasewhite/.cache/closer/parser",
+  "model_access": "read-only",
+  "environment": {
+    "PILLE_LLVM_PREFIX": "/opt/homebrew/opt/llvm",
+    "compiled_root": "/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline/compiled"
+  },
+  "correctness": "All request frame digests and readings matched recorded vectors on each of 15 calls. Request hashes compare complete framing, tokens and binary blocks."
+}

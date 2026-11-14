@@ -1,0 +1,23 @@
+{
+  "schema": "isolated-closer-parser-benchmark/1",
+  "source_sha256": {
+    "/tmp/pille-perf-bw1z4aif/closer-candidate64/closer-exports/closer_exports/reader/tagger.rhm": "8424911c9beda4c7dd7effe0af6c053725646fa44cb43d4ec911e4096af7c996",
+    "/tmp/pille-perf-bw1z4aif/artifacts/parser-candidate64/bench.rhm": "a2f573df43fb8b19c0379f5ec5c33aa1fdba97848b5de922b15b75d486d963fa",
+    "/tmp/pille-perf-bw1z4aif/artifacts/parser-candidate64/run-benchmark.sh": "958585132b32c5ebbe45f2e71f82ab3f1d02d03a167cef1104dcd4ce469a1a6e",
+    "/tmp/pille-perf-bw1z4aif/artifacts/parser-baseline/bench.rhm": "61d9c8ee58564d1010d92eda70c41ba38ec578490f6b6fc769c43c98fc944b03"
+  },
+  "vectors": [
+    0,
+    8,
+    12,
+    34,
+    38
+  ],
+  "passes": 3,
+  "warm_passes": [
+    1,
+    2
+  ],
+  "correctness": "15 of 15 calls exactly match recorded annotations/features, captured baseline raw score bytes, recorded request frame SHA-256 and complete readings",
+  "notes": "Candidate module load includes compilation of new snapshot paths. Warm timings exclude compilation/JIT; first invocation times include JIT. No live source edits."
+}

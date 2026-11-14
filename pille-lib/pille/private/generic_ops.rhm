@@ -28,10 +28,12 @@ export generic_funops:
   cos(x)
   exp(x)
   floor(x)
+  log(x)
   round(x)
   sin(x)
   sqrt(x)
   tan(x)
+  tanh(x)
   trunc(x)
 
 //==============================================================================

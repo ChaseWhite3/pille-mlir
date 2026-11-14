@@ -1,0 +1,64 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/hosted open
+  pille/spmd/embedded open
+
+// Arithmetic in a varying branch checks only the lanes that execute it.
+// Keep the overflowing lane last: reducing only the first lane would miss it.
+pille.fun arithmetic(input :: Ptr(α), output :: PtrMut(α), active :: UInt(32), op :: UInt(32)) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let value = input[i]
+      when i < active
+      | cond
+        | op == 0: output[i] := value + 1
+        | op == 1: output[i] := value - 1
+        | ~else: output[i] := value * 2
+
+fun signed(op :: Int, active :: Int, edge :: Int) :: List:
+  let input = new int8_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := if i == 3 | edge | i + 2
+    mem output[i] := 99
+  pille(input :: Ptr(Int(8)), output :: PtrMut(Int(8)), active :: UInt(32), op :: UInt(32)):
+    arithmetic(input, output, active, op)
+  for List (i in 0 .. 4): mem output[i]
+
+fun unsigned(op :: Int, active :: Int, edge :: Int) :: List:
+  let input = new uint8_t[4]
+  let output = new uint8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := if i == 3 | edge | i + 2
+    mem output[i] := 99
+  pille(input :: Ptr(UInt(8)), output :: PtrMut(UInt(8)), active :: UInt(32), op :: UInt(32)):
+    arithmetic(input, output, active, op)
+  for List (i in 0 .. 4): mem output[i]
+
+pille.configure_jit(~ub_policy: #'check)
+
+check signed(0, 3, 127) ~is [3, 4, 5, 99]
+check signed(1, 3, -128) ~is [1, 2, 3, 99]
+check signed(2, 3, 64) ~is [4, 6, 8, 99]
+check unsigned(0, 3, 255) ~is [3, 4, 5, 99]
+check unsigned(1, 3, 0) ~is [1, 2, 3, 99]
+check unsigned(2, 3, 128) ~is [4, 6, 8, 99]
+
+check signed(0, 4, 127) ~throws "integer overflow/underflow"
+check signed(1, 4, -128) ~throws "integer overflow/underflow"
+check signed(2, 4, 64) ~throws "integer overflow/underflow"
+check unsigned(0, 4, 255) ~throws "integer overflow/underflow"
+check unsigned(1, 4, 0) ~throws "integer overflow/underflow"
+check unsigned(2, 4, 128) ~throws "integer overflow/underflow"
+
+// Suppression keeps its existing wrapping behavior, without throwing.
+pille.configure_jit(~ub_policy: #'suppress)
+
+check signed(0, 4, 127) ~is [3, 4, 5, -128]
+check signed(1, 4, -128) ~is [1, 2, 3, 127]
+check signed(2, 4, 64) ~is [4, 6, 8, -128]
+check unsigned(0, 4, 255) ~is [3, 4, 5, 0]
+check unsigned(1, 4, 0) ~is [1, 2, 3, 255]
+check unsigned(2, 4, 128) ~is [4, 6, 8, 0]

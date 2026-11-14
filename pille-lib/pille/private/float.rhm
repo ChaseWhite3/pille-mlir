@@ -192,11 +192,13 @@ unary_ops:
   $cos: cos
   $exp: exp
   $floor: floor
+  $log: log
   $neg: fneg
   $round: roundeven
   $sin: sin
   $sqrt: sqrt
   $tan: tan
+  $tanh: tanh
   $trunc: ftrunc
 
 //==============================================================================

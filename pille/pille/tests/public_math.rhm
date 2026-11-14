@@ -1,0 +1,124 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/hosted open
+
+// Exercise only the public API, with runtime inputs so LLVM must lower the
+// operations rather than folding literal calls during compilation.
+pille.fun scalar_math(x :: FloatingPoint):
+  specl.assert(type_of(tanh(x)) == type_of(x))
+  specl.assert(type_of(sqrt(x)) == type_of(x))
+  specl.assert(type_of(log(x)) == type_of(x))
+  [tanh(x), sqrt(abs(x)), log(abs(x) + 1.0)]
+
+pille.fun special_values(zero :: FloatingPoint):
+  let inf = 1.0 / zero
+  let nan = zero / zero
+  let negative_zero = -zero
+  let tanh_nan = tanh(nan)
+  let sqrt_negative = sqrt(-1.0 :: type_of(zero))
+  let log_negative = log(-1.0 :: type_of(zero))
+  let log_nan = log(nan)
+  [tanh(inf) == 1.0,
+   tanh(-inf) == -1.0,
+   !(tanh_nan == tanh_nan),
+   1.0 / tanh(negative_zero) < -1.0e30,
+   1.0 / sqrt(negative_zero) < -1.0e30,
+   !(sqrt_negative == sqrt_negative),
+   log(zero) == -inf,
+   log(negative_zero) == -inf,
+   !(log_negative == log_negative),
+   log(inf) == inf,
+   !(log_nan == log_nan)]
+
+def samples = [-1.0, 0.0, 0.5, 1.0]
+def expected_tanh = [-0.7615941559557649, 0.0, 0.46211715726000974, 0.7615941559557649]
+def expected_sqrt = [1.0, 0.0, 0.7071067811865476, 1.0]
+def expected_log = [0.6931471805599453, 0.0, 0.4054651081081644, 0.6931471805599453]
+
+fun near(actual :: List, expected :: List, tolerance) :: Boolean:
+  actual.length() == expected.length()
+    && (for all (a in actual, e in expected): math.abs(a - e) <= tolerance)
+
+check:
+  for all (x in samples, t in expected_tanh, s in expected_sqrt, l in expected_log):
+    near(pille(x :: Float): scalar_math(x), [t, s, l], 1.0e-6)
+  ~is #true
+
+check:
+  for all (x in samples, t in expected_tanh, s in expected_sqrt, l in expected_log):
+    near(pille(x :: Double): scalar_math(x), [t, s, l], 1.0e-14)
+  ~is #true
+
+check:
+  let zero = 0.0
+  pille(zero :: Float): special_values(zero)
+  ~is [#true, #true, #true, #true, #true, #true, #true, #true, #true, #true, #true]
+
+check:
+  let zero = 0.0
+  pille(zero :: Double): special_values(zero)
+  ~is [#true, #true, #true, #true, #true, #true, #true, #true, #true, #true, #true]
+
+// Distinct lanes exercise vector lowering and lane independence for both
+// element types. Buffer alignment is explicitly that of the element type.
+check:
+  let input = new float_t[4]
+  let output_tanh = new float_t[4]
+  let output_sqrt = new float_t[4]
+  let output_log = new float_t[4]
+  for (i in 0..4): mem input[i] := samples[i]
+  pille(input :: RawPtr, output_tanh :: RawPtr, output_sqrt :: RawPtr, output_log :: RawPtr):
+    let x = input.load(Simd(Float, 4), 4)
+    specl.assert(type_of(tanh(x)) == Simd(Float, 4))
+    specl.assert(type_of(sqrt(x)) == Simd(Float, 4))
+    specl.assert(type_of(log(x)) == Simd(Float, 4))
+    output_tanh.store(tanh(x), 4)
+    output_sqrt.store(sqrt(abs(x)), 4)
+    output_log.store(log(abs(x) + 1.0), 4)
+  [near(for List (i in 0..4): mem output_tanh[i], expected_tanh, 1.0e-6),
+   near(for List (i in 0..4): mem output_sqrt[i], expected_sqrt, 1.0e-6),
+   near(for List (i in 0..4): mem output_log[i], expected_log, 1.0e-6)]
+  ~is [#true, #true, #true]
+
+check:
+  let input = new double_t[4]
+  let output_tanh = new double_t[4]
+  let output_sqrt = new double_t[4]
+  let output_log = new double_t[4]
+  for (i in 0..4): mem input[i] := samples[i]
+  pille(input :: RawPtr, output_tanh :: RawPtr, output_sqrt :: RawPtr, output_log :: RawPtr):
+    let x = input.load(Simd(Double, 4), 8)
+    specl.assert(type_of(tanh(x)) == Simd(Double, 4))
+    specl.assert(type_of(sqrt(x)) == Simd(Double, 4))
+    specl.assert(type_of(log(x)) == Simd(Double, 4))
+    output_tanh.store(tanh(x), 8)
+    output_sqrt.store(sqrt(abs(x)), 8)
+    output_log.store(log(abs(x) + 1.0), 8)
+  [near(for List (i in 0..4): mem output_tanh[i], expected_tanh, 1.0e-14),
+   near(for List (i in 0..4): mem output_sqrt[i], expected_sqrt, 1.0e-14),
+   near(for List (i in 0..4): mem output_log[i], expected_log, 1.0e-14)]
+  ~is [#true, #true, #true]
+
+// Vector log must preserve each lane's domain behavior: log(1), log(0),
+// log(-1), and log(+infinity), with inputs loaded at runtime.
+check:
+  let input = new uint32_t[4]
+  let output = new float_t[4]
+  for (i in 0..4, bits in [0x3f800000, 0, 0xbf800000, 0x7f800000]): mem input[i] := bits
+  pille(input :: RawPtr, output :: PtrMut(Float)):
+    output.raw.store(log(input.load(Simd(Float, 4), 4)), 4)
+    let inf = 1.0 / (0.0 :: Float)
+    [output[0] == 0.0, output[1] == -inf, !(output[2] == output[2]), output[3] == inf]
+  ~is [#true, #true, #true, #true]
+
+check:
+  let input = new uint64_t[4]
+  let output = new double_t[4]
+  for (i in 0..4, bits in [0x3ff0000000000000, 0, 0xbff0000000000000, 0x7ff0000000000000]): mem input[i] := bits
+  pille(input :: RawPtr, output :: PtrMut(Double)):
+    output.raw.store(log(input.load(Simd(Double, 4), 8)), 8)
+    let inf = 1.0 / (0.0 :: Double)
+    [output[0] == 0.0, output[1] == -inf, !(output[2] == output[2]), output[3] == inf]
+  ~is [#true, #true, #true, #true]

@@ -1,0 +1,45 @@
+#lang pille/private/kernel
+
+import:
+  "main.rhm" open
+
+// Copy a row-major matrix to its row-major transpose. The caller owns both
+// buffers; their element counts must match the shape and their byte ranges
+// must be disjoint. These preconditions do not depend on the UB policy.
+export fun transpose_copy(source :: SliceOf(α), target :: SliceMut(α),
+                          rows :: USize, cols :: USize) :: Void:
+  specl.assert(α.byte_stride > 0)
+  when cols != 0 && rows > USize.max_value /↓ cols
+  | panic("transpose_copy: shape product overflows")
+  let count = rows * cols
+  unless source.len == count && target.len == count
+  | panic("transpose_copy: slice lengths do not match the shape")
+
+  when count != 0
+  | when count > USize.max_value /↓ α.byte_stride
+    | panic("transpose_copy: byte count overflows")
+    let bytes = count * α.byte_stride
+    let src = prim.ptrtoint(source.ptr.raw, ~to: USize)
+    let dst = prim.ptrtoint(target.ptr.raw, ~to: USize)
+    when src > USize.max_value - bytes || dst > USize.max_value - bytes
+    | panic("transpose_copy: address range overflows")
+    when src < dst + bytes && dst < src + bytes
+    | panic("transpose_copy: source and target overlap")
+
+    // Bound each tile by the remaining rows/columns before adding its size,
+    // so even the tile endpoints cannot overflow for a valid shape.
+    var rb :: USize = 0
+    while rb < rows:
+      let rend = rb + (if rows - rb < 32 | rows - rb | 32)
+      var cb :: USize = 0
+      while cb < cols:
+        let cend = cb + (if cols - cb < 32 | cols - cb | 32)
+        var r = rb
+        while r < rend:
+          var c = cb
+          while c < cend:
+            target.ptr[c * rows + r] := source.ptr[r * cols + c]
+            c := c + 1
+          r := r + 1
+        cb := cend
+      rb := rend

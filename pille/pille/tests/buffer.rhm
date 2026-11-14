@@ -1,0 +1,99 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/hosted open
+  pille/buffer open
+
+fun transpose_u32(input, output, rows, cols, source_len, target_len):
+  pille(source :: Slice(UInt(32)) = [input, source_len],
+        target :: SliceMut(UInt(32)) = [output, target_len],
+        rows :: USize, cols :: USize):
+    transpose_copy(source, target, rows, cols)
+
+fun read_u32(buffer, length) :: List:
+  for List (i in 0..length): mem (cast (uint32_t*) buffer)[i]
+
+fun sequence_buffer(length):
+  let buffer = new uint32_t[length]
+  for (i in 0..length): mem buffer[i] := i + 1
+  buffer
+
+// Check both orientations, full tiles, tails and degenerate dimensions.
+def shapes = [[1, 1], [1, 65], [65, 1], [2, 3], [3, 2], [32, 32], [33, 31], [31, 33], [65, 67], [0, 0], [0, 7], [7, 0]]
+for ([rows, cols] in shapes):
+  check:
+    let count = rows * cols
+    let input = sequence_buffer(math.max(1, count))
+    let output = sequence_buffer(math.max(1, count))
+    transpose_u32(input, output, rows, cols, count, count)
+    read_u32(output, count)
+    ~is (for List:
+           each c in 0..cols
+           each r in 0..rows
+           r * cols + c + 1)
+
+// Float/Double storage is checked through integer views, including signed
+// zero, infinity, and NaN payloads: the transpose must perform no arithmetic.
+def float_patterns = [0x80000000, 0x7fc12345, 0x7f800000, 0x3f800000, 0xffc54321, 0x00000000, 0x7f812345, 0xff800000]
+check:
+  let input = new uint32_t[8]
+  let output = new uint32_t[8]
+  for (i in 0..8): mem input[i] := float_patterns[i]
+  pille(source :: Slice(Float) = [input, 8], target :: SliceMut(Float) = [output, 8]):
+    transpose_copy(source, target, 2 :: USize, 4 :: USize)
+  read_u32(output, 8)
+  ~is (for List (i in [0, 4, 1, 5, 2, 6, 3, 7]): float_patterns[i])
+
+def double_patterns = [0x8000000000000000, 0x7ff8123456789abc, 0x7ff0000000000000, 0x3ff0000000000000, 0xfff8abcdef123456, 0x0000000000000000, 0x7ff0123456789abc, 0xfff0000000000000]
+check:
+  let input = new uint64_t[8]
+  let output = new uint64_t[8]
+  for (i in 0..8): mem input[i] := double_patterns[i]
+  pille(source :: SliceMut(Double) = [input, 8], target :: SliceMut(Double) = [output, 8]):
+    transpose_copy(source, target, 2 :: USize, 4 :: USize)
+  (for List (i in 0..8): mem output[i])
+  ~is (for List (i in [0, 4, 1, 5, 2, 6, 3, 7]): double_patterns[i])
+
+// Every rejection must precede writes even when normal UB checks are off.
+for (policy in [#'check, #'suppress, #'allow]):
+  pille.configure_jit(~ub_policy: policy)
+  let input = sequence_buffer(12)
+  let output = sequence_buffer(12)
+  let before = read_u32(output, 12)
+  check transpose_u32(input, output, 2, 3, 5, 6) ~throws "slice lengths do not match"
+  check transpose_u32(input, output, 2, 3, 6, 7) ~throws "slice lengths do not match"
+  check read_u32(output, 12) ~is before
+
+  let maximum = pille: USize.max_value
+  check transpose_u32(input, output, maximum, 2, 6, 6) ~throws "shape product overflows"
+  check transpose_u32(input, output, maximum, 1, maximum, maximum) ~throws "byte count overflows"
+  check read_u32(output, 12) ~is before
+
+  // A correctly aligned address whose claimed range wraps must be refused
+  // before either buffer is read or written. This pointer is never valid
+  // memory and must not be dereferenced, even with UB checks disabled.
+  let near_end = uintptr_to_ptr(maximum - 3)
+  check transpose_u32(near_end, output, 2, 3, 6, 6) ~throws "address range overflows"
+  check transpose_u32(input, near_end, 2, 3, 6, 6) ~throws "address range overflows"
+  check read_u32(output, 12) ~is before
+
+  let shifted = pille(p :: PtrMut(UInt(32)) = input): p + 1
+  check transpose_u32(input, input, 2, 3, 6, 6) ~throws "source and target overlap"
+  check transpose_u32(input, shifted, 2, 3, 6, 6) ~throws "source and target overlap"
+  check transpose_u32(shifted, input, 2, 3, 6, 6) ~throws "source and target overlap"
+  check read_u32(input, 12) ~is before
+
+  // Adjacent ranges in one allocation are disjoint; an empty range may
+  // share its pointer with the other empty range.
+  check:
+    let adjacent = pille(p :: PtrMut(UInt(32)) = input): p + 6
+    transpose_u32(input, adjacent, 2, 3, 6, 6)
+    read_u32(adjacent, 6)
+    ~is [1, 4, 2, 5, 3, 6]
+  check:
+    transpose_u32(input, input, 0, maximum, 0, 0)
+    read_u32(input, 6)
+    ~is [1, 2, 3, 4, 5, 6]
+
+pille.configure_jit()

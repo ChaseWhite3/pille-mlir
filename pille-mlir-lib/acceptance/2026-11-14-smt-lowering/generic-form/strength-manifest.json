@@ -1,0 +1,307 @@
+{
+ "format": "pille-smt-query",
+ "operations": {
+  "closer_strengths.both": {
+   "locals": [],
+   "operands": [
+    "a",
+    "b"
+   ],
+   "requires": [],
+   "result": "out",
+   "value": [
+    "select",
+    [
+     "operand",
+     0
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "operand",
+     1
+    ],
+    [
+     "const",
+     "0",
+     [
+      "width",
+      8
+     ]
+    ]
+   ]
+  },
+  "closer_strengths.either": {
+   "locals": [],
+   "operands": [
+    "a",
+    "b"
+   ],
+   "requires": [],
+   "result": "out",
+   "value": [
+    "select",
+    [
+     "operand",
+     0
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "operand",
+     1
+    ]
+   ]
+  },
+  "closer_strengths.is": {
+   "locals": [],
+   "operands": [
+    "value",
+    "wanted"
+   ],
+   "requires": [],
+   "result": "out",
+   "value": [
+    "select",
+    [
+     "operand",
+     0
+    ],
+    [
+     "operand",
+     1
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "const",
+     "0",
+     [
+      "width",
+      8
+     ]
+    ]
+   ]
+  },
+  "closer_strengths.leave": {
+   "locals": [],
+   "operands": [
+    "before",
+    "state"
+   ],
+   "requires": [],
+   "result": "out",
+   "value": [
+    "operand",
+    1
+   ]
+  },
+  "closer_strengths.none": {
+   "locals": [],
+   "operands": [
+    "a"
+   ],
+   "requires": [],
+   "result": "out",
+   "value": [
+    "select",
+    [
+     "operand",
+     0
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "const",
+     "0",
+     [
+      "width",
+      8
+     ]
+    ],
+    [
+     "const",
+     "1",
+     [
+      "width",
+      8
+     ]
+    ]
+   ]
+  }
+ },
+ "queries": [
+  {
+   "defined_symbol": "pille_defined",
+   "function": "derived_0",
+   "inputs": [
+    {
+     "name": "start_0",
+     "width": 8
+    },
+    {
+     "name": "start_1",
+     "width": 8
+    },
+    {
+     "name": "start_2",
+     "width": 8
+    }
+   ],
+   "mode": "values",
+   "preconditions": [
+    [
+     "or",
+     [
+      "eq",
+      [
+       "input",
+       0
+      ],
+      [
+       "const",
+       "0",
+       [
+        "width",
+        8
+       ]
+      ]
+     ],
+     [
+      "eq",
+      [
+       "input",
+       0
+      ],
+      [
+       "const",
+       "1",
+       [
+        "width",
+        8
+       ]
+      ]
+     ]
+    ],
+    [
+     "eq",
+     [
+      "input",
+      0
+     ],
+     [
+      "const",
+      "0",
+      [
+       "width",
+       8
+      ]
+     ]
+    ],
+    [
+     "or",
+     [
+      "eq",
+      [
+       "input",
+       1
+      ],
+      [
+       "const",
+       "0",
+       [
+        "width",
+        8
+       ]
+      ]
+     ],
+     [
+      "eq",
+      [
+       "input",
+       1
+      ],
+      [
+       "const",
+       "1",
+       [
+        "width",
+        8
+       ]
+      ]
+     ]
+    ],
+    [
+     "or",
+     [
+      "eq",
+      [
+       "input",
+       2
+      ],
+      [
+       "const",
+       "0",
+       [
+        "width",
+        8
+       ]
+      ]
+     ],
+     [
+      "eq",
+      [
+       "input",
+       2
+      ],
+      [
+       "const",
+       "1",
+       [
+        "width",
+        8
+       ]
+      ]
+     ]
+    ]
+   ],
+   "property": null,
+   "result_symbol": "pille_result",
+   "result_width": null
+  }
+ ],
+ "unmodeled": [],
+ "version": 2
+}

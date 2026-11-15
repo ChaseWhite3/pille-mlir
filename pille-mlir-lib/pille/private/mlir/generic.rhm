@@ -1,0 +1,602 @@
+#lang rhombus/static
+
+import:
+  lib("racket/base.rkt") as rkt
+
+export:
+  Attr
+  Arg
+  Op
+  Block
+  Region
+  Module
+  read_module
+  split_types
+  location_place
+
+// A reader of MLIR's generic operation form, as `mlir-opt` prints a verified
+// module with
+//
+//   --mlir-print-op-generic --mlir-print-local-scope --mlir-print-debuginfo
+//
+// The SMT lowering reads the module the toolchain verified, never the text a
+// caller wrote, and this is the only place that text is taken apart.
+//
+// The grammar is closed. A module is
+//
+//   "builtin.module"() [<{…}>] ({ operation… }) [{…}] : () -> () [loc(…)]
+//
+// and an operation is
+//
+//   [%r[:n], … =] "name"(%operand, …) [[^successor, …]] [<{property, …}>]
+//       [({ block… }, …)] [{attribute, …}] : (type, …) -> type | (type, …) [loc(…)]
+//
+// where a block is `[^label[(%argument: type [loc(…)], …)]:] operation…`.
+// Attribute values, types and locations are kept as the text between their
+// delimiters and are never interpreted here. Anything else is refused with its
+// line and column, so a change in what MLIR prints is a refusal and never a
+// different meaning.
+//
+// Of a module's top-level operations only `func.func` is looked at, and only
+// as far as its symbol name; a function's body is read when the function is
+// asked for. Operations nobody selects are passed over by their brackets
+// alone, as the native pass that this replaces passed over them.
+
+class Attr(name :: String, value :: String)
+
+class Arg(name :: String, type :: String, loc :: String)
+
+class Region(blocks :: List)
+
+class Op(results :: List.of(String),
+         name :: String,
+         operands :: List.of(String),
+         successors :: Int,
+         properties :: List.of(Attr),
+         attributes :: List.of(Attr),
+         regions :: List.of(Region),
+         operand_types :: List.of(String),
+         result_types :: List.of(String),
+         loc :: String):
+  // Every attribute the operation carries, inherent or not, in the order
+  // MLIR's own attribute dictionary keeps them: sorted by name.
+  method attribute_names() :: List.of(String):
+    let names :: List.of(String):
+      for List (attribute :: Attr in properties ++ attributes): attribute.name
+    names.sort(fun (a :: String, b :: String): a < b)
+
+  method property(name :: String) :: maybe(String):
+    for values(found :: maybe(String) = #false) (attribute :: Attr in properties):
+      if attribute.name == name | attribute.value | found
+
+class Block(args :: List.of(Arg), ops :: List.of(Op))
+
+class Top(name :: String, symbol :: maybe(String), start :: Int)
+
+class Module(text :: String, loc :: String, tops :: List.of(Top), functions :: MutableMap):
+  // The first top-level func.func with this symbol name, read whole.
+  method function(name :: String) :: maybe(Op):
+    cond
+    | functions.has_key(name): functions[name]
+    | ~else:
+        let start:
+          for values(found = #false) (top :: Top in tops):
+            if !found && top.name == "func.func" && top.symbol == name | top.start | found
+        let read :: maybe(Op):
+          match start
+          | position :: Int: read_op(Reader(text, position))
+          | ~else: #false
+        functions[name] := read
+        read
+
+//==============================================================================
+// Characters
+
+class Reader(text :: String, mutable pos :: Int)
+
+fun refuse(r :: Reader, expected :: String):
+  let size = r.text.length()
+  let at = math.min(r.pos, size)
+  let (line, column):
+    for values(line = 1, column = 1) (index in 0 .. at):
+      if r.text[index] == Char"\n" | values(line + 1, 1) | values(line, column + 1)
+  let found:
+    if at >= size
+    | "the end of the text"
+    | to_string(r.text.substring(at, math.min(size, at + 24)), ~mode: #'expr)
+  throw Exn.Fail.User("pille/mlir: generic MLIR reader: line " +& line +& ", column " +& column
+                        +& ": expected " ++ expected ++ ", found " ++ found
+                        ++ "; only the generic form of a verified module is read",
+                      Continuation.Marks.current())
+
+fun at_end(r :: Reader) :: Boolean:
+  r.pos >= r.text.length()
+
+fun peek(r :: Reader) :: Char:
+  if r.pos < r.text.length() | r.text[r.pos] | Char"\0"
+
+fun is_space(c :: Char) :: Boolean:
+  c == Char" " || c == Char"\n" || c == Char"\t" || c == Char"\r"
+
+// Whitespace, and the comments the printer adds after a block's label.
+fun skip_ws(r :: Reader):
+  let size = r.text.length()
+  recur loop ():
+    cond
+    | r.pos < size && is_space(r.text[r.pos]):
+        r.pos := r.pos + 1
+        loop()
+    | r.pos + 1 < size && r.text[r.pos] == Char"/" && r.text[r.pos + 1] == Char"/":
+        recur line ():
+          when r.pos < size && r.text[r.pos] != Char"\n"
+          | r.pos := r.pos + 1
+            line()
+        loop()
+    | ~else: #void
+
+fun looking_at(r :: Reader, token :: String) :: Boolean:
+  let end = r.pos + token.length()
+  end <= r.text.length() && r.text.substring(r.pos, end) == token
+
+fun eat(r :: Reader, token :: String) :: Boolean:
+  skip_ws(r)
+  cond
+  | looking_at(r, token):
+      r.pos := r.pos + token.length()
+      #true
+  | ~else: #false
+
+fun expect(r :: Reader, token :: String):
+  unless eat(r, token)
+  | refuse(r, "`" ++ token ++ "`")
+
+fun is_word(c :: Char) :: Boolean:
+  let code = c.to_int()
+  (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57)
+    || c == Char"_" || c == Char"$" || c == Char"." || c == Char"-"
+
+fun read_word(r :: Reader, what :: String) :: String:
+  let start = r.pos
+  let size = r.text.length()
+  recur loop ():
+    when r.pos < size && is_word(r.text[r.pos])
+    | r.pos := r.pos + 1
+      loop()
+  when r.pos == start
+  | refuse(r, what)
+  to_string(r.text.substring(start, r.pos))
+
+fun hex_digit(c :: Char) :: maybe(Int):
+  let code = c.to_int()
+  cond
+  | code >= 48 && code <= 57: code - 48
+  | code >= 65 && code <= 70: code - 55
+  | code >= 97 && code <= 102: code - 87
+  | ~else: #false
+
+// A string literal, with MLIR's escapes: \" \\ \n \t and two hex digits.
+fun read_string(r :: Reader) :: String:
+  skip_ws(r)
+  unless peek(r) == Char"\""
+  | refuse(r, "a string")
+  r.pos := r.pos + 1
+  let size = r.text.length()
+  recur loop (parts :: List = []):
+    when r.pos >= size
+    | refuse(r, "the end of a string")
+    let c = r.text[r.pos]
+    cond
+    | c == Char"\"":
+        r.pos := r.pos + 1
+        String.append(& parts)
+    | c == Char"\\":
+        when r.pos + 1 >= size
+        | refuse(r, "an escape")
+        let next = r.text[r.pos + 1]
+        cond
+        | next == Char"\"" || next == Char"\\":
+            r.pos := r.pos + 2
+            loop(parts.add(to_string(next)))
+        | next == Char"n":
+            r.pos := r.pos + 2
+            loop(parts.add("\n"))
+        | next == Char"t":
+            r.pos := r.pos + 2
+            loop(parts.add("\t"))
+        | ~else:
+            let high = hex_digit(next)
+            let low = r.pos + 2 < size && hex_digit(r.text[r.pos + 2])
+            match [high, low]
+            | [h :: Int, l :: Int]:
+                r.pos := r.pos + 3
+                loop(parts.add(to_string(Char.from_int(h * 16 + l))))
+            | ~else: refuse(r, "an escape")
+    | ~else:
+        r.pos := r.pos + 1
+        loop(parts.add(to_string(c)))
+
+fun skip_string(r :: Reader):
+  let size = r.text.length()
+  r.pos := r.pos + 1
+  recur loop ():
+    when r.pos >= size
+    | refuse(r, "the end of a string")
+    let c = r.text[r.pos]
+    cond
+    | c == Char"\"": r.pos := r.pos + 1
+    | c == Char"\\":
+        r.pos := r.pos + 2
+        loop()
+    | ~else:
+        r.pos := r.pos + 1
+        loop()
+
+fun closes(open :: Char, close :: Char) :: Boolean:
+  (open == Char"(" && close == Char")") || (open == Char"[" && close == Char"]")
+    || (open == Char"{" && close == Char"}")
+
+// Text that is kept and not interpreted: an attribute's value, a type, or a
+// whole operation. Brackets and strings are balanced as MLIR's own lexer
+// balances a dialect's attribute or type: `->` is an arrow and no bracket, and
+// a `>` that closes no `<` is a comparison.
+//
+//   #'attribute  ends before a `,` or `}` outside every bracket
+//   #'type       ends before a `,` or `)` outside every bracket, or before ` loc(`
+//   #'result     ends before ` loc(` or the end of the line
+//   #'operation  ends at the end of the line outside every bracket
+fun scan(r :: Reader, mode :: Symbol) :: String:
+  skip_ws(r)
+  let start = r.pos
+  let size = r.text.length()
+  fun location_follows() :: Boolean:
+    let after:
+      recur ahead (index = r.pos):
+        if index < size && r.text[index] == Char" " | ahead(index + 1) | index
+    after + 4 <= size && r.text.substring(after, after + 4) == "loc("
+  recur loop (stack :: List = []):
+    cond
+    | r.pos >= size:
+        unless stack == [] && mode == #'operation
+        | refuse(r, "the rest of " ++ to_string(mode))
+    | ~else:
+        let c = r.text[r.pos]
+        cond
+        | c == Char"\"":
+            skip_string(r)
+            loop(stack)
+        | c == Char"-" && r.pos + 1 < size && r.text[r.pos + 1] == Char">":
+            r.pos := r.pos + 2
+            loop(stack)
+        | c == Char"(" || c == Char"[" || c == Char"{" || c == Char"<":
+            r.pos := r.pos + 1
+            loop(stack.add(c))
+        | c == Char">":
+            r.pos := r.pos + 1
+            if stack != [] && stack.last == Char"<" | loop(stack.drop_last(1)) | loop(stack)
+        | c == Char")" || c == Char"]" || c == Char"}":
+            cond
+            | stack == []:
+                unless (mode == #'attribute && c == Char"}") || (mode == #'type && c == Char")")
+                | refuse(r, "balanced brackets")
+            | closes(stack.last, c):
+                r.pos := r.pos + 1
+                loop(stack.drop_last(1))
+            | ~else: refuse(r, "balanced brackets")
+        | stack == [] && c == Char"," && (mode == #'attribute || mode == #'type): #void
+        | stack == [] && c == Char"\n" && mode != #'attribute:
+            when mode == #'type
+            | refuse(r, "the end of a type")
+        | stack == [] && c == Char" " && (mode == #'type || mode == #'result) && location_follows():
+            #void
+        | ~else:
+            r.pos := r.pos + 1
+            loop(stack)
+  to_string(r.text.substring(start, r.pos)).trim()
+
+//==============================================================================
+// Operations
+
+// `loc(…)`, kept whole, or "" where the printer gave none.
+fun read_location(r :: Reader) :: String:
+  // only spaces may come before it: a location belongs to its own line
+  let size = r.text.length()
+  let after:
+    recur ahead (index = r.pos):
+      if index < size && r.text[index] == Char" " | ahead(index + 1) | index
+  cond
+  | after + 4 <= size && r.text.substring(after, after + 4) == "loc(":
+      r.pos := after + 3
+      let start = after
+      r.pos := r.pos + 1
+      let inside = scan_parenthesized(r)
+      "loc(" ++ inside ++ ")"
+  | ~else: ""
+
+// From just after a `(` to just after its `)`, giving what is between.
+fun scan_parenthesized(r :: Reader) :: String:
+  let start = r.pos
+  let size = r.text.length()
+  recur loop (depth = 0):
+    when r.pos >= size
+    | refuse(r, "`)`")
+    let c = r.text[r.pos]
+    cond
+    | c == Char"\"":
+        skip_string(r)
+        loop(depth)
+    | c == Char"(":
+        r.pos := r.pos + 1
+        loop(depth + 1)
+    | c == Char")" && depth == 0:
+        r.pos := r.pos + 1
+    | c == Char")":
+        r.pos := r.pos + 1
+        loop(depth - 1)
+    | ~else:
+        r.pos := r.pos + 1
+        loop(depth)
+  to_string(r.text.substring(start, r.pos - 1))
+
+// `%name`, with `#n` where it names one of several results.
+fun read_value(r :: Reader) :: String:
+  skip_ws(r)
+  unless peek(r) == Char"%"
+  | refuse(r, "an SSA value")
+  r.pos := r.pos + 1
+  let name = read_word(r, "an SSA value's name")
+  cond
+  | peek(r) == Char"#":
+      r.pos := r.pos + 1
+      "%" ++ name ++ "#" ++ read_word(r, "a result number")
+  | ~else: "%" ++ name
+
+fun read_dictionary(r :: Reader) :: List.of(Attr):
+  expect(r, "{")
+  recur loop (entries :: List.of(Attr) = []):
+    cond
+    | eat(r, "}"): entries
+    | ~else:
+        skip_ws(r)
+        let name:
+          if peek(r) == Char"\"" | read_string(r) | read_word(r, "an attribute's name")
+        let value:
+          if eat(r, "=") | scan(r, #'attribute) | ""
+        unless eat(r, ",")
+        | skip_ws(r)
+          unless peek(r) == Char"}"
+          | refuse(r, "`,` or `}`")
+        loop(entries.add(Attr(name, value)))
+
+// `(type, …)`, from its `(`.
+fun read_type_list(r :: Reader) :: List.of(String):
+  expect(r, "(")
+  recur loop (types :: List.of(String) = []):
+    cond
+    | eat(r, ")"): types
+    | ~else:
+        let type = scan(r, #'type)
+        when type == ""
+        | refuse(r, "a type")
+        unless eat(r, ",")
+        | skip_ws(r)
+          unless peek(r) == Char")"
+          | refuse(r, "`,` or `)`")
+        loop(types.add(type))
+
+// The types of `(type, …) -> type` or `(type, …) -> (type, …)`, as text.
+fun split_types(text :: String) :: values(List.of(String), List.of(String)):
+  let r = Reader(text ++ "\n", 0)
+  let (inputs, results) = read_function_type(r)
+  skip_ws(r)
+  unless at_end(r)
+  | refuse(r, "the end of a function type")
+  values(inputs, results)
+
+fun read_function_type(r :: Reader) :: values(List.of(String), List.of(String)):
+  let inputs = read_type_list(r)
+  expect(r, "->")
+  skip_ws(r)
+  let results :: List.of(String):
+    cond
+    | peek(r) == Char"(": read_type_list(r)
+    | ~else:
+        let type = scan(r, #'result)
+        when type == ""
+        | refuse(r, "a result type")
+        [type]
+  values(inputs, results)
+
+fun read_region(r :: Reader) :: Region:
+  expect(r, "{")
+  // A block is opened by its label, or by the region's first operation.
+  recur loop (blocks :: List = [], args :: List.of(Arg) = [], ops :: List.of(Op) = [], open = #false):
+    fun closed() :: List:
+      if open | blocks.add(Block(args, ops)) | blocks
+    skip_ws(r)
+    cond
+    | eat(r, "}"): Region(closed())
+    | peek(r) == Char"^":
+        r.pos := r.pos + 1
+        read_word(r, "a block's name")
+        let arguments :: List.of(Arg):
+          cond
+          | eat(r, "("):
+              recur each_argument (found :: List.of(Arg) = []):
+                cond
+                | eat(r, ")"): found
+                | ~else:
+                    let name = read_value(r)
+                    expect(r, ":")
+                    let type = scan(r, #'type)
+                    let loc = read_location(r)
+                    unless eat(r, ",")
+                    | skip_ws(r)
+                      unless peek(r) == Char")"
+                      | refuse(r, "`,` or `)`")
+                    each_argument(found.add(Arg(name, type, loc)))
+          | ~else: []
+        expect(r, ":")
+        loop(closed(), arguments, [], #true)
+    | ~else:
+        let op = read_op(r)
+        loop(blocks, args, ops.add(op), #true)
+
+fun read_op(r :: Reader) :: Op:
+  skip_ws(r)
+  let results :: List.of(String):
+    cond
+    | peek(r) == Char"%":
+        recur loop (found :: List.of(String) = []):
+          let name = read_value(r)
+          let named :: List.of(String):
+            cond
+            | peek(r) == Char":":
+                r.pos := r.pos + 1
+                let count = String.to_int(read_word(r, "a result count"))
+                match count
+                | n :: Int: for List (index in 0 .. n): name ++ "#" +& index
+                | ~else: refuse(r, "a result count")
+            | ~else: [name]
+          cond
+          | eat(r, ","): loop(found ++ named)
+          | ~else:
+              expect(r, "=")
+              found ++ named
+    | ~else: []
+  let name = read_string(r)
+  expect(r, "(")
+  let operands :: List.of(String):
+    recur loop (found :: List.of(String) = []):
+      cond
+      | eat(r, ")"): found
+      | ~else:
+          let operand = read_value(r)
+          unless eat(r, ",")
+          | skip_ws(r)
+            unless peek(r) == Char")"
+            | refuse(r, "`,` or `)`")
+          loop(found.add(operand))
+  let successors:
+    cond
+    | peek(r) == Char"[":
+        r.pos := r.pos + 1
+        recur loop (count = 0):
+          cond
+          | eat(r, "]"): count
+          | ~else:
+              expect(r, "^")
+              read_word(r, "a successor's name")
+              unless eat(r, ",")
+              | skip_ws(r)
+                unless peek(r) == Char"]"
+                | refuse(r, "`,` or `]`")
+              loop(count + 1)
+    | ~else: 0
+  skip_ws(r)
+  let properties :: List.of(Attr):
+    cond
+    | peek(r) == Char"<":
+        r.pos := r.pos + 1
+        let entries = read_dictionary(r)
+        expect(r, ">")
+        entries
+    | ~else: []
+  skip_ws(r)
+  let regions :: List.of(Region):
+    cond
+    | peek(r) == Char"(":
+        r.pos := r.pos + 1
+        recur loop (found :: List.of(Region) = []):
+          let region = read_region(r)
+          cond
+          | eat(r, ","): loop(found.add(region))
+          | ~else:
+              expect(r, ")")
+              found.add(region)
+    | ~else: []
+  skip_ws(r)
+  let attributes :: List.of(Attr):
+    if peek(r) == Char"{" | read_dictionary(r) | []
+  expect(r, ":")
+  let (operand_types, result_types) = read_function_type(r)
+  let loc = read_location(r)
+  Op(results, name, operands, successors, properties, attributes, regions,
+     operand_types, result_types, loc)
+
+//==============================================================================
+// Modules
+
+fun read_module(text :: String) :: Module:
+  let r = Reader(text, 0)
+  skip_ws(r)
+  unless looking_at(r, "\"builtin.module\"")
+  | refuse(r, "\"builtin.module\"")
+  r.pos := r.pos + 16
+  expect(r, "(")
+  expect(r, ")")
+  skip_ws(r)
+  when peek(r) == Char"<"
+  | r.pos := r.pos + 1
+    read_dictionary(r)
+    expect(r, ">")
+  expect(r, "(")
+  expect(r, "{")
+  let tops :: List.of(Top):
+    recur loop (found :: List.of(Top) = []):
+      skip_ws(r)
+      cond
+      | eat(r, "}"): found
+      | ~else:
+          let start = r.pos
+          // results, if any, are part of what is passed over
+          let name:
+            cond
+            | peek(r) == Char"\"": read_string(r)
+            | ~else: ""
+          let symbol :: maybe(String):
+            cond
+            | name == "func.func":
+                expect(r, "(")
+                expect(r, ")")
+                skip_ws(r)
+                cond
+                | peek(r) == Char"<":
+                    r.pos := r.pos + 1
+                    let entries = read_dictionary(r)
+                    for values(found :: maybe(String) = #false) (entry :: Attr in entries):
+                      if entry.name == "sym_name" | symbol_name(entry.value) | found
+                | ~else: #false
+            | ~else: #false
+          r.pos := start
+          scan(r, #'operation)
+          loop(found.add(Top(name, symbol, start)))
+  expect(r, ")")
+  skip_ws(r)
+  when peek(r) == Char"{"
+  | read_dictionary(r)
+  expect(r, ":")
+  expect(r, "(")
+  expect(r, ")")
+  expect(r, "->")
+  expect(r, "(")
+  expect(r, ")")
+  let loc = read_location(r)
+  skip_ws(r)
+  unless at_end(r)
+  | refuse(r, "the end of the module")
+  Module(text, loc, tops, MutableMap())
+
+fun symbol_name(value :: String) :: maybe(String):
+  cond
+  | value.length() >= 2 && value[0] == Char"\"":
+      let r = Reader(value, 0)
+      let name = read_string(r)
+      at_end(r) && name
+  | ~else: #false
+
+// Where a diagnostic at this location is reported: `file:line:column: `, from
+// the first file position the location holds, or "" where it holds none.
+fun location_place(loc :: String) :: String:
+  match rkt.#{regexp-match}(#{#px"\"([^\"]*)\":([0-9]+):([0-9]+)"}, loc)
+  | PairList[_, file, line, column]: to_string(file) ++ ":" ++ to_string(line) ++ ":" ++ to_string(column) ++ ": "
+  | ~else: ""

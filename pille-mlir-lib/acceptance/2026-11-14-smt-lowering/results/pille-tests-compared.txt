@@ -1,0 +1,42 @@
+raco test: (file "pille/mlir/tests/api.rhm")
+raco test: (file "pille/mlir/tests/declarations/hygiene.rhm")
+raco test: (file "pille/mlir/tests/declarations/macros.rhm")
+raco test: (file "pille/mlir/tests/declarations/valid.rhm")
+raco test: (file "pille/mlir/tests/declarations.rkt")
+raco test: (file "pille/mlir/tests/integration.rkt")
+raco test: (file "pille/mlir/tests/schema-api.rhm")
+raco test: (file "pille/mlir/tests/schema.rkt")
+raco test: (file "pille/mlir/tests/semantics/hygiene.rhm")
+raco test: (file "pille/mlir/tests/semantics/macros.rhm")
+raco test: (file "pille/mlir/tests/semantics/valid.rhm")
+raco test: (file "pille/mlir/tests/semantics.rkt")
+raco test: (file "pille/mlir/tests/sessions.rkt")
+raco test: (file "pille/mlir/tests/smt-api.rhm")
+/Users/chasewhite/gitStuff/pille/pille-mlir-lib/pille/mlir/tests/smt-api.rhm:167: failed
+  got: #{'#<query>}
+  expected: exception "cannot find the SMT query plugin"
+  location...:
+   smt-api.rhm:167:0
+  context...:
+   /Users/chasewhite/Library/Racket/9.3/pkgs/rhombus-lib/rhombus/private/check.rhm:206:0: check_same
+   body of "/Users/chasewhite/gitStuff/pille/pille-mlir-lib/pille/mlir/tests/smt-api.rhm"
+   /Applications/Racket v9.3/share/pkgs/compiler-lib/compiler/commands/test.rkt:98:2
+   body of (submod "/Applications/Racket v9.3/share/pkgs/compiler-lib/compiler/commands/test.rkt" process)
+   body of top-level
+raco test: (file "pille/mlir/tests/smt-batch.rhm")
+raco test: (file "pille/mlir/tests/smt-declarations.rkt")
+raco test: (file "pille/mlir/tests/smt-integration.rkt")
+--------------------
+the plugin must be selected explicitly and must exist
+FAILURE
+name:       check-exn
+location:   pille/mlir/tests/smt-integration.rkt:851:4
+params:
+  '(#rx"no SMT query plugin was selected"
+  #<procedure:...smt-integration.rkt:852:15>)
+message:    "No exception raised"
+--------------------
+raco test: (file "pille/mlir/tests/smt-support.rkt")
+raco test: (file "pille/mlir/tests/solver.rkt")
+raco test: (file "pille/mlir/tests/toolchain.rkt")
+2/3497 test failures

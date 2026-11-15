@@ -1,0 +1,19 @@
+#lang rhombus
+
+// E3: the strengths of examples/rhombus-safetynet, asked cold in one process.
+import:
+  lib("racket/base.rkt") as rkt
+  lib("racket/file.rkt") as rfile
+  closer_exports/phrase/safetynet as phrase_safetynet
+  closer_exports/mlir/model open
+  closer_exports/requirements open
+
+def checkout = "/Users/chasewhite/Documents/gitStuff/anote-java-clojure"
+def notation :: Path = Path(rfile.#{make-temporary-directory}())
+def model :: Map = model_of(Path(checkout).add("examples").add("rhombus-safetynet"), ~ran_from: Path(checkout), ~notation: notation)
+def started = rkt.#{current-inexact-milliseconds}()
+def claims :: List = page_claim_strengths(phrase_safetynet.read, model)
+def judged :: List = judge_requirements(phrase_safetynet.read, model, ~strengths: #true)
+def elapsed = rkt.#{current-inexact-milliseconds}() - started
+println("strengths_ms\t" +& math.round(elapsed) +& "\tclaims\t" +& claims.length() +& "\tjudged\t" +& judged.length())
+rfile.#{delete-directory/files}(notation)

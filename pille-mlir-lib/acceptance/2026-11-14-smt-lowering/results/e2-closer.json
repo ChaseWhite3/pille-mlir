@@ -1,0 +1,24 @@
+{
+ "both_lowered": 1249,
+ "both_refused": 0,
+ "counterexamples_cross_checked": 846,
+ "differences": [],
+ "distinct_requests": 1000,
+ "members_equal": 1232,
+ "proof_questions": 867,
+ "questions": 6058,
+ "questions_normalized_equal": 6058,
+ "questions_text_equal": 6058,
+ "records": 1249,
+ "refusal_messages": {},
+ "refusals_equal": 0,
+ "smtlib_equal": 1249,
+ "status_equal": 716,
+ "statuses": {
+  "sat": 423,
+  "unsat": 293
+ },
+ "value_sets_equal": 5008,
+ "values_questions": 5191,
+ "verified_equal": 1249
+}

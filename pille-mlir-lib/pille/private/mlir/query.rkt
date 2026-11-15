@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require json
+         racket/file
          racket/list
          racket/match
          racket/promise
@@ -10,12 +11,14 @@
          "semantics.rkt"
          "solver.rkt"
          "session.rkt"
-         "tools.rkt")
+         "tools.rkt"
+         "lower.rhm")
 
 (provide smt_input smt_result smt_const smt_binary
          smt_eq smt_not smt_and smt_or
          render_term render_formula
          make_smt_query
+         smt_lower_text
          make_spec make_values_spec make_smt_batch make_smt_values_batch make_smt_values_query
          batch_queries batch_check batch_session_check query_session_check values_query_check
          values_query_inputs values_query_assumptions
@@ -306,6 +309,78 @@
   (for/list ([input (in-list declared)])
     (cons (car (term-args input)) (term-width input))))
 
+;; The lowering is `lower.rhm`, over the module's generic form. It returns the
+;; module of solvers and each solver as a module of its own.
+(define (run-lowering module manifest)
+  (define-values (text members)
+    (if (string? manifest)
+        (lower_text (module_generic module) manifest)
+        (lower (module_generic module) manifest)))
+  (values text (treelist->list members)))
+
+;; TEMPORARY, for the acceptance comparison only, and removed with the native
+;; plugin: with PILLE_MLIR_SMT_COMPARE naming a directory, every lowering is
+;; also run through the plugin (PILLE_MLIR_SMT_PLUGIN), and both results, or
+;; refusals, are recorded there with their inputs. The Rhombus result is the
+;; one used either way.
+(define compare-directory (getenv "PILLE_MLIR_SMT_COMPARE"))
+(define compare-count 0)
+
+;; TEMPORARY, with the same life: PILLE_MLIR_SMT_LOWERING=plugin answers with the
+;; plugin's lowering alone, so that each can be timed and tested in turn.
+(define (run-plugin module manifest)
+  (define plugin (resolve_smt_plugin #f))
+  (cond
+    [(string? manifest) (values (run_smt_query_pass module plugin manifest) '())]
+    [(eqv? (hash-ref manifest 'version #f) 2) (run_smt_batch_pass module plugin manifest)]
+    [else (values (run_smt_query_pass module plugin (jsexpr->string manifest)) '())]))
+
+(define (lower-manifest module manifest)
+  (cond
+    [compare-directory (compare-lowerings module manifest)]
+    [(equal? (getenv "PILLE_MLIR_SMT_LOWERING") "plugin") (run-plugin module manifest)]
+    [else (run-lowering module manifest)]))
+
+(define (compare-lowerings module manifest)
+  (define (attempt run)
+    (with-handlers ([exn:fail? (lambda (error) (list 'error error))])
+      (call-with-values run (lambda (text members) (list 'ok text members)))))
+  (define (side result)
+    (cond
+      [(eq? (car result) 'error) (hasheq 'error (exn-message (cadr result)))]
+      [else
+       (with-handlers ([exn:fail? (lambda (error) (hasheq 'verify_error (exn-message error)))])
+         (define verified (parse_stock_module (cadr result) module))
+         (hasheq 'verified (module_ir verified)
+                 'smtlib (to_smtlib verified)
+                 'members (if (<= (length (caddr result)) 4)
+                              (for/list ([member (in-list (caddr result))])
+                                (module_ir (parse_stock_module member module)))
+                              (length (caddr result)))))]))
+  (define by-plugin (attempt (lambda () (run-plugin module manifest))))
+  (define by-rhombus (attempt (lambda () (run-lowering module manifest))))
+  (set! compare-count (add1 compare-count))
+  (make-directory* compare-directory)
+  (call-with-output-file
+    (build-path compare-directory
+                (format "~a-~a.json" (current-inexact-milliseconds) compare-count))
+    (lambda (out)
+      (write-json (hasheq 'ir (module_ir module) 'irdl (module_irdl module)
+                          'manifest (if (string? manifest) manifest (jsexpr->string manifest))
+                          'plugin (side by-plugin) 'rhombus (side by-rhombus))
+                  out)))
+  (if (eq? (car by-rhombus) 'error)
+      (raise (cadr by-rhombus))
+      (values (cadr by-rhombus) (caddr by-rhombus))))
+
+;; Lowers a manifest given as JSON text, bypassing the manifest this module
+;; derives from a dialect: for tests of what the lowering itself checks.
+(define (smt_lower_text module manifest)
+  (unless (is_module module) (raise-argument-error 'smt_lower_text "module" module))
+  (unless (string? manifest) (raise-argument-error 'smt_lower_text "string?" manifest))
+  (define-values (text _members) (lower-manifest module manifest))
+  text)
+
 (define (make_smt_query dialect module function inputs property preconditions [plugin #f])
   (check-context 'smt_query dialect module)
   (define description (make_spec function inputs property preconditions))
@@ -313,8 +388,7 @@
     (for/fold ([manifest (context-manifest dialect 1)])
               ([(key value) (in-hash (spec-manifest description))])
       (hash-set manifest key value)))
-  (define lowered
-    (run_smt_query_pass module (resolve_smt_plugin plugin) (jsexpr->string manifest)))
+  (define-values (lowered _members) (lower-manifest module manifest))
   (define verified (parse_stock_module lowered module))
   (define smtlib (to_smtlib verified))
   (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
@@ -350,8 +424,7 @@
           (raise-argument-error who (if values? "ValuesSpec" "Spec") value))
         (spec-manifest value))))
   (define manifest (hash-set (context-manifest dialect 2) 'queries descriptions))
-  (define-values (lowered standalone)
-    (run_smt_batch_pass module (resolve_smt_plugin plugin) manifest))
+  (define-values (lowered standalone) (lower-manifest module manifest))
   (define verified (parse_stock_module lowered module))
   (define text (to_smtlib verified))
   (define chunks (split-queries text))

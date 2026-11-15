@@ -1,0 +1,792 @@
+#lang rhombus/static
+
+import:
+  lib("racket/base.rkt") as rkt
+  lib("json/main.rkt") as rjson
+  "generic.rhm"
+
+export:
+  lower
+  lower_text
+
+// Lowers selected functions of a verified MLIR module into SMT dialect
+// queries, as text for the stock `mlir-opt` to verify and the stock
+// `mlir-translate --export-smtlib` to export.
+//
+// The lowering is driven entirely by the manifest `query.rkt` writes from
+// Rhombus declarations: it has no built-in knowledge of any custom operation.
+// For every instance of a modeled operation it instantiates the declared
+// semantic expression at the instance's actual operand and result types.
+//
+// It does four things, in this order for each query:
+//
+//   1. checks the selected function (`check_function`);
+//   2. lowers its body once per manifest (`lower_body`, `lower_modeled`,
+//      `lower_constant`), keeping what each use of an operation requires;
+//   3. lowers manifest expressions (`lower_term`, `lower_formula`,
+//      `lower_literal`); widths are never coerced;
+//   4. encodes the question in one `smt.solver` (`build_query`).
+//
+// Operations are written in MLIR's generic form, and only these are ever
+// written: smt.solver, smt.set_logic, smt.declare_fun, smt.bv.constant,
+// smt.bv.add, smt.bv.mul, smt.bv.neg, smt.eq, smt.ite, smt.not, smt.and,
+// smt.or, smt.assert, smt.check and smt.yield.
+//
+// The module is read from the generic form the toolchain printed
+// (`generic.rhm`). Two things a native pass could ask MLIR and this cannot:
+// whether an operation is a terminator, taken here as having successors or
+// being last in its block, which a verified module makes the same thing; and
+// whether a registered operation has known memory effects, which no operation
+// a dialect declares through IRDL has.
+
+//==============================================================================
+// Diagnostics
+
+// A refusal, reported as `mlir-opt` reports a diagnostic at a location.
+fun fail(loc :: String, message :: String):
+  throw Exn.Fail.User("pille/mlir: SMT lowering failed:\n" ++ generic.location_place(loc)
+                        ++ "error: " ++ message ++ "\n",
+                      Continuation.Marks.current())
+
+//==============================================================================
+// The manifest, as the JSON reader gives it: hashes keyed by symbols, lists,
+// strings, numbers, booleans and the symbol `null`.
+
+fun get(object :: Map, key :: Symbol):
+  rkt.#{hash-ref}(object, key, #false)
+
+fun as_string(value) :: maybe(String):
+  if value is_a ReadableString | to_string(value) | #false
+
+fun as_array(value) :: maybe(PairList):
+  if value is_a PairList | value | #false
+
+fun as_object(value) :: maybe(Map):
+  if value is_a Map | value | #false
+
+fun as_integer(value) :: maybe(Int):
+  cond
+  | value is_a Int: value
+  | value is_a Flonum && rkt.#{integer?}(value): rkt.#{inexact->exact}(value)
+  | ~else: #false
+
+// The integer widths of the supported fragment. Each maps to an SMT bitvector
+// of exactly the same width; nothing is widened, narrowed, or reinterpreted.
+fun is_supported_width(width) :: Boolean:
+  width == 1 || width == 8 || width == 16 || width == 32 || width == 64
+
+// Width of a supported signless integer type, or 0.
+fun supported_width(type :: String) :: Int:
+  match type
+  | "i1": 1
+  | "i8": 8
+  | "i16": 16
+  | "i32": 32
+  | "i64": 64
+  | ~else: 0
+
+//==============================================================================
+// What is lowered
+
+// A bitvector-sorted SMT value. A Boolean-sorted one is its name alone.
+class Bv(name :: String, width :: Int)
+
+// One modeled operation, as described by the manifest.
+class Model(operands :: List.of(String),
+            result :: String,
+            locals :: List,
+            value,
+            requirements :: maybe(PairList))
+
+// The first query for a function lowers its body. Later queries reuse the
+// lowered body, declaring the inputs under their own display names. Every
+// query has its own solver, so none of its assertions can affect any other.
+class Lowered(body :: List.of(String),
+              next :: Int,
+              widths :: List.of(Int),
+              returned :: Bv,
+              obligations :: List.of(String))
+
+// One manifest, and so one model, over one module.
+class Context(module :: generic.Module,
+              manifest :: Map,
+              lowered :: MutableMap,
+              mutable models :: maybe(Map),
+              mutable unmodeled :: Set)
+
+class Spec(function :: String,
+           inputs :: List.of(Bv),
+           expected_result_width :: maybe(Int),
+           preconditions :: PairList,
+           property,
+           enumerate_values :: Boolean,
+           result_symbol :: String,
+           defined_symbol :: String)
+
+class Function(op :: generic.Op, block :: generic.Block)
+
+// The references an expression may use. Semantic expressions see an
+// operation's operands and locals; properties see function inputs and the
+// returned value. A tag outside its scope is a malformed manifest.
+class Scope(description :: String,
+            semantic :: Boolean,
+            operands :: List.of(Bv),
+            locals :: List.of(Bv),
+            result_width :: Int,
+            inputs :: List.of(Bv),
+            result :: maybe(Bv))
+
+class Query(context :: Context,
+            specification :: Map,
+            index :: maybe(Int),
+            mutable lines :: List.of(String),
+            mutable next :: Int,
+            values :: MutableMap,
+            mutable obligations :: List.of(String)):
+  method prefix() :: String:
+    match index
+    | position :: Int: "SMT batch spec " +& position +& ": "
+    | ~else: ""
+
+  method malformed(message :: String):
+    fail(context.module.loc, prefix() ++ "malformed SMT query manifest: " ++ message)
+
+  method error(loc :: String, message :: String):
+    fail(loc, prefix() ++ message)
+
+//==============================================================================
+// Writing SMT operations
+
+fun bv_type(width :: Int) :: String:
+  "!smt.bv<" +& width +& ">"
+
+// A string attribute. Anything but plain printable characters is written as
+// the two hex digits of each of its bytes, which MLIR's lexer reads back.
+fun quoted(text :: String) :: String:
+  let digits = "0123456789ABCDEF"
+  let parts :: List.of(String):
+    for List (byte :: Int in rkt.#{bytes->list}(rkt.#{string->bytes/utf-8}(text)) :~ PairList):
+      cond
+      | byte >= 32 && byte < 127 && byte != 34 && byte != 92: to_string(Char.from_int(byte))
+      | ~else: "\\" ++ to_string(digits[byte div 16]) ++ to_string(digits[byte mod 16])
+  "\"" ++ String.append(& parts) ++ "\""
+
+fun emit(q :: Query, text :: String, loc :: String):
+  let suffix = if loc == "" | "" | " " ++ loc
+  q.lines := q.lines.add("    " ++ text ++ suffix)
+
+fun fresh(q :: Query) :: String:
+  let name = "%" +& q.next
+  q.next := q.next + 1
+  name
+
+fun declaration(name :: String, display :: String, width :: Int, loc :: String) :: String:
+  let suffix = if loc == "" | "" | " " ++ loc
+  "    " ++ name ++ " = \"smt.declare_fun\"() <{namePrefix = " ++ quoted(display) ++ "}> : () -> "
+    ++ bv_type(width) ++ suffix
+
+fun declare_fun(q :: Query, display :: String, width :: Int, loc :: String) :: Bv:
+  let name = fresh(q)
+  q.lines := q.lines.add(declaration(name, display, width, loc))
+  Bv(name, width)
+
+fun bv_constant(q :: Query, value :: Int, width :: Int, loc :: String) :: Bv:
+  let name = fresh(q)
+  let type = bv_type(width)
+  emit(q, name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" +& value +& "> : " ++ type ++ "}> : () -> " ++ type, loc)
+  Bv(name, width)
+
+fun bv_binary(q :: Query, operation :: String, lhs :: Bv, rhs :: Bv, loc :: String) :: Bv:
+  let name = fresh(q)
+  let type = bv_type(lhs.width)
+  emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
+            ++ ") -> " ++ type, loc)
+  Bv(name, lhs.width)
+
+fun bv_neg(q :: Query, input :: Bv, loc :: String) :: Bv:
+  let name = fresh(q)
+  let type = bv_type(input.width)
+  emit(q, name ++ " = \"smt.bv.neg\"(" ++ input.name ++ ") : (" ++ type ++ ") -> " ++ type, loc)
+  Bv(name, input.width)
+
+fun bv_eq(q :: Query, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
+  let name = fresh(q)
+  let type = bv_type(lhs.width)
+  emit(q, name ++ " = \"smt.eq\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
+            ++ ") -> !smt.bool", loc)
+  name
+
+fun bv_ite(q :: Query, test :: String, chosen :: Bv, otherwise :: Bv, loc :: String) :: Bv:
+  let name = fresh(q)
+  let type = bv_type(chosen.width)
+  emit(q, name ++ " = \"smt.ite\"(" ++ test ++ ", " ++ chosen.name ++ ", " ++ otherwise.name ++ ") : (!smt.bool, "
+            ++ type ++ ", " ++ type ++ ") -> " ++ type, loc)
+  Bv(name, chosen.width)
+
+fun bool_not(q :: Query, input :: String, loc :: String) :: String:
+  let name = fresh(q)
+  emit(q, name ++ " = \"smt.not\"(" ++ input ++ ") : (!smt.bool) -> !smt.bool", loc)
+  name
+
+fun bool_connective(q :: Query, operation :: String, operands :: List.of(String), loc :: String) :: String:
+  let name = fresh(q)
+  let types = String.join(for List (_ in operands): "!smt.bool", ", ")
+  emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ String.join(operands, ", ") ++ ") : (" ++ types
+            ++ ") -> !smt.bool", loc)
+  name
+
+fun assert(q :: Query, input :: String, loc :: String):
+  emit(q, "\"smt.assert\"(" ++ input ++ ") : (!smt.bool) -> ()", loc)
+
+//==============================================================================
+// 1. The manifest's description of one query, and the function it selects
+
+fun read_models(q :: Query, operations :: Map, unmodeled_list :: PairList):
+  let unmodeled :: Set:
+    for Set (entry in unmodeled_list):
+      let operation = as_string(entry)
+      unless operation
+      | q.malformed("invalid unmodeled operation name")
+      operation
+  let names :: List.of(Symbol):
+    (for List (key :: Symbol in operations.keys()): key).sort(fun (a :: Symbol, b :: Symbol): to_string(a) < to_string(b))
+  let models :: Map:
+    for Map (key in names):
+      let description = as_object(get(operations, key))
+      let operands = description && as_array(get(description, #'operands))
+      let locals = description && as_array(get(description, #'locals))
+      let result = description && as_string(get(description, #'result))
+      let has_value = description && (description :~ Map).has_key(#'value)
+      unless operands && locals && result && has_value
+      | q.malformed("invalid semantics for operation '" ++ to_string(key) ++ "'")
+      let model_operands :: List.of(String):
+        for List (operand in operands :~ PairList):
+          let operand_name = as_string(operand)
+          unless operand_name
+          | q.malformed("invalid operand name")
+          operand_name
+      let model_locals :: List:
+        for List (local in locals :~ PairList):
+          let pair = as_array(local)
+          let label = pair && (pair :~ PairList).length() == 2 && as_string((pair :~ PairList)[0])
+          unless label
+          | q.malformed("invalid local binding")
+          [label, (pair :~ PairList)[1]]
+      values(to_string(key),
+             Model(model_operands, result, model_locals, get(description :~ Map, #'value),
+                   as_array(get(description :~ Map, #'requires))))
+  q.context.unmodeled := unmodeled
+  q.context.models := models
+
+fun read_spec(q :: Query) :: Spec:
+  let specification = q.specification
+  let manifest = q.context.manifest
+  let name = as_string(get(specification, #'function))
+  let input_list = as_array(get(specification, #'inputs))
+  let operations = as_object(get(manifest, #'operations))
+  let unmodeled_list = as_array(get(manifest, #'unmodeled))
+  let preconditions = as_array(get(specification, #'preconditions))
+  let has_property = specification.has_key(#'property)
+  let mode = as_string(get(specification, #'mode))
+  let enumerate_values = mode == "values"
+  when mode && mode != "values" && mode != "proof"
+  | q.malformed("unknown query mode")
+  unless name && input_list && operations && unmodeled_list && preconditions && (has_property || enumerate_values)
+  | q.malformed("missing a required field")
+  let inputs :: List.of(Bv):
+    for List (entry in input_list :~ PairList):
+      let input = as_object(entry)
+      let input_name = input && as_string(get(input, #'name))
+      let width = input && as_integer(get(input, #'width))
+      unless input_name && width && is_supported_width(width)
+      | q.malformed("invalid input declaration")
+      Bv(input_name, width)
+  let (result_symbol :: String, defined_symbol :: String):
+    cond
+    | enumerate_values:
+        let result_name = as_string(get(specification, #'result_symbol))
+        let defined_name = as_string(get(specification, #'defined_symbol))
+        unless result_name && result_name != "" && defined_name && defined_name != "" && result_name != defined_name
+        | q.malformed("values queries require distinct result_symbol and defined_symbol names")
+        for (input in inputs):
+          when input.name == result_name || input.name == defined_name
+          | q.malformed("a values query output symbol collides with an input name")
+        values(result_name, defined_name)
+    | ~else: values("", "")
+  let expected_result_width :: maybe(Int):
+    cond
+    | specification.has_key(#'result_width) && get(specification, #'result_width) != #'null:
+        let number = as_integer(get(specification, #'result_width))
+        unless number && is_supported_width(number)
+        | q.malformed("invalid result width")
+        number
+    | ~else: #false
+  // The model is one per manifest: read with the first query, as the first
+  // query's own.
+  unless q.context.models
+  | read_models(q, operations, unmodeled_list)
+  Spec(name, inputs, expected_result_width, preconditions,
+       get(specification, #'property), enumerate_values, result_symbol, defined_symbol)
+
+// Function-level attributes that cannot change the value computed by a
+// straight-line body. Anything else is rejected rather than ignored.
+fun is_neutral_function_attribute(name :: String) :: Boolean:
+  name == "sym_name" || name == "function_type" || name == "sym_visibility"
+
+def supported_types = "; supported types are i1, i8, i16, i32, and i64"
+
+fun check_function(q :: Query, spec :: Spec) :: Function:
+  let module = q.context.module
+  let name = spec.function
+  let function :: generic.Op:
+    match module.function(name)
+    | found :: generic.Op: found
+    | ~else: q.error(module.loc, "SMT query: function @" ++ name ++ " was not found as a func.func in the module")
+  let loc = function.loc
+  let blocks :: List.of(generic.Block):
+    match function.regions
+    | [region]: region.blocks
+    | ~else: q.error(loc, "SMT query: function @" ++ name ++ " is not a func.func with one body region")
+  when blocks.length() == 0
+  | q.error(loc, "SMT query: function @" ++ name ++ " is a declaration without a body")
+  for (attribute in function.attribute_names()):
+    unless is_neutral_function_attribute(attribute)
+    | q.error(loc, "SMT query: unsupported attribute '" ++ attribute ++ "' on function @" ++ name
+                     ++ "; attributes are rejected rather than ignored")
+  unless blocks.length() == 1
+  | q.error(loc, "SMT query: unsupported control flow: function @" ++ name ++ " has " +& blocks.length()
+                   +& " blocks, but only straight-line single-block bodies are supported")
+  let (input_types :: List.of(String), result_types :: List.of(String)):
+    match function.property("function_type")
+    | type :: String: generic.split_types(type)
+    | ~else: q.error(loc, "SMT query: function @" ++ name ++ " has no function type")
+  unless result_types.length() == 1
+  | q.error(loc, "SMT query: function @" ++ name ++ " returns " +& result_types.length()
+                   +& " values; exactly one scalar result is supported")
+  let result_width = supported_width(result_types[0])
+  when result_width == 0
+  | q.error(loc, "SMT query: unsupported result type '" ++ result_types[0] ++ "' of function @" ++ name
+                   ++ supported_types)
+  match spec.expected_result_width
+  | expected :: Int:
+      unless expected == result_width
+      | q.error(loc, "SMT query: the property refers to a " +& expected +& "-bit result, but function @" ++ name
+                       ++ " returns '" ++ result_types[0] ++ "'")
+  | ~else: #void
+  unless input_types.length() == spec.inputs.length()
+  | q.error(loc, "SMT query: function @" ++ name ++ " has " +& input_types.length() +& " arguments, but "
+                   +& spec.inputs.length() +& " inputs were declared")
+  for (input in spec.inputs, type in input_types, index in 0 ..):
+    let width = supported_width(type)
+    when width == 0
+    | q.error(loc, "SMT query: unsupported type '" ++ type ++ "' of argument " +& index +& " of function @" ++ name
+                     ++ supported_types)
+    unless width == input.width
+    | q.error(loc, "SMT query: input '" ++ input.name ++ "' is declared with width " +& input.width
+                     +& ", but argument " +& index +& " of function @" ++ name ++ " has type '" ++ type ++ "'")
+  Function(function, blocks[0])
+
+//==============================================================================
+// 3. Manifest expressions
+
+fun node_tag(expression) :: values(maybe(PairList), maybe(String)):
+  let node = as_array(expression)
+  let tag = node && (node :~ PairList).length() > 0 && as_string((node :~ PairList)[0])
+  values(node, tag)
+
+fun reference(q :: Query, node :: PairList, candidates :: List.of(Bv), scope :: Scope) :: Bv:
+  let index = node.length() == 2 && as_integer(node[1])
+  match index
+  | position :: Int:
+      unless position >= 0 && position < candidates.length()
+      | q.malformed("reference out of range in " ++ scope.description)
+      candidates[position]
+  | ~else: q.malformed("reference out of range in " ++ scope.description)
+
+fun is_arithmetic(tag :: String) :: Boolean:
+  tag == "add" || tag == "sub" || tag == "mul"
+
+// The width of an expression, computed without writing any operation. A
+// literal's `like` target contributes only its width, never its value.
+fun term_width(q :: Query, expression, scope :: Scope, loc :: String) :: Int:
+  let (node, tag) = node_tag(expression)
+  match [node, tag]
+  | [node :: PairList, tag :: String]:
+      cond
+      | tag == "operand" && scope.semantic: reference(q, node, scope.operands, scope).width
+      | tag == "local" && scope.semantic: reference(q, node, scope.locals, scope).width
+      | tag == "const" && node.length() == 3 && as_array(node[2]):
+          literal_width(q, node[2], scope, loc)
+      | is_arithmetic(tag) && node.length() == 3:
+          let lhs = term_width(q, node[1], scope, loc)
+          let rhs = term_width(q, node[2], scope, loc)
+          unless lhs == rhs
+          | q.error(loc, mixed_widths(tag, scope, lhs, rhs))
+          lhs
+      | tag == "select" && node.length() == 5 && scope.semantic:
+          // Only the width is wanted here; the comparison and the agreement of
+          // the arms are checked where the choice is lowered.
+          term_width(q, node[3], scope, loc)
+      | ~else: q.malformed("unsupported expression '" ++ tag ++ "' in " ++ scope.description)
+  | ~else: q.malformed("invalid expression in " ++ scope.description)
+
+fun mixed_widths(tag :: String, scope :: Scope, lhs :: Int, rhs :: Int) :: String:
+  "SMT query: bv." ++ tag ++ " in " ++ scope.description ++ " combines a " +& lhs +& "-bit value with a " +& rhs
+    +& "-bit value; widths must be equal and are never coerced or assumed equal"
+
+fun literal_width(q :: Query, spec :: PairList, scope :: Scope, loc :: String) :: Int:
+  let kind = spec.length() > 0 && as_string(spec[0])
+  let width :: maybe(Int):
+    cond
+    | kind == "width" && spec.length() == 2:
+        let width = as_integer(spec[1])
+        width && is_supported_width(width) && width
+    | kind == "like" && spec.length() == 2 && scope.semantic:
+        let target = as_array(spec[1])
+        let is_result = target && (target :~ PairList).length() == 1 && as_string((target :~ PairList)[0]) == "result"
+        if is_result | scope.result_width | term_width(q, spec[1], scope, loc)
+    | ~else: #false
+  match width
+  | known :: Int: known
+  | ~else: q.malformed("invalid literal width in " ++ scope.description)
+
+// Literal policy, shared with the Rhombus front end: a literal for width w
+// must lie in [-2^(w-1), 2^w - 1]. Negative values denote their two's
+// complement residue. Anything else is rejected, never truncated.
+fun lower_literal(q :: Query, node :: PairList, scope :: Scope, loc :: String) :: Bv:
+  let text = node.length() == 3 && as_string(node[1])
+  let spec = node.length() == 3 && as_array(node[2])
+  match [text, spec]
+  | [text :: String, spec :: PairList]:
+      let width = literal_width(q, spec, scope, loc)
+      let negative = text.length() > 0 && text[0] == Char"-"
+      let digits = if negative | to_string(text.substring(1, text.length())) | text
+      let magnitude = rkt.#{regexp-match?}(#{#px"^[0-9]{1,20}$"}, digits) && String.to_int(digits)
+      match magnitude
+      | magnitude :: Int:
+          let limit = if negative | 2 ** (width - 1) | 2 ** width - 1
+          when magnitude > limit
+          | q.error(loc, "SMT query: literal " ++ text ++ " in " ++ scope.description ++ " does not fit in " +& width
+                           +& " bits (accepted range is -2^(w-1) through 2^w-1)")
+          let residue = magnitude mod (2 ** width)
+          let value = if negative | (2 ** width - residue) mod (2 ** width) | residue
+          bv_constant(q, value, width, loc)
+      | ~else: q.malformed("invalid literal digits in " ++ scope.description)
+  | ~else: q.malformed("invalid literal in " ++ scope.description)
+
+fun lower_term(q :: Query, expression, scope :: Scope, loc :: String) :: Bv:
+  let (node, tag) = node_tag(expression)
+  match [node, tag]
+  | [node :: PairList, tag :: String]:
+      cond
+      | tag == "operand" && scope.semantic: reference(q, node, scope.operands, scope)
+      | tag == "local" && scope.semantic: reference(q, node, scope.locals, scope)
+      | tag == "input" && !scope.semantic: reference(q, node, scope.inputs, scope)
+      | tag == "result" && !scope.semantic && node.length() == 1:
+          match scope.result
+          | result :: Bv: result
+          | ~else: q.malformed("unsupported expression 'result' in " ++ scope.description)
+      | tag == "const": lower_literal(q, node, scope, loc)
+      | is_arithmetic(tag) && node.length() == 3:
+          let lhs = lower_term(q, node[1], scope, loc)
+          let rhs = lower_term(q, node[2], scope, loc)
+          unless lhs.width == rhs.width
+          | q.error(loc, mixed_widths(tag, scope, lhs.width, rhs.width))
+          cond
+          | tag == "add": bv_binary(q, "smt.bv.add", lhs, rhs, loc)
+          | tag == "mul": bv_binary(q, "smt.bv.mul", lhs, rhs, loc)
+          | ~else:
+              // The SMT dialect has no subtraction operation. Wrapping
+              // subtraction is exactly addition of the two's complement negation.
+              let negated = bv_neg(q, rhs, loc)
+              bv_binary(q, "smt.bv.add", lhs, negated, loc)
+      | tag == "select" && node.length() == 5 && scope.semantic:
+          let lhs = lower_term(q, node[1], scope, loc)
+          let rhs = lower_term(q, node[2], scope, loc)
+          let chosen = lower_term(q, node[3], scope, loc)
+          let otherwise = lower_term(q, node[4], scope, loc)
+          unless lhs.width == rhs.width
+          | q.error(loc, "SMT query: bv.if in " ++ scope.description ++ " compares a " +& lhs.width
+                           +& "-bit value and a " +& rhs.width
+                           +& "-bit value; widths must be equal and are never coerced or assumed equal")
+          unless chosen.width == otherwise.width
+          | q.error(loc, "SMT query: bv.if in " ++ scope.description ++ " chooses between a " +& chosen.width
+                           +& "-bit value and a " +& otherwise.width
+                           +& "-bit value; widths must be equal and are never coerced or assumed equal")
+          let test = bv_eq(q, lhs, rhs, loc)
+          bv_ite(q, test, chosen, otherwise, loc)
+      | ~else: q.malformed("unsupported expression '" ++ tag ++ "' in " ++ scope.description)
+  | ~else: q.malformed("invalid expression in " ++ scope.description)
+
+fun lower_formula(q :: Query, expression, scope :: Scope, loc :: String) :: String:
+  let (node, tag) = node_tag(expression)
+  match [node, tag]
+  | [node :: PairList, tag :: String]:
+      cond
+      | tag == "eq" && node.length() == 3:
+          let lhs = lower_term(q, node[1], scope, loc)
+          let rhs = lower_term(q, node[2], scope, loc)
+          unless lhs.width == rhs.width
+          | q.error(loc, "SMT query: equality in " ++ scope.description ++ " compares a " +& lhs.width
+                           +& "-bit value with a " +& rhs.width +& "-bit value")
+          bv_eq(q, lhs, rhs, loc)
+      | tag == "not" && node.length() == 2:
+          bool_not(q, lower_formula(q, node[1], scope, loc), loc)
+      | (tag == "and" || tag == "or") && node.length() >= 2:
+          let operands :: List.of(String):
+            for List (child in node, position in 0 ..):
+              skip_when position == 0
+              lower_formula(q, child, scope, loc)
+          cond
+          | operands.length() == 1: operands[0]
+          | tag == "and": bool_connective(q, "smt.and", operands, loc)
+          | ~else: bool_connective(q, "smt.or", operands, loc)
+      | ~else: q.malformed("unsupported predicate '" ++ tag ++ "' in " ++ scope.description)
+  | ~else: q.malformed("invalid predicate in " ++ scope.description)
+
+//==============================================================================
+// 2. A function's body
+
+fun lower_constant(q :: Query, op :: generic.Op):
+  let loc = op.loc
+  for (attribute in op.attribute_names()):
+    unless attribute == "value"
+    | q.error(loc, "SMT query: unsupported attribute '" ++ attribute ++ "' on arith.constant")
+  let type = if op.result_types.length() == 1 | op.result_types[0] | ""
+  let width = supported_width(type)
+  // A signless integer attribute prints as `true`, `false`, or decimal digits
+  // followed by its type where that is not i64.
+  let value :: maybe(Int):
+    match op.property("value")
+    | "true": 1
+    | "false": 0
+    | text :: String:
+        match rkt.#{regexp-match}(#{#px"^(-?[0-9]+)(?: : (i[0-9]+))?$"}, text)
+        | PairList[_, digits, _]: String.to_int(to_string(digits))
+        | ~else: #false
+    | ~else: #false
+  match value
+  | value :: Int when width != 0:
+      q.values[op.results[0]] := bv_constant(q, value mod (2 ** width), width, loc)
+  | ~else:
+      q.error(loc, "SMT query: unsupported constant of type '" ++ type ++ "'" ++ supported_types)
+
+fun lower_modeled(q :: Query, op :: generic.Op, model :: Model, is_last :: Boolean):
+  let loc = op.loc
+  let name = op.name
+  when is_last || op.successors != 0
+  | q.error(loc, "SMT query: operation '" ++ name ++ "' is a terminator; control flow is unsupported")
+  unless op.regions.length() == 0
+  | q.error(loc, "SMT query: operation '" ++ name ++ "' has regions, which are unsupported")
+  // The declared model cannot observe attributes, so an attribute could carry
+  // meaning that the proof would silently ignore.
+  match op.attribute_names()
+  | [first, & _]:
+      q.error(loc, "SMT query: operation '" ++ name ++ "' carries attribute '" ++ first
+                     ++ "'; attribute-dependent semantics are unsupported and attributes are rejected rather than ignored")
+  | ~else: #void
+  unless op.operands.length() == model.operands.length() && op.results.length() == 1
+  | q.error(loc, "SMT query: operation '" ++ name ++ "' has " +& op.operands.length() +& " operands and "
+                   +& op.results.length() +& " results, which is incompatible with its declared semantics ("
+                   +& model.operands.length() +& " operands, 1 result)")
+  let operands :: List.of(Bv):
+    for List (operand in op.operands, type in op.operand_types, operand_name in model.operands):
+      when supported_width(type) == 0
+      | q.error(loc, "SMT query: operand '" ++ operand_name ++ "' of operation '" ++ name ++ "' has unsupported type '"
+                       ++ type ++ "'" ++ supported_types)
+      match q.values.get(operand, #false)
+      | lowered :: Bv: lowered
+      | ~else:
+          q.error(loc, "SMT query: internal error: operand '" ++ operand_name ++ "' of operation '" ++ name
+                         ++ "' has no lowered value")
+  let result_type = op.result_types[0]
+  let result_width = supported_width(result_type)
+  when result_width == 0
+  | q.error(loc, "SMT query: result '" ++ model.result ++ "' of operation '" ++ name ++ "' has unsupported type '"
+                   ++ result_type ++ "'" ++ supported_types)
+  let description = "the semantics of '" ++ name ++ "'"
+  let locals :: List.of(Bv):
+    for values(locals :: List.of(Bv) = []) (local :: List in model.locals):
+      locals.add(lower_term(q, local[1], Scope(description, #true, operands, locals, result_width, [], #false), loc))
+  let scope = Scope(description, #true, operands, locals, result_width, [], #false)
+  let result = lower_term(q, model.value, scope, loc)
+  unless result.width == result_width
+  | q.error(loc, "SMT query: the semantics of '" ++ name ++ "' produce a " +& result.width +& "-bit value for result '"
+                   ++ model.result ++ "', whose type is '" ++ result_type
+                   ++ "'; widths are never coerced or assumed equal")
+  match model.requirements
+  | requirements :: PairList:
+      let required = Scope("a requirement of '" ++ name ++ "'", #true, operands, locals, result_width, [], #false)
+      for (predicate in requirements):
+        let obligation = lower_formula(q, predicate, required, loc)
+        q.obligations := q.obligations.add(obligation)
+  | ~else: #void
+  q.values[op.results[0]] := result
+
+fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of(Bv), Bv):
+  let block = function.block
+  let inputs :: List.of(Bv):
+    for List (input in spec.inputs, argument in block.args):
+      let declared = declare_fun(q, input.name, input.width, function.op.loc)
+      q.values[argument.name] := declared
+      declared
+  let count = block.ops.length()
+  let models :: Map = q.context.models || {}
+  let returned :: maybe(Bv):
+    for values(returned :: maybe(Bv) = #false) (op in block.ops, position in 0 ..):
+      let name = op.name
+      cond
+      | name == "arith.constant":
+          lower_constant(q, op)
+          returned
+      | name == "func.return":
+          unless op.operands.length() == 1 && op.attribute_names().length() == 0
+          | q.error(op.loc, "SMT query: unsupported return in function @" ++ spec.function)
+          q.values.get(op.operands[0], #false)
+      | models.has_key(name):
+          lower_modeled(q, op, models[name], position == count - 1)
+          returned
+      | name in q.context.unmodeled:
+          q.error(op.loc, "SMT query: operation '" ++ name
+                            ++ "' has no declared SMT semantics; add an smt clause to its declaration")
+      | ~else:
+          q.error(op.loc, "SMT query: unsupported operation '" ++ name
+                            ++ "'; only arith.constant, func.return, and operations with declared SMT semantics are supported")
+  match returned
+  | value :: Bv: values(inputs, value)
+  | ~else: q.error(function.op.loc, "SMT query: function @" ++ spec.function ++ " does not return a supported value")
+
+//==============================================================================
+// 4. One question, as one solver
+
+def yield_line = "\"smt.yield\"() : () -> ()"
+
+fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :: String:
+  let q = Query(context, specification, index, [], 0, MutableMap(), [])
+  let spec = read_spec(q)
+  let function = check_function(q, spec)
+  let loc = function.op.loc
+  emit(q, "\"smt.set_logic\"() <{logic = \"QF_BV\"}> : () -> ()", loc)
+  let (inputs :: List.of(Bv), returned :: Bv):
+    cond
+    | context.lowered.has_key(spec.function):
+        let prepared :: Lowered = context.lowered[spec.function]
+        let inputs :: List.of(Bv):
+          for List (input in spec.inputs, width in prepared.widths, position in 0 ..):
+            let name = "%" +& position
+            q.lines := q.lines.add(declaration(name, input.name, width, loc))
+            Bv(name, width)
+        q.lines := q.lines ++ prepared.body
+        q.next := prepared.next
+        q.obligations := prepared.obligations
+        values(inputs, prepared.returned)
+    | ~else:
+        let (inputs, returned) = lower_body(q, spec, function)
+        // Exactly the body, before this question's assertions. The first
+        // line is set_logic, whose scope belongs to each query, and the
+        // inputs are declared again under each query's own names.
+        let widths :: List.of(Int) = for List (input in inputs): input.width
+        let body = q.lines.drop(1 + inputs.length())
+        context.lowered[spec.function] := Lowered(body, q.next, widths, returned, q.obligations)
+        values(inputs, returned)
+  // Assert the preconditions and the negation of what is to be shown: the
+  // property, and that every operation was used within what its model
+  // requires. No other assumption is added.
+  for (precondition in spec.preconditions, position in 0 ..):
+    let scope = Scope("precondition " +& position, #false, [], [], 0, inputs, returned)
+    assert(q, lower_formula(q, precondition, scope, loc), loc)
+  cond
+  | spec.enumerate_values:
+      // Expose the result and definedness separately. The caller first asks
+      // if any admitted input violates a requirement, so enumeration cannot
+      // hide partial functions by filtering away their undefined inputs.
+      let result = declare_fun(q, spec.result_symbol, returned.width, loc)
+      assert(q, bv_eq(q, result, returned, loc), loc)
+      let one = bv_constant(q, 1, 1, loc)
+      let defined_value :: Bv:
+        cond
+        | q.obligations.length() == 0: one
+        | ~else:
+            let condition:
+              if q.obligations.length() == 1
+              | q.obligations[0]
+              | bool_connective(q, "smt.and", q.obligations, loc)
+            let zero = bv_constant(q, 0, 1, loc)
+            bv_ite(q, condition, one, zero, loc)
+      let defined = declare_fun(q, spec.defined_symbol, 1, loc)
+      assert(q, bv_eq(q, defined, defined_value, loc), loc)
+  | ~else:
+      let scope = Scope("the property", #false, [], [], 0, inputs, returned)
+      let property = lower_formula(q, spec.property, scope, loc)
+      let goal:
+        if q.obligations.length() == 0
+        | property
+        | bool_connective(q, "smt.and", q.obligations.add(property), loc)
+      assert(q, bool_not(q, goal, loc), loc)
+  let suffix = if loc == "" | "" | " " ++ loc
+  let check :: List.of(String):
+    ["    \"smt.check\"() ({",
+     "      " ++ yield_line,
+     "    }, {",
+     "      " ++ yield_line,
+     "    }, {",
+     "      " ++ yield_line,
+     "    }) : () -> ()" ++ suffix,
+     "    " ++ yield_line,
+     "  }) : () -> ()" ++ suffix]
+  String.join(["  \"smt.solver\"() ({"] ++ q.lines ++ check, "\n")
+
+fun module_of(solvers :: List.of(String), loc :: String) :: String:
+  let suffix = if loc == "" | "" | " " ++ loc
+  "\"builtin.module\"() ({\n" ++ String.join(solvers, "\n") ++ "\n}) : () -> ()" ++ suffix ++ "\n"
+
+// The verified module's generic text is read once, however many manifests are
+// lowered over it.
+def read_modules = rkt.#{make-weak-hasheq}()
+
+fun module_read(text :: String) :: generic.Module:
+  match rkt.#{hash-ref}(read_modules, text, #false)
+  | found :: generic.Module: found
+  | ~else:
+      let module = generic.read_module(text)
+      rkt.#{hash-set!}(read_modules, text, module)
+      module
+
+// Lowers every query of a manifest (version 1: the manifest is the one query;
+// version 2: its `queries`) over the module whose generic form is `text`.
+// Returns the module holding one solver per query, in order, and each solver
+// as a module of its own. The source operations are in neither.
+fun lower(text :: String, manifest) :: values(String, List.of(String)):
+  let module = module_read(text)
+  fun malformed(message :: String):
+    fail(module.loc, "malformed SMT query manifest: " ++ message)
+  let root :: Map:
+    match manifest
+    | root :: Map: root
+    | ~else: malformed("expected an object")
+  let version = as_integer(get(root, #'version))
+  unless as_string(get(root, #'format)) == "pille-smt-query" && (version == 1 || version == 2)
+  | malformed("expected format \"pille-smt-query\" version 1 or 2")
+  let context = Context(module, root, MutableMap(), #false, Set{})
+  let solvers :: List.of(String):
+    cond
+    | version == 1: [build_query(context, root, #false)]
+    | ~else:
+        match as_array(get(root, #'queries))
+        | queries :: PairList:
+            for List (entry in queries, index in 0 ..):
+              match entry
+              | specification :: Map: build_query(context, specification, index)
+              | ~else: fail(module.loc, "SMT batch spec " +& index +& ": expected a query object")
+        | ~else: malformed("missing queries array")
+  values(module_of(solvers, module.loc),
+         for List (solver in solvers): module_of([solver], module.loc))
+
+// The same, from the manifest's JSON text.
+fun lower_text(text :: String, manifest :: ReadableString) :: values(String, List.of(String)):
+  let document:
+    try:
+      rjson.#{string->jsexpr}(to_string(manifest))
+      ~catch exn :: Exn.Fail:
+        fail(module_read(text).loc, "malformed SMT query manifest: " ++ exn.message)
+  lower(text, document)

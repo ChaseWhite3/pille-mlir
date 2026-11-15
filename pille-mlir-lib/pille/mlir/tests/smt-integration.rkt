@@ -682,7 +682,7 @@
                               'property '("eq" ("result") ("input" 0)))])
                ([override (in-list overrides)])
        (hash-set base (car override) (cdr override)))))
-  (define (lower text) (run_smt_query_pass basics plugin text))
+  (define (lower text) (smt_lower_text basics text))
   (check-regexp-match #rx"smt.solver" (lower (manifest)))
   (define (operations add)
     (cons 'operations
@@ -843,21 +843,3 @@
                    (lambda () (query arithmetic module "missing" (list x32) (same r32 x32)))))
       (check-equal? (directory-list work) '()))
     (lambda () (delete-directory/files root #:must-exist? #f))))
-
-(test-case "the plugin must be selected explicitly and must exist"
-  (parameterize ([current-environment-variables
-                  (environment-variables-copy (current-environment-variables))])
-    (environment-variables-set! (current-environment-variables) #"PILLE_MLIR_SMT_PLUGIN" #f)
-    (check-exn #rx"no SMT query plugin was selected"
-               (lambda () (make_smt_query arithmetic basics "add_zero" (list x32) (same r32 x32) '())))
-    (check-exn #rx"cannot find the SMT query plugin /pille-test/missing.so"
-               (lambda ()
-                 (make_smt_query arithmetic basics "add_zero" (list x32) (same r32 x32) '()
-                                 "/pille-test/missing.so")))
-    ;; The environment variable is honored, and a broken one never falls back.
-    (putenv "PILLE_MLIR_SMT_PLUGIN" (path->string plugin))
-    (check-eq? (status (make_smt_query arithmetic basics "add_zero" (list x32) (same r32 x32) '()))
-               'unsat)
-    (putenv "PILLE_MLIR_SMT_PLUGIN" "/pille-test/missing.so")
-    (check-exn #rx"cannot find the SMT query plugin"
-               (lambda () (make_smt_query arithmetic basics "add_zero" (list x32) (same r32 x32) '())))))

@@ -10,6 +10,7 @@
                      [parse-module parse_module]
                      [mlir-module-ir module_ir]
                      [mlir-module-irdl module_irdl]
+                     [module-generic module_generic]
                      [run-smt-query-pass run_smt_query_pass]
                      [run-smt-batch-pass run_smt_batch_pass]
                      [parse-stock-module parse_stock_module]
@@ -130,6 +131,21 @@
                    (string-append "--pass-pipeline=" pipeline))
              #:irdl (mlir-module-irdl module))
    (mlir-module-irdl module) (mlir-module-toolchain module)))
+
+;; The verified module in MLIR's generic form, which the SMT lowering reads.
+;; Locations, attributes and types are printed in place, without aliases. It
+;; is asked for once per module, however many queries are lowered over it.
+(define generic-texts (make-weak-hasheq))
+
+(define (module-generic module)
+  (unless (mlir-module? module) (raise-argument-error 'module_generic "mlir-module?" module))
+  (or (hash-ref generic-texts module #f)
+      (let ([text (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
+                            '("--verify-each" "--mlir-print-op-generic" "--mlir-print-local-scope"
+                              "--mlir-print-debuginfo")
+                            #:irdl (mlir-module-irdl module))])
+        (hash-set! generic-texts module text)
+        text)))
 
 ;; Translation requires LLVM-translatable dialects. Lowering is deliberately
 ;; explicit: tensor, memref, vector, GPU, etc. need different pipelines.

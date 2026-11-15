@@ -1,0 +1,170 @@
+== bench-batch plugin round 1
+mode	questions	total_ms	ms_per_question
+module_verify	1	15.877	15.877
+single	1	66.703	66.703
+batch_lower	1	42.639	42.639
+batch	1	65.696	65.696
+session_check	1	0.238	0.238
+session_with_lowering	1	58.754	58.754
+single	10	565.930	56.593
+batch_lower	10	44.906	4.491
+batch	10	73.364	7.336
+session_check	10	2.580	0.258
+session_with_lowering	10	63.363	6.336
+single	100	5323.581	53.236
+batch_lower	100	53.524	0.535
+batch	100	132.741	1.327
+session_check	100	24.188	0.242
+session_with_lowering	100	93.589	0.936
+single	1000	53928.660	53.929
+batch_lower	1000	125.710	0.126
+batch	1000	709.196	0.709
+session_check	1000	223.606	0.224
+session_with_lowering	1000	365.193	0.365
+closer_module_verify	1	58.354	58.354
+closer_batch_lower	4000	1263.891	0.316
+closer_batch	4000	4517.908	1.129
+closer_values_lower	500	238.955	0.478
+closer_values_session	500	406.487	0.813
+closer_values	500	703.796	1.408
+== closer safetynet plugin round 1
+strengths_ms	110.0	claims	29	judged	192
+== bench-batch rhombus round 1
+mode	questions	total_ms	ms_per_question
+module_verify	1	23.942	23.942
+single	1	73.313	73.313
+batch_lower	1	27.763	27.763
+batch	1	58.781	58.781
+session_check	1	0.260	0.260
+session_with_lowering	1	51.965	51.965
+single	10	391.923	39.192
+batch_lower	10	28.656	2.866
+batch	10	65.377	6.538
+session_check	10	2.613	0.261
+session_with_lowering	10	55.211	5.521
+single	100	3778.999	37.790
+batch_lower	100	42.209	0.422
+batch	100	130.556	1.306
+session_check	100	23.909	0.239
+session_with_lowering	100	90.060	0.901
+single	1000	38544.438	38.544
+batch_lower	1000	91.563	0.092
+batch	1000	691.700	0.692
+session_check	1000	223.142	0.223
+session_with_lowering	1000	338.647	0.339
+closer_module_verify	1	58.669	58.669
+closer_batch_lower	4000	1292.002	0.323
+closer_batch	4000	4515.780	1.129
+closer_values_lower	500	174.650	0.349
+closer_values_session	500	397.501	0.795
+closer_values	500	630.820	1.262
+== closer safetynet rhombus round 1
+strengths_ms	109.0	claims	29	judged	192
+== bench-batch plugin round 2
+mode	questions	total_ms	ms_per_question
+module_verify	1	16.490	16.490
+batch_lower	1	43.623	43.623
+batch	1	67.597	67.597
+session_check	1	0.246	0.246
+session_with_lowering	1	60.359	60.359
+batch_lower	10	47.292	4.729
+batch	10	76.411	7.641
+session_check	10	2.713	0.271
+session_with_lowering	10	66.495	6.649
+batch_lower	100	52.581	0.526
+batch	100	133.787	1.338
+session_check	100	25.121	0.251
+session_with_lowering	100	94.192	0.942
+batch_lower	1000	125.446	0.125
+batch	1000	721.188	0.721
+session_check	1000	232.960	0.233
+session_with_lowering	1000	374.896	0.375
+closer_module_verify	1	58.726	58.726
+closer_batch_lower	4000	1286.745	0.322
+closer_batch	4000	4540.777	1.135
+closer_values_lower	500	237.756	0.476
+closer_values_session	500	400.680	0.801
+closer_values	500	697.162	1.394
+== closer safetynet plugin round 2
+strengths_ms	110.0	claims	29	judged	192
+== bench-batch rhombus round 2
+mode	questions	total_ms	ms_per_question
+module_verify	1	15.965	15.965
+batch_lower	1	41.366	41.366
+batch	1	64.420	64.420
+session_check	1	0.230	0.230
+session_with_lowering	1	57.561	57.561
+batch_lower	10	30.642	3.064
+batch	10	59.157	5.916
+session_check	10	2.418	0.242
+session_with_lowering	10	49.025	4.903
+batch_lower	100	34.566	0.346
+batch	100	116.495	1.165
+session_check	100	26.616	0.266
+session_with_lowering	100	77.147	0.771
+batch_lower	1000	100.563	0.101
+batch	1000	687.528	0.688
+session_check	1000	231.541	0.232
+session_with_lowering	1000	348.069	0.348
+closer_module_verify	1	58.553	58.553
+closer_batch_lower	4000	1297.846	0.324
+closer_batch	4000	4540.820	1.135
+closer_values_lower	500	177.259	0.355
+closer_values_session	500	402.850	0.806
+closer_values	500	638.662	1.277
+== closer safetynet rhombus round 2
+strengths_ms	109.0	claims	29	judged	192
+== bench-batch plugin round 3
+mode	questions	total_ms	ms_per_question
+module_verify	1	15.951	15.951
+batch_lower	1	42.511	42.511
+batch	1	65.754	65.754
+session_check	1	0.262	0.262
+session_with_lowering	1	58.724	58.724
+batch_lower	10	47.200	4.720
+batch	10	76.028	7.603
+session_check	10	2.414	0.241
+session_with_lowering	10	65.565	6.557
+batch_lower	100	52.871	0.529
+batch	100	133.200	1.332
+session_check	100	25.379	0.254
+session_with_lowering	100	94.201	0.942
+batch_lower	1000	127.254	0.127
+batch	1000	743.793	0.744
+session_check	1000	233.520	0.234
+session_with_lowering	1000	376.725	0.377
+closer_module_verify	1	61.063	61.063
+closer_batch_lower	4000	1287.152	0.322
+closer_batch	4000	4533.958	1.133
+closer_values_lower	500	237.615	0.475
+closer_values_session	500	399.379	0.799
+closer_values	500	698.057	1.396
+== closer safetynet plugin round 3
+strengths_ms	110.0	claims	29	judged	192
+== bench-batch rhombus round 3
+mode	questions	total_ms	ms_per_question
+module_verify	1	15.973	15.973
+batch_lower	1	46.119	46.119
+batch	1	69.433	69.433
+session_check	1	0.198	0.198
+session_with_lowering	1	62.290	62.290
+batch_lower	10	30.637	3.064
+batch	10	59.255	5.925
+session_check	10	2.524	0.252
+session_with_lowering	10	49.134	4.913
+batch_lower	100	36.527	0.365
+batch	100	119.226	1.192
+session_check	100	22.921	0.229
+session_with_lowering	100	75.421	0.754
+batch_lower	1000	99.646	0.100
+batch	1000	687.555	0.688
+session_check	1000	233.377	0.233
+session_with_lowering	1000	348.996	0.349
+closer_module_verify	1	59.089	59.089
+closer_batch_lower	4000	1304.337	0.326
+closer_batch	4000	4593.323	1.148
+closer_values_lower	500	178.011	0.356
+closer_values_session	500	397.421	0.795
+closer_values	500	634.521	1.269
+== closer safetynet rhombus round 3
+strengths_ms	129.0	claims	29	judged	192

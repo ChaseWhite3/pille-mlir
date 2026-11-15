@@ -1,0 +1,73 @@
+{
+ "both_lowered": 627,
+ "both_refused": 38,
+ "counterexamples_cross_checked": 668,
+ "differences": [
+  {
+   "plugin": "malformed SMT query manifest: [1:2, byte=2]: Expected object key",
+   "record": "1794710673845.615-336.json",
+   "rhombus": "malformed SMT query manifest: string::2: string->jsexpr: non-string value used for json object key",
+   "what": "refusal messages differ"
+  },
+  {
+   "plugin": "pille/mlir: no SMT query plugin was selected; build pille/mlir/native with the MLIR installation that supplies mlir-opt (see the package README, or use build_plugin), then pass its path explicitly or set PILLE_MLIR_SMT_PLUGIN",
+   "record": "1794710675939.408-354.json",
+   "rhombus": "lowered",
+   "what": "one side refused"
+  }
+ ],
+ "distinct_requests": 655,
+ "members_equal": 6,
+ "proof_questions": 922,
+ "questions": 933,
+ "questions_normalized_equal": 933,
+ "questions_text_equal": 933,
+ "records": 666,
+ "refusal_messages": {
+  "SMT batch spec 1: SMT query: function @missing was not found as a func.func in the module": 1,
+  "SMT query: bv.add in the semantics of 'arithmetic.loose' combines a 32-bit value with a 64-bit value; widths must be equal and are never coerced or assumed equal": 1,
+  "SMT query: function @declared is a declaration without a body": 1,
+  "SMT query: function @missing was not found as a func.func in the module": 2,
+  "SMT query: function @pair returns 2 values; exactly one scalar result is supported": 1,
+  "SMT query: function @round_trip has 2 arguments, but 1 inputs were declared": 1,
+  "SMT query: function @successor has 1 arguments, but 2 inputs were declared": 1,
+  "SMT query: input 'x' is declared with width 64, but argument 0 of function @successor has type 'i32'": 1,
+  "SMT query: literal 2 in the semantics of 'second.affine' does not fit in 1 bits (accepted range is -2^(w-1) through 2^w-1)": 1,
+  "SMT query: literal 300 in the semantics of 'arithmetic.add' does not fit in 8 bits (accepted range is -2^(w-1) through 2^w-1)": 1,
+  "SMT query: operation 'arithmetic.add' carries attribute 'rounding'; attribute-dependent semantics are unsupported and attributes are rejected rather than ignored": 1,
+  "SMT query: operation 'arithmetic.add' has 2 operands and 1 results, which is incompatible with its declared semantics (3 operands, 1 result)": 1,
+  "SMT query: operation 'arithmetic.annotate' has no declared SMT semantics; add an smt clause to its declaration": 1,
+  "SMT query: operation 'arithmetic.opaque' has no declared SMT semantics; add an smt clause to its declaration": 1,
+  "SMT query: the property refers to a 64-bit result, but function @successor returns 'i32'": 1,
+  "SMT query: the semantics of 'arithmetic.add' produce a 8-bit value for result 'out', whose type is 'i32'; widths are never coerced or assumed equal": 1,
+  "SMT query: the semantics of 'arithmetic.loose' produce a 32-bit value for result 'out', whose type is 'i64'; widths are never coerced or assumed equal": 1,
+  "SMT query: unsupported attribute 'pille.note' on function @annotated; attributes are rejected rather than ignored": 1,
+  "SMT query: unsupported constant of type 'f32'; supported types are i1, i8, i16, i32, and i64": 1,
+  "SMT query: unsupported control flow: function @branch has 2 blocks, but only straight-line single-block bodies are supported": 1,
+  "SMT query: unsupported operation 'arith.addi'; only arith.constant, func.return, and operations with declared SMT semantics are supported": 1,
+  "SMT query: unsupported operation 'func.call'; only arith.constant, func.return, and operations with declared SMT semantics are supported": 1,
+  "SMT query: unsupported operation 'memref.alloca'; only arith.constant, func.return, and operations with declared SMT semantics are supported": 1,
+  "SMT query: unsupported result type 'f32' of function @float_result; supported types are i1, i8, i16, i32, and i64": 1,
+  "SMT query: unsupported result type 'index' of function @index_result; supported types are i1, i8, i16, i32, and i64": 1,
+  "SMT query: unsupported type 'f32' of argument 0 of function @any_float; supported types are i1, i8, i16, i32, and i64": 1,
+  "SMT query: unsupported type 'i7' of argument 0 of function @odd_width; supported types are i1, i8, i16, i32, and i64": 1,
+  "malformed SMT query manifest: expected an object": 1,
+  "malformed SMT query manifest: expected format \"pille-smt-query\" version 1 or 2": 1,
+  "malformed SMT query manifest: missing a required field": 1,
+  "malformed SMT query manifest: reference out of range in the semantics of 'arithmetic.add'": 1,
+  "malformed SMT query manifest: unsupported expression 'input' in the semantics of 'arithmetic.add'": 1,
+  "malformed SMT query manifest: unsupported expression 'operand' in the property": 1,
+  "malformed SMT query manifest: unsupported expression 'shl' in the semantics of 'arithmetic.add'": 1,
+  "malformed SMT query manifest: unsupported predicate 'implies' in the property": 1
+ },
+ "refusals_equal": 37,
+ "smtlib_equal": 627,
+ "status_equal": 913,
+ "statuses": {
+  "sat": 334,
+  "unsat": 579
+ },
+ "value_sets_equal": 11,
+ "values_questions": 11,
+ "verified_equal": 627
+}

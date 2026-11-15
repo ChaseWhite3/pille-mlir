@@ -148,7 +148,7 @@ match missing
 | ~else:
     check "a missing solver is a failure" ~is #false
 
-// Boundaries: a schema-only operation, an unrelated module, and a missing plugin.
+// Boundaries: a schema-only operation, an unrelated module, and an undeclared input.
 check:
   arithmetic.smt_query(program, ~function: "annotated", ~inputs: [x],
                        ~property: smt.eq(result, x), ~plugin: plugin)
@@ -163,8 +163,3 @@ check:
   arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
                        ~property: smt.eq(result, y), ~plugin: plugin)
   ~throws "refers to input y, which is not among the declared inputs"
-
-check:
-  arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
-                       ~property: smt.eq(result, x), ~plugin: "/pille-test/missing.so")
-  ~throws "cannot find the SMT query plugin"

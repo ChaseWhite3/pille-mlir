@@ -5,12 +5,10 @@ import:
   pille/mlir/dialect
   pille/mlir/schema
   pille/mlir/smt
-  lib("pille/mlir/tests/smt-support.rkt") as support
   "../examples/bench-batch-support.rkt" as fixtures
 
 // Public API integration: no skipped solver tests and no fake lowering. These
-// tests require MLIR, the freshly built plugin, and Z3, like smt-api.rhm.
-def plugin :: Path = support.smt_plugin()
+// tests require MLIR and Z3, like smt-api.rhm.
 def word = schema.type_is("i8")
 def arithmetic :: dialect.Dialect:
   fun binary(name :: String, meaning):
@@ -37,7 +35,7 @@ def specs:
   for List (index in 0 .. 300):
     smt.Spec(~function: function(index), ~inputs: [x], ~property: smt.eq(out, x),
              ~preconditions: assumptions(index))
-def batch = arithmetic.smt_batch(module, specs, ~plugin: plugin)
+def batch = arithmetic.smt_batch(module, specs)
 check batch.queries.length() ~is 300
 check batch.module.to_ir().contains("batch_arithmetic.") ~is #false
 check batch.to_smtlib().contains("(check-sat)") ~is #true
@@ -49,7 +47,7 @@ check answers.length() ~is 300
 for (answer in answers, index in 0 ..):
   let original = arithmetic.smt_query(module, ~function: function(index), ~inputs: [x],
                                       ~property: smt.eq(out, x),
-                                      ~preconditions: assumptions(index), ~plugin: plugin)
+                                      ~preconditions: assumptions(index))
   let alone = original.check()
   check answer.function ~is alone.function
   check answer.dialect ~is alone.dialect
@@ -88,21 +86,19 @@ try:
   ~finally: session.close()
 session.close()
 
-// Errors name the zero-based spec index, including errors found by the native
-// pass after the pure specification builders have accepted a valid value.
+// Errors name the zero-based spec index, including errors found by the
+// lowering after the pure specification builders have accepted a valid value.
 check:
   arithmetic.smt_batch(
-    module, [specs[0], smt.Spec(~function: "missing", ~inputs: [x], ~property: smt.eq(out, x))],
-    ~plugin: plugin)
+    module, [specs[0], smt.Spec(~function: "missing", ~inputs: [x], ~property: smt.eq(out, x))])
   ~throws "spec 1"
 check:
   arithmetic.smt_batch(
-    module, [specs[0], smt.Spec(~function: "identity", ~inputs: [], ~property: smt.eq(out, x))],
-    ~plugin: plugin)
+    module, [specs[0], smt.Spec(~function: "identity", ~inputs: [], ~property: smt.eq(out, x))])
   ~throws "spec 1"
 
 // One batch preserves the existing missing-executable outcome classification.
-def singleton = arithmetic.smt_batch(module, [specs[1]], ~plugin: plugin)
+def singleton = arithmetic.smt_batch(module, [specs[1]])
 def missing = singleton.check(~solver: "/pille-test/no-such-z3")
 check missing.length() ~is 1
 match missing[0]
@@ -118,7 +114,7 @@ def scales = [0, 1, 2, 3, 4, 7, 16, 128]
 def value_specs:
   for List (index in 0 .. scales.length()):
     smt.ValuesSpec(~function: "affine_" ++ to_string(index), ~inputs: [x])
-def value_batch = arithmetic.smt_values_batch(affine, value_specs, ~plugin: plugin)
+def value_batch = arithmetic.smt_values_batch(affine, value_specs)
 check value_batch.queries.length() ~is scales.length()
 def value_session = smt.Session()
 try:
@@ -139,8 +135,7 @@ try:
   // Inconsistent assumptions mean no values, not a proof of a constant result.
   let impossible = arithmetic.smt_values_query(
     affine, ~function: "affine_1", ~inputs: [x],
-    ~preconditions: [smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8))],
-    ~plugin: plugin)
+    ~preconditions: [smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8))])
   match value_session.values(impossible, ~limit: 257)
   | empty :: smt.Values:
       check empty.complete ~is #true
@@ -174,7 +169,7 @@ def restricted_module = restricted.module(@str|{
   }
 }|)
 def unbounded = restricted.smt_values_query(
-  restricted_module, ~function: "identity", ~inputs: [x], ~plugin: plugin)
+  restricted_module, ~function: "identity", ~inputs: [x])
 def restricted_session = smt.Session()
 try:
   match restricted_session.values(unbounded, ~limit: 257)
@@ -182,8 +177,7 @@ try:
   | ~else: error("values silently filtered an undefined input")
   let allowed = restricted.smt_values_query(
     restricted_module, ~function: "identity", ~inputs: [x],
-    ~preconditions: [smt.or(smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8)))],
-    ~plugin: plugin)
+    ~preconditions: [smt.or(smt.eq(x, smt.const(0, ~width: 8)), smt.eq(x, smt.const(1, ~width: 8)))])
   match restricted_session.values(allowed, ~limit: 3)
   | answer :: smt.Values:
       check answer.complete ~is #true

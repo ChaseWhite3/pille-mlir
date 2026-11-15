@@ -4,8 +4,7 @@ import:
   pille/mlir/dialect open
   pille/mlir/smt
 
-// Requires MLIR, the SMT query plugin (PILLE_MLIR_SMT_PLUGIN), and Z3. See the
-// package README for how to build the plugin.
+// Requires MLIR and Z3.
 
 constraint Integer:
   same("T", i32 || i64)

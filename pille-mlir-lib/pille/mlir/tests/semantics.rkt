@@ -7,7 +7,7 @@
          "../../private/mlir/schema.rkt"
          "../../private/mlir/semantics.rkt")
 
-;; Pure descriptor tests: nothing here may need MLIR, the plugin, or a solver.
+;; Pure descriptor tests: nothing here may need MLIR or a solver.
 (define (without-tools thunk)
   (parameterize ([current-environment-variables
                   (environment-variables-copy (current-environment-variables))])

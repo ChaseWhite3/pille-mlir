@@ -3,8 +3,8 @@
 import:
   pille/mlir/dialect open
 
-// Importing this module and reading its descriptors needs no MLIR, plugin, or
-// solver. The integration tests lower programs that use these dialects.
+// Importing this module and reading its descriptors needs no MLIR or solver.
+// The integration tests lower programs that use these dialects.
 constraint Integer:
   same("T", i1 || i8 || i16 || i32 || i64)
 

@@ -5,7 +5,6 @@ import:
   lib("pille/private/mlir/query.rkt") as query
   lib("pille/private/mlir/solver.rkt") as solver
   lib("pille/private/mlir/session.rkt") as session
-  lib("pille/private/mlir/tools.rkt") as tools
 
 export:
   Term
@@ -35,7 +34,6 @@ export:
   not
   and
   or
-  build_plugin
 
 // A bitvector-sorted value with an exact width. Terms and Boolean predicates
 // are separate sorts: a one-bit term is never usable as a predicate.
@@ -91,12 +89,6 @@ fun and(operand, ...) :: Formula:
 
 fun or(operand, ...) :: Formula:
   query.smt_or([operand, ...])
-
-// Builds the native lowering plugin against the toolchain's own MLIR
-// installation and returns the plugin's path. Nothing calls this implicitly.
-fun build_plugin(directory :: Path || ReadableString,
-                 ~toolchain: toolchain :: mlir.Toolchain = mlir.Toolchain()) :: Path:
-  tools.build_smt_plugin(directory, toolchain)
 
 class Assignment(name :: String, width :: Int, value :: Int):
   method describe() :: String:

@@ -22,7 +22,7 @@
 
 ;; The SMT model of an operation is a small typed expression tree over
 ;; fixed-width bitvectors. It is shared by macro expansion, runtime descriptor
-;; reconstruction, and the manifest consumed by the native lowering pass.
+;; reconstruction, and the manifest consumed by the lowering (lower.rhm).
 ;;
 ;;   (expr 'operand (name))          an operand of the modeled operation
 ;;   (expr 'local   (index))         an earlier `let` binding of the same model

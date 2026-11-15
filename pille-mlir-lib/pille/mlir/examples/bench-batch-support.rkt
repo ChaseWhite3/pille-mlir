@@ -1,14 +1,12 @@
 #lang racket/base
 
-(require racket/file
-         racket/format
+(require racket/format
          racket/list
          racket/string
-         racket/treelist
-         "../../private/mlir/tools.rkt")
+         racket/treelist)
 
 (provide milliseconds measure row basic_source closer_source affine_source
-         affine_values plugin)
+         affine_values)
 
 (define (milliseconds) (current-inexact-monotonic-milliseconds))
 
@@ -77,14 +75,3 @@ MLIR
   (list->treelist
    (sort (remove-duplicates
           (for/list ([x (in-range 256)]) (modulo (+ (* scale x) offset) 256))) <)))
-
-(define built #f)
-(define (plugin)
-  (or (and (getenv "PILLE_MLIR_SMT_PLUGIN") (resolve_smt_plugin))
-      built
-      (let ([directory (make-temporary-file "pille-smt-benchmark-~a" 'directory)])
-        (plumber-add-flush! (current-plumber)
-                           (lambda (_handle)
-                             (delete-directory/files directory #:must-exist? #f)))
-        (set! built (build_smt_plugin directory (make_toolchain)))
-        built)))

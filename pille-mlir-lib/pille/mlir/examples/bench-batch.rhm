@@ -8,13 +8,11 @@ import:
   rhombus/envvar
   "bench-batch-support.rkt" as support
 
-// Run with the selected MLIR installation and Z3 available. Building the
-// plugin is excluded; module verification is reported separately and included
-// once in each end-to-end total. Set
-// PILLE_MLIR_SMT_PLUGIN to use an already rebuilt plugin. The optional
-// PILLE_SMT_BENCH_SKIP_SINGLE skips only the slow legacy baseline during
-// development; leave it unset for the complete benchmark.
-def plugin :: Path = support.plugin()
+// Run with the selected MLIR installation and Z3 available. Module
+// verification is reported separately and included once in each end-to-end
+// total. The optional PILLE_SMT_BENCH_SKIP_SINGLE skips only the slow
+// one-question-at-a-time baseline during development; leave it unset for the
+// complete benchmark.
 def word = schema.type_is("i8")
 def arithmetic :: dialect.Dialect:
   fun binary(name :: String, meaning):
@@ -64,11 +62,11 @@ for (n in [1, 10, 100, 1000]):
       let query = arithmetic.smt_query(program,
                                        ~function: (if index mod 3 == 0 | "identity" | "successor"),
                                        ~inputs: [x], ~property: smt.eq(returned, x),
-                                       ~preconditions: assumptions, ~plugin: plugin)
+                                       ~preconditions: assumptions)
       check_answer(query.check(), index)
     support.row("single", n, module_ms + support.milliseconds() - started)
 
-  let [lower_ms :: Real, batch :: smt.Batch] = support.measure(fun(): arithmetic.smt_batch(program, specs, ~plugin: plugin))
+  let [lower_ms :: Real, batch :: smt.Batch] = support.measure(fun(): arithmetic.smt_batch(program, specs))
   let [solve_ms :: Real, answers :: List.of(smt.Outcome)] = support.measure(fun(): batch.check())
   for (answer in answers, index in 0 ..): check_answer(answer, index)
   support.row("batch_lower", n, lower_ms)
@@ -113,7 +111,7 @@ def comparison_specs:
     each value in 0 .. 8
     smt.Spec(~function: "chain_" ++ to_string(index), ~inputs: [start],
              ~property: smt.eq(returned, smt.const(value, ~width: 8)), ~preconditions: domain)
-def [closer_lower_ms :: Real, closer_batch :: smt.Batch] = support.measure(fun(): strength_dialect.smt_batch(closer_program, comparison_specs, ~plugin: plugin))
+def [closer_lower_ms :: Real, closer_batch :: smt.Batch] = support.measure(fun(): strength_dialect.smt_batch(closer_program, comparison_specs))
 def [closer_solve_ms :: Real, closer_answers :: List.of(smt.Outcome)] = support.measure(fun(): closer_batch.check())
 for (answer in closer_answers, question in 0 ..):
   let index = question div 8
@@ -133,7 +131,7 @@ support.row("closer_batch", 4000, closer_module_ms + closer_lower_ms + closer_so
 def value_specs:
   for List (index in 0 .. 500):
     smt.ValuesSpec(~function: "chain_" ++ to_string(index), ~inputs: [start], ~preconditions: domain)
-def [values_lower_ms :: Real, values_batch :: smt.ValuesBatch] = support.measure(fun(): strength_dialect.smt_values_batch(closer_program, value_specs, ~plugin: plugin))
+def [values_lower_ms :: Real, values_batch :: smt.ValuesBatch] = support.measure(fun(): strength_dialect.smt_values_batch(closer_program, value_specs))
 def values_session = smt.Session()
 try:
   values_session.values(values_batch.queries[0], ~limit: 9)
@@ -158,5 +156,5 @@ try:
 def relation = strength_dialect.smt_query(
   closer_program, ~function: "relation", ~inputs: [start],
   ~property: smt.eq(returned, smt.const(1, ~width: 8)),
-  ~preconditions: domain, ~plugin: plugin)
+  ~preconditions: domain)
 unless relation.check().is_proved | error("Closer Boolean recipes were not proved")

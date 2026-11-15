@@ -9,15 +9,15 @@
          racket/treelist
          "../../private/mlir/schema.rkt")
 
-;; Expansion tests for the `smt:` clause. Nothing here needs MLIR, the query
-;; plugin, or a solver: the environment is cleared to prove it.
+;; Expansion tests for the `smt:` clause. Nothing here needs MLIR or a solver:
+;; the environment is cleared to prove it.
 (define-runtime-path fixtures "semantics")
 (define (fixture name) (build-path fixtures name))
 
 (define (without-tools thunk)
   (parameterize ([current-environment-variables
                   (environment-variables-copy (current-environment-variables))])
-    (for ([name '(#"PILLE_MLIR_PREFIX" #"PILLE_LLVM_PREFIX" #"PILLE_MLIR_SMT_PLUGIN" #"PILLE_Z3")])
+    (for ([name '(#"PILLE_MLIR_PREFIX" #"PILLE_LLVM_PREFIX" #"PILLE_Z3")])
       (environment-variables-set! (current-environment-variables) name #f))
     (environment-variables-set! (current-environment-variables) #"PATH" #"")
     (thunk)))
@@ -55,7 +55,7 @@
                                 #:when (equal? (cadr definition) operation))
                       definition)))))
 
-(test-case "declaring semantics and reading descriptors needs no MLIR, plugin, or solver"
+(test-case "declaring semantics and reading descriptors needs no MLIR or solver"
   (without-tools
    (lambda ()
      (check-not-exn (lambda () (expand-fixture "valid.rhm")))

@@ -4,11 +4,9 @@ import:
   pille/mlir
   pille/mlir/dialect open
   pille/mlir/smt
-  lib("pille/mlir/tests/smt-support.rkt") as support
 
 // Exercises the public static-language API end to end. Like the integration
-// tests, this requires MLIR, the query plugin, and Z3 (z3 on PATH or PILLE_Z3).
-def plugin :: Path = support.smt_plugin()
+// tests, this requires MLIR and Z3 (z3 on PATH or PILLE_Z3).
 
 constraint Integer:
   same("T", i32 || i64)
@@ -71,8 +69,7 @@ check smt.input("check-sat", ~width: 32) ~throws "invalid input name"
 def round_trip :: smt.Query = arithmetic.smt_query(program,
                                                    ~function: "round_trip",
                                                    ~inputs: [x, y],
-                                                   ~property: smt.eq(result, x),
-                                                   ~plugin: plugin)
+                                                   ~property: smt.eq(result, x))
 check round_trip.function ~is "round_trip"
 check round_trip.dialect ~is "arithmetic"
 check round_trip.inputs ~is [["x", 32], ["y", 32]]
@@ -100,8 +97,7 @@ match proved
 def successor = arithmetic.smt_query(program,
                                      ~function: "successor",
                                      ~inputs: [x],
-                                     ~property: smt.eq(result, x),
-                                     ~plugin: plugin)
+                                     ~property: smt.eq(result, x))
 match successor.check()
 | refuted :: smt.Counterexample:
     check refuted.is_proved ~is #false
@@ -122,8 +118,7 @@ def vacuous = arithmetic.smt_query(
   ~function: "successor",
   ~inputs: [x],
   ~property: smt.eq(result, x),
-  ~preconditions: [smt.eq(x, smt.const(0, ~width: 32)), smt.eq(x, smt.const(1, ~width: 32))],
-  ~plugin: plugin
+  ~preconditions: [smt.eq(x, smt.const(0, ~width: 32)), smt.eq(x, smt.const(1, ~width: 32))]
 )
 check vacuous.assumptions ~is ["x == 0x00000000:bv32", "x == 0x00000001:bv32"]
 match vacuous.check()
@@ -151,15 +146,15 @@ match missing
 // Boundaries: a schema-only operation, an unrelated module, and an undeclared input.
 check:
   arithmetic.smt_query(program, ~function: "annotated", ~inputs: [x],
-                       ~property: smt.eq(result, x), ~plugin: plugin)
+                       ~property: smt.eq(result, x))
   ~throws "operation 'arithmetic.annotate' has no declared SMT semantics"
 
 check:
   arithmetic.smt_query(mlir.Module("module {}"), ~function: "f",
-                       ~property: smt.eq(result, result), ~plugin: plugin)
+                       ~property: smt.eq(result, result))
   ~throws "was not verified against dialect arithmetic's generated IRDL"
 
 check:
   arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
-                       ~property: smt.eq(result, y), ~plugin: plugin)
+                       ~property: smt.eq(result, y))
   ~throws "refers to input y, which is not among the declared inputs"

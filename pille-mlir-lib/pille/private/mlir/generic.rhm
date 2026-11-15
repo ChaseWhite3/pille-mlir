@@ -305,9 +305,7 @@ fun read_location(r :: Reader) :: String:
       if index < size && r.text[index] == Char" " | ahead(index + 1) | index
   cond
   | after + 4 <= size && r.text.substring(after, after + 4) == "loc(":
-      r.pos := after + 3
-      let start = after
-      r.pos := r.pos + 1
+      r.pos := after + 4
       let inside = scan_parenthesized(r)
       "loc(" ++ inside ++ ")"
   | ~else: ""

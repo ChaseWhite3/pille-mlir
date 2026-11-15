@@ -1,7 +1,6 @@
 #lang racket/base
 
 (require json
-         racket/file
          racket/list
          racket/match
          racket/promise
@@ -248,7 +247,7 @@
   (values declared assumptions))
 
 ;; Specs retain immutable property descriptors. Batch validation resolves their
-;; references with an index in each error; native lowering checks signatures.
+;; references with an index in each error; the lowering checks signatures.
 (define (make_spec function inputs property [preconditions '()])
   (spec (string->immutable-string function) (entries 'Spec inputs) property
         (entries 'Spec preconditions)))
@@ -318,77 +317,22 @@
         (lower (module_generic module) manifest)))
   (values text (treelist->list members)))
 
-;; TEMPORARY, for the acceptance comparison only, and removed with the native
-;; plugin: with PILLE_MLIR_SMT_COMPARE naming a directory, every lowering is
-;; also run through the plugin (PILLE_MLIR_SMT_PLUGIN), and both results, or
-;; refusals, are recorded there with their inputs. The Rhombus result is the
-;; one used either way.
-(define compare-directory (getenv "PILLE_MLIR_SMT_COMPARE"))
-(define compare-count 0)
-
-;; TEMPORARY, with the same life: PILLE_MLIR_SMT_LOWERING=plugin answers with the
-;; plugin's lowering alone, so that each can be timed and tested in turn.
-(define (run-plugin module manifest)
-  (define plugin (resolve_smt_plugin #f))
-  (cond
-    [(string? manifest) (values (run_smt_query_pass module plugin manifest) '())]
-    [(eqv? (hash-ref manifest 'version #f) 2) (run_smt_batch_pass module plugin manifest)]
-    [else (values (run_smt_query_pass module plugin (jsexpr->string manifest)) '())]))
-
-(define (lower-manifest module manifest)
-  (cond
-    [compare-directory (compare-lowerings module manifest)]
-    [(equal? (getenv "PILLE_MLIR_SMT_LOWERING") "plugin") (run-plugin module manifest)]
-    [else (run-lowering module manifest)]))
-
-(define (compare-lowerings module manifest)
-  (define (attempt run)
-    (with-handlers ([exn:fail? (lambda (error) (list 'error error))])
-      (call-with-values run (lambda (text members) (list 'ok text members)))))
-  (define (side result)
-    (cond
-      [(eq? (car result) 'error) (hasheq 'error (exn-message (cadr result)))]
-      [else
-       (with-handlers ([exn:fail? (lambda (error) (hasheq 'verify_error (exn-message error)))])
-         (define verified (parse_stock_module (cadr result) module))
-         (hasheq 'verified (module_ir verified)
-                 'smtlib (to_smtlib verified)
-                 'members (if (<= (length (caddr result)) 4)
-                              (for/list ([member (in-list (caddr result))])
-                                (module_ir (parse_stock_module member module)))
-                              (length (caddr result)))))]))
-  (define by-plugin (attempt (lambda () (run-plugin module manifest))))
-  (define by-rhombus (attempt (lambda () (run-lowering module manifest))))
-  (set! compare-count (add1 compare-count))
-  (make-directory* compare-directory)
-  (call-with-output-file
-    (build-path compare-directory
-                (format "~a-~a.json" (current-inexact-milliseconds) compare-count))
-    (lambda (out)
-      (write-json (hasheq 'ir (module_ir module) 'irdl (module_irdl module)
-                          'manifest (if (string? manifest) manifest (jsexpr->string manifest))
-                          'plugin (side by-plugin) 'rhombus (side by-rhombus))
-                  out)))
-  (if (eq? (car by-rhombus) 'error)
-      (raise (cadr by-rhombus))
-      (values (cadr by-rhombus) (caddr by-rhombus))))
-
 ;; Lowers a manifest given as JSON text, bypassing the manifest this module
 ;; derives from a dialect: for tests of what the lowering itself checks.
 (define (smt_lower_text module manifest)
   (unless (is_module module) (raise-argument-error 'smt_lower_text "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_text "string?" manifest))
-  (define-values (text _members) (lower-manifest module manifest))
+  (define-values (text _members) (run-lowering module manifest))
   text)
 
-(define (make_smt_query dialect module function inputs property preconditions [plugin #f])
+(define (make_smt_query dialect module function inputs property preconditions)
   (check-context 'smt_query dialect module)
   (define description (make_spec function inputs property preconditions))
   (define manifest
     (for/fold ([manifest (context-manifest dialect 1)])
               ([(key value) (in-hash (spec-manifest description))])
       (hash-set manifest key value)))
-  (define-values (lowered _members) (lower-manifest module manifest))
+  (define-values (lowered _members) (run-lowering module manifest))
   (define verified (parse_stock_module lowered module))
   (define smtlib (to_smtlib verified))
   (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
@@ -411,7 +355,7 @@
     (builder-error 'smt_batch "exported SMT batch has commands after the last query's reset"))
   chunks)
 
-(define (make-batch dialect module specifications plugin values?)
+(define (make-batch dialect module specifications values?)
   (define who (if values? 'smt_values_batch 'smt_batch))
   (check-context who dialect module)
   (define specs (entries who specifications))
@@ -424,7 +368,7 @@
           (raise-argument-error who (if values? "ValuesSpec" "Spec") value))
         (spec-manifest value))))
   (define manifest (hash-set (context-manifest dialect 2) 'queries descriptions))
-  (define-values (lowered standalone) (lower-manifest module manifest))
+  (define-values (lowered standalone) (run-lowering module manifest))
   (define verified (parse_stock_module lowered module))
   (define text (to_smtlib verified))
   (define chunks (split-queries text))
@@ -437,7 +381,7 @@
       (define declarations (smtlib-declarations script))
       (define expected (expected-inputs inputs))
       ;; Construction checks the whole batch once. Accessing a member's module
-      ;; can verify the native printer's isolated module lazily, without adding
+      ;; verifies the lowering's isolated module lazily, without adding
       ;; processes to ordinary batch construction or solver execution.
       (define member-module (delay (parse_stock_module ir module)))
       (cond
@@ -456,14 +400,14 @@
          (query member-module script (dialect_name dialect) function inputs property assumptions)])))
   ((if values? values-batch batch) verified text queries))
 
-(define (make_smt_batch dialect module specs [plugin #f])
-  (make-batch dialect module specs plugin #f))
-(define (make_smt_values_batch dialect module specs [plugin #f])
-  (make-batch dialect module specs plugin #t))
-(define (make_smt_values_query dialect module function inputs preconditions [plugin #f])
+(define (make_smt_batch dialect module specs)
+  (make-batch dialect module specs #f))
+(define (make_smt_values_batch dialect module specs)
+  (make-batch dialect module specs #t))
+(define (make_smt_values_query dialect module function inputs preconditions)
   (car (values-batch-queries
         (make_smt_values_batch dialect module
-                              (list (make_values_spec function inputs preconditions)) plugin))))
+                              (list (make_values_spec function inputs preconditions))))))
 
 (define (batch-requests value)
   (for/list ([member (in-list (batch-queries value))])

@@ -10,7 +10,6 @@
          racket/string
          racket/system
          racket/treelist
-         "smt-support.rkt"
          "../../private/mlir/query.rkt"
          "../../private/mlir/schema.rkt"
          "../../private/mlir/solver.rkt"
@@ -18,13 +17,11 @@
          "../../private/mlir/tools.rkt")
 
 ;; End-to-end tests of declaration-driven SMT verification. They require real
-;; MLIR tools, the native query plugin (built here unless PILLE_MLIR_SMT_PLUGIN
-;; selects one), and a real Z3. A missing tool is a test failure, not a skip.
+;; MLIR tools and a real Z3. A missing tool is a test failure, not a skip.
 (define-runtime-path fixtures "semantics")
 (define (dialect name) (dynamic-require (build-path fixtures "valid.rhm") name))
 
 (define chain (make_toolchain))
-(define plugin (smt_plugin))
 (define z3
   (or (getenv "PILLE_Z3")
       (find-executable-path "z3")
@@ -55,7 +52,7 @@
                 (dialect_irdl dialect) chain))
 
 (define (query dialect module function inputs property [preconditions '()])
-  (make_smt_query dialect module function inputs property preconditions plugin))
+  (make_smt_query dialect module function inputs property preconditions))
 
 (define (solve value . arguments) (apply query_check value z3 arguments))
 (define (status value . arguments) (solver_result_status (apply solve value arguments)))
@@ -66,7 +63,7 @@
 (define (same lhs rhs) (smt_eq lhs rhs))
 
 ;; An evaluator written independently of the lowering: exact integers reduced
-;; modulo 2^width. It shares no code with the semantic model or the pass.
+;; modulo 2^width. It shares no code with the semantic model or the lowering.
 (define (wrap value width) (modulo value (expt 2 width)))
 (define (model-add lhs rhs width) (wrap (+ lhs rhs) width))
 (define (model-sub lhs rhs width) (wrap (- lhs rhs) width))
@@ -434,7 +431,7 @@
              (lambda () (query arithmetic module "any_float"
                                (list x32 y32) (same r32 r32)))))
 
-(test-case "renamed operations, another namespace, and other models need no native changes"
+(test-case "renamed operations, another namespace, and other models need no change to the lowering"
   (define module
     (program second
              (function "plus_zero" '("i32") "i32"
@@ -662,9 +659,9 @@
   (define refuted (solve (query arithmetic basics "round_trip" (list tmp tmp0) (same r32 tmp0))))
   (check-equal? (map car (solver_result_values refuted)) '("tmp" "tmp_0")))
 
-(test-case "descriptors incompatible with the program are rejected by the pass"
+(test-case "descriptors incompatible with the program are rejected by the lowering"
   ;; The public API derives the manifest from the dialect whose IRDL verified
-  ;; the module. These manifests bypass it to show the pass checks for itself.
+  ;; the module. These manifests bypass it to show the lowering checks for itself.
   (define (manifest . overrides)
     (jsexpr->string
      (for/fold ([base (hasheq 'format "pille-smt-query" 'version 1 'function "round_trip"

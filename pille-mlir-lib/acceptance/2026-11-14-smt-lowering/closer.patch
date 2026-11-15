@@ -1,0 +1,1257 @@
+diff --git a/closer-exports/README.md b/closer-exports/README.md
+index cd48dfd6..faa8bd3b 100644
+--- a/closer-exports/README.md
++++ b/closer-exports/README.md
+@@ -45,8 +45,9 @@ raco test closer-exports
+ ```
+ 
+ With the packages linked (`python3 mojo/language/racket_package.py --exports`
+-links this one), `PLTCOLLECTS` is not needed. `PILLE_MLIR_SMT_PLUGIN` names a
+-built query plugin; without it the MLIR check builds one under `build/`.
++links this one), `PLTCOLLECTS` is not needed. The solver's questions need only
++the stock `mlir-opt` and `mlir-translate` of `PILLE_MLIR_PREFIX` and `z3`: Pille
++lowers them in Rhombus, and there is no query plugin to build.
+ 
+ - `mlir/check.rhm` (155 comparisons) holds the MLIR side to the sealed package
+   `examples/rhombus-mlir/packages/r4`: the model's digest and declarations,
+diff --git a/closer-exports/SOLVER_STRENGTHS_PLAN.md b/closer-exports/SOLVER_STRENGTHS_PLAN.md
+index 36a98821..c1e66b11 100644
+--- a/closer-exports/SOLVER_STRENGTHS_PLAN.md
++++ b/closer-exports/SOLVER_STRENGTHS_PLAN.md
+@@ -329,8 +329,8 @@ raco test models/strength_model.rkt
+ ```
+ 
+ - Z3 is `/opt/homebrew/bin/z3`.
+-- The SMT query plugin is `build/pille-smt-query/PilleSmtQuery.so`
+-  (or `PILLE_MLIR_SMT_PLUGIN`). `survey.rhm` shows how it is found.
++- There is no SMT query plugin any more (2026-11-14): Pille lowers the questions
++  in Rhombus, and needs only the stock `mlir-opt` and `mlir-translate`.
+ - Mojo's compile is `./build/mojo/closer`. From Rhombus, use
+   `closer_exports/closer`: copy the project, remove its `build`, call
+   `without_compiled(copy)`, call `derive_words_in_place(copy)` where it has a
+diff --git a/closer-exports/closer_exports/bench.rhm b/closer-exports/closer_exports/bench.rhm
+index e13dbfd2..4b16cc6d 100644
+--- a/closer-exports/closer_exports/bench.rhm
++++ b/closer-exports/closer_exports/bench.rhm
+@@ -125,12 +125,11 @@ fun rhombus_side(project :: Path, phrase :: String) :: Map:
+   let reading = milliseconds(fun (): rsystem.#{system*}(rkt.#{find-executable-path}("raco"), "make", module))
+   let read :: Map = rkt.#{dynamic-require}(module, #'read)
+   let walked = thrice(fun (): judge_requirements(read, model))
+-  let plugin = Path(checkout).add("build").add("pille-smt-query").add("PilleSmtQuery.so")
+   // The solver's answers are kept in the process, so the first run is the cost.
+   let strengths = milliseconds(fun ():
+-                                 page_claim_strengths(read, model, ~plugin: plugin)
+-                                 judge_requirements(read, model, ~strengths: #true, ~plugin: plugin))
+-  let claims = page_claim_strengths(read, model, ~plugin: plugin)
++                                 page_claim_strengths(read, model)
++                                 judge_requirements(read, model, ~strengths: #true))
++  let claims = page_claim_strengths(read, model)
+   let package = Path(rfile.#{make-temporary-directory}())
+   let packaged = thrice(fun ():
+                           receiving_package(read, copy, package.add("package"),
+diff --git a/closer-exports/closer_exports/checked.rhm b/closer-exports/closer_exports/checked.rhm
+index f0324772..fe6fd941 100644
+--- a/closer-exports/closer_exports/checked.rhm
++++ b/closer-exports/closer_exports/checked.rhm
+@@ -567,14 +567,14 @@ fun message_of(why :: String) :: String:
+ fun refused(code :: String, at, why :: String) :: Map: {"code": code, "at": at, "why": why}
+ 
+ // A layer as text, from elsewhere: its JSON read, then ingested.
+-fun ingest_checked_text(text :: String, read :: Map, model :: Map, ~pages: pages :: Path, ~plugin: plugin = #false) :: Map:
++fun ingest_checked_text(text :: String, read :: Map, model :: Map, ~pages: pages :: Path) :: Map:
+   let payload:
+     try:
+       json.from_string(text)
+       ~catch _ :: Exn.Fail:
+         #false
+   if payload is_a Map
+-  | ingest_checked(payload, read, model, ~pages: pages, ~plugin: plugin)
++  | ingest_checked(payload, read, model, ~pages: pages)
+   | {"schema": "closer.ingested", "version": 1, "accepted": [], "judgements": [],
+      "refused": [refused("malformed", "", "not a JSON object: " ++ text.substring(0, math.min(text.length(), 40)))]}
+ 
+@@ -583,7 +583,7 @@ fun ingest_checked_text(text :: String, read :: Map, model :: Map, ~pages: pages
+ // checked, each occurrence's proposition required, and what is accepted judged
+ // again here. Its judgements, and any flag it carries saying it was checked,
+ // are not read.
+-fun ingest_checked(payload :: Map, read :: Map, model :: Map, ~pages: pages :: Path, ~plugin: plugin = #false) :: Map:
++fun ingest_checked(payload :: Map, read :: Map, model :: Map, ~pages: pages :: Path) :: Map:
+   let context = context_of(read, model, pages)
+   fun whole(refusals :: List) :: Map:
+     {"schema": "closer.ingested", "version": 1, "context": context["id"], "accepted": [], "judgements": [],
+@@ -701,7 +701,7 @@ fun ingest_checked(payload :: Map, read :: Map, model :: Map, ~pages: pages :: P
+     let judged :: List:
+       if asked == []
+       | []
+-      | page_claim_strengths(read ++ {"claims": list_at(read, "claims") ++ asked}, model, ~plugin: plugin)
++      | page_claim_strengths(read ++ {"claims": list_at(read, "claims") ++ asked}, model)
+     let judgements :: List:
+       for List:
+         each [entry :: Map, _] in accepted
+diff --git a/closer-exports/closer_exports/checked_check.rhm b/closer-exports/closer_exports/checked_check.rhm
+index 9881bd1f..b3a16df3 100644
+--- a/closer-exports/closer_exports/checked_check.rhm
++++ b/closer-exports/closer_exports/checked_check.rhm
+@@ -5,8 +5,6 @@ import:
+   rhombus/runtime_path
+   lib("racket/base.rkt") as rkt
+   lib("racket/file.rkt") as rfile
+-  pille/mlir/smt
+-  closer_exports/closer.checkout
+   closer_exports/record open
+   closer_exports/serve.answer_of
+   closer_exports/kripke_view.worlds_view
+@@ -348,8 +346,7 @@ check refusal_codes(ingested(Path(holds_path), holds ++ {"schema": "closer.captu
+ // moments of the plan's Kripke structure) shows each page claim's checked
+ // proposition, how its references were resolved, its context and outcomes.
+ 
+-def plugin = smt.build_plugin(Path(checkout).add("build").add("pille-smt-query"))
+-def view :: Map = worlds_view(Path(references_path), ~plugin: plugin)
++def view :: Map = worlds_view(Path(references_path))
+ def pump_claim :: Map = find(list_at(view, "claims"), fun (c :: Map): c["line"] == 9) || {}
+ check:
+   (pump_claim["checked"] :~ Map)["said"]
+diff --git a/closer-exports/closer_exports/checked_main.rhm b/closer-exports/closer_exports/checked_main.rhm
+index d6b57d10..47c703e5 100644
+--- a/closer-exports/closer_exports/checked_main.rhm
++++ b/closer-exports/closer_exports/checked_main.rhm
+@@ -4,7 +4,6 @@ import:
+   rhombus/json
+   lib("racket/base.rkt") as rkt
+   lib("racket/file.rkt") as rfile
+-  pille/mlir/smt
+   closer_exports/closer.checkout
+   closer_exports/compile.compile_record
+   closer_exports/notation open
+@@ -29,7 +28,7 @@ export:
+ // {accepted, judgements, refused}. The pages are read as closer serve reads
+ // them (closer_exports/reader).
+ 
+-fun checked_main(folder :: Path, ~ingest: layer :: maybe(Path) = #false, ~plugin: plugin = #false) :: Map:
++fun checked_main(folder :: Path, ~ingest: layer :: maybe(Path) = #false) :: Map:
+   let project = Path(rkt.#{simplify-path}(rkt.#{path->complete-path}(folder)))
+   build_notation(project.add("rhombus"), notation_home(project), ~pages: project)
+   let read :: Map = read_at_runtime(project)
+@@ -37,15 +36,14 @@ fun checked_main(folder :: Path, ~ingest: layer :: maybe(Path) = #false, ~plugin
+   | path :: Path:
+       let model = model_of(project, ~ran_from: Path(checkout), ~notation: notation_home(project))
+       ingest_checked_text(to_string(rfile.#{file->string}(path)), guarded_read(needs_resolved(without_notes(read), model), model),
+-                          model, ~pages: project, ~plugin: plugin)
+-  | ~else: (compile_record(project, ~plugin: plugin, ~read: read) :~ Map)["checked"]
++                          model, ~pages: project)
++  | ~else: (compile_record(project, ~read: read) :~ Map)["checked"]
+ 
+ module main:
+   def args = (rkt.#{current-command-line-arguments}() :~ Array).to_list()
+-  def plugin = smt.build_plugin(Path(checkout).add("build").add("pille-smt-query"))
+   def answer:
+     match args
+-    | [folder, "--ingest", layer]: checked_main(Path(to_string(folder)), ~ingest: Path(to_string(layer)), ~plugin: plugin)
+-    | [folder]: checked_main(Path(to_string(folder)), ~plugin: plugin)
++    | [folder, "--ingest", layer]: checked_main(Path(to_string(folder)), ~ingest: Path(to_string(layer)))
++    | [folder]: checked_main(Path(to_string(folder)))
+     | ~else: {"error": "usage: racket -l- closer_exports/checked_main.rhm FOLDER [--ingest LAYER.json]"}
+   print(json.to_string(answer))
+diff --git a/closer-exports/closer_exports/compile.rhm b/closer-exports/closer_exports/compile.rhm
+index eec00b06..bf3502ba 100644
+--- a/closer-exports/closer_exports/compile.rhm
++++ b/closer-exports/closer_exports/compile.rhm
+@@ -693,7 +693,7 @@ fun forms_used(folder :: Path, pages :: List) :: List:
+     keep_when rkt.#{file-exists?}(folder.add(file))
+     {"file": file, "line": 0, "form": key, "text": "", "why": why}
+ 
+-fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read :: maybe(Map) = #false,
++fun compile_record(project :: Path, ~read: given_read :: maybe(Map) = #false,
+                    ~only: only :: List = [], ~pages: pages_folder :: Path = project, ~resolutions: resolutions = #false,
+                    ~words: words_folders :: List = [project.add("build").add("mojo").add("notation")]) :: Map:
+   // a note to the person ("Don't …") is no step, so no line left unread
+@@ -716,7 +716,7 @@ fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read
+       for Map (n :: Map in list_at(read, "namings")):
+         values(n["phrase"], to_string(text_at(n, "sort")).split(".").last.downcase())
+     fun referent(name) :: String: "referent-" ++ kind_of_thing.get(name, "") ++ "-" ++ name
+-    let judged :: List = judge_requirements(read, model, ~strengths: #true, ~plugin: plugin)
++    let judged :: List = judge_requirements(read, model, ~strengths: #true)
+     let requirements :: List:
+       for List (j :: Map in judged):
+         keep_when j.get("read", #false)
+@@ -735,8 +735,8 @@ fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read
+                     project)
+     let steps :: List = list_at(read, "steps")
+     let namings = namings_of(read, model, pages, lines)
+-    let claims :: List = page_claim_strengths(read, model, ~plugin: plugin)
+-    let rests_of_premises :: Map = premise_rests(read, model, ~plugin: plugin)
++    let claims :: List = page_claim_strengths(read, model)
++    let rests_of_premises :: Map = premise_rests(read, model)
+     // the checks the language's meanings declare (#lang closer/meanings `check`)
+     let checks :: List:
+       for List (m :: Map in (list_at(language_of(notation), "meanings"))): keep_when m["kind"] == "check"; m["name"]
+@@ -836,7 +836,7 @@ fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read
+         {"aliases": (n["material"] :~ Map).get("aliases", []), "file": n["file"], "line": n["line"],
+          "noun": n["noun"], "phrase": n["phrase"]}
+     let value_rows = value_rows_of(read, lines)
+-    let need_checks = solver_need_checks(read, model, fold["needs"], ~plugin: plugin)
++    let need_checks = solver_need_checks(read, model, fold["needs"])
+     let supported = !(for any (i :: Map in issues): i["kind"] == "language" || i["kind"] == "guard-unread")
+     fun empty_of(key :: String): if key == "row-labels" || key == "row-numbers" | {} | []
+     // the page forms said beside the readings (closer_exports/forms)
+@@ -877,7 +877,7 @@ fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read
+        // the record's versioned parts, as Mojo names them
+        "capabilities": ["derivations.v1", "needs.v1", "solver-premise-judgments.v1", "solver-groundings.v1",
+                         & (if need_checks == [] | [] | ["solver-need-checks.v1"])],
+-       "solver-premise-judgments": (for List (p :: Map in solver_premises(read, model, ~plugin: plugin)):
++       "solver-premise-judgments": (for List (p :: Map in solver_premises(read, model)):
+                                       p ++ {"referent": referent(p["referent"])}),
+        "value-rows": value_rows,
+        "value-kinds": value_kinds_of(value_rows),
+@@ -904,7 +904,7 @@ fun compile_record(project :: Path, ~plugin: plugin = #false, ~read: given_read
+        // key of Mojo's, so none it is held to
+        // over every step, a guarded one taken in the runs where its guard
+        // holds: the plan's worlds, not its one walk
+-       "kripke": kripke_record(read_all, model, ~plugin: plugin),
++       "kripke": kripke_record(read_all, model),
+        // what the analysis covers: each line or form not read, and every
+        // judgement after one (closer_exports/coverage); no key of Mojo's
+        "coverage": coverage,
+diff --git a/closer-exports/closer_exports/kripke_view.rhm b/closer-exports/closer_exports/kripke_view.rhm
+index eddeece9..3c269464 100644
+--- a/closer-exports/closer_exports/kripke_view.rhm
++++ b/closer-exports/closer_exports/kripke_view.rhm
+@@ -4,7 +4,6 @@ import:
+   rhombus/json
+   lib("racket/base.rkt") as rkt
+   lib("racket/file.rkt") as rfile
+-  pille/mlir/smt
+   closer_exports/closer open
+   closer_exports/notation open
+   closer_exports/mlir/model open
+@@ -58,7 +57,7 @@ fun unmarked(line :: String) :: String:
+   if said.starts_with("- ") || said.starts_with("* ") | said.substring(2 ..).trim() | said
+ def shown_at_most = 64
+ 
+-fun worlds_view(project :: Path, ~plugin: plugin = #false) :: Map:
++fun worlds_view(project :: Path) :: Map:
+   let root :: Path:
+     for values(found :: Path = project) (candidate :: Path in [project, project.add("pages")]):
+       if rkt.#{directory-exists?}(candidate.add("rhombus")) | candidate | found
+@@ -73,7 +72,7 @@ fun worlds_view(project :: Path, ~plugin: plugin = #false) :: Map:
+   let problems :: List = kripke_problems(read, model)
+   let done_at :: List = for List (m :: List in (w["named_moments"] :~ List)): m[3]
+   let context = [w["kinds"], w["parents"], []]
+-  let record :: Map = kripke_record(read, model, ~plugin: plugin)
++  let record :: Map = kripke_record(read, model)
+   fun problem_of(file) :: Problem: problems[pages.find_index(fun (p): p == file) || 0]
+   // the claim a grid shows: a box's or a diamond's, the one inside it
+   fun shown_formula(form, strength) :: List:
+@@ -100,7 +99,7 @@ fun worlds_view(project :: Path, ~plugin: plugin = #false) :: Map:
+   let coverage = coverage_of(read)
+   let guarded = guarded_read(read, model)
+   let checked :: Map:
+-    checked_of(guarded, model, ~strengths: page_claim_strengths(guarded, model, ~plugin: plugin), ~coverage: coverage,
++    checked_of(guarded, model, ~strengths: page_claim_strengths(guarded, model), ~coverage: coverage,
+                ~pages: root, ~steps: steps)
+   let claims :: List:
+     (for List (c :: Map in (record["claims"] :~ List)):
+@@ -126,5 +125,4 @@ fun worlds_view(project :: Path, ~plugin: plugin = #false) :: Map:
+ module main:
+   def args = rkt.#{current-command-line-arguments}() :~ Array
+   def project = Path(rkt.#{path->complete-path}(Path(to_string(args[0]))))
+-  def plugin = smt.build_plugin(Path(checkout).add("build").add("pille-smt-query"))
+-  print(json.to_string(worlds_view(project, ~plugin: plugin)))
++  print(json.to_string(worlds_view(project)))
+diff --git a/closer-exports/closer_exports/mlir/assumptions_check.rhm b/closer-exports/closer_exports/mlir/assumptions_check.rhm
+index 334e0845..f1a79ccf 100644
+--- a/closer-exports/closer_exports/mlir/assumptions_check.rhm
++++ b/closer-exports/closer_exports/mlir/assumptions_check.rhm
+@@ -1,8 +1,6 @@
+ #lang rhombus/and_meta
+ 
+ import:
+-  pille/mlir/smt
+-  closer_exports/closer.checkout
+   closer_exports/mlir/strengths open
+   closer_exports/mlir/kripke open
+   "../../../models/kripke_model.rkt" as kripke_spec
+@@ -16,7 +14,6 @@ import:
+ // (models/strength_model.rkt, models/kripke_model.rkt) on every variant. A
+ // translation that dropped an assumption would give two variants one answer.
+ 
+-def plugin = smt.build_plugin(Path(checkout).add("build").add("pille-smt-query"))
+ def strengths = ["guaranteed", "regardless", "given", ["without", "a"]]
+ 
+ // one thing, a, OFF or ON, and one step that leaves it be
+@@ -25,7 +22,7 @@ fun with_start(start :: String, ~lifecycle_only: only :: List = [], ~asserts: as
+ 
+ // what each strength knows of a after the step: its value, or #false
+ fun known(p :: Problem) :: List:
+-  let answer :: Map = decided([p], ~plugin: plugin, ~strengths: strengths)[0]
++  let answer :: Map = decided([p], ~strengths: strengths)[0]
+   for List (strength in strengths):
+     match (answer[strength] :~ List)[1]
+     | [["key", "a|state", value]]: value
+@@ -58,7 +55,7 @@ check known(with_start("OFF", ~asserts: [[1, "a|state", "ON"]])) ~is [#false, "O
+ def variants :: List:
+   [with_start("ON"), with_start("OFF"), with_start(""), with_start("ON", ~lifecycle_only: ["a|state"]),
+    with_start("", ~asserts: [[1, "a|state", "ON"]]), with_start("OFF", ~asserts: [[1, "a|state", "ON"]])]
+-check decided(variants, ~plugin: plugin, ~strengths: strengths) ~is modeled(variants, ~strengths: strengths)
++check decided(variants, ~strengths: strengths) ~is modeled(variants, ~strengths: strengths)
+ 
+ //======================================================================
+ // A step's guard
+@@ -76,7 +73,7 @@ def a_on = ["atom", ["state", "a", "ON"]]
+ // 1 in every run, 0 in none, -1 in some
+ fun judged(p :: Problem) :: List:
+   for List (strength in ["guaranteed", "regardless"]):
+-    judged_formula(p, strength, a_on, 1, [[], []], [], ~plugin: plugin)
++    judged_formula(p, strength, a_on, 1, [[], []], [])
+ 
+ // the guard known to hold: taken. Regardless, g may start either way
+ check judged(guarded("YES", on_yes)) ~is [1, -1]
+@@ -101,7 +98,7 @@ fun against_model(p :: Problem) :: List:
+     each strength in both
+     each modal in [["box", strength, a_on], ["diamond", strength, a_on]]
+     each t in 0 .. p.steps.length() + 1
+-    let ours = decide_formula(p, modal, t, [[], []], [], ~plugin: plugin)
++    let ours = decide_formula(p, modal, t, [[], []], [])
+     let theirs = kripke_spec.value(modal, frame, #false, t, [[], [], []])
+     keep_when ours != theirs
+     [modal, t, ours, theirs]
+diff --git a/closer-exports/closer_exports/mlir/check.rhm b/closer-exports/closer_exports/mlir/check.rhm
+index 6056502a..1ddf013b 100644
+--- a/closer-exports/closer_exports/mlir/check.rhm
++++ b/closer-exports/closer_exports/mlir/check.rhm
+@@ -9,7 +9,6 @@ import:
+   rhombus/runtime_path
+   lib("racket/file.rkt") as rfile
+   pille/mlir/smt
+-  rhombus/envvar
+   closer_exports/mlir/dialect open
+   closer_exports/mlir/smt open
+   closer_exports/mlir/rules open
+@@ -142,14 +141,8 @@ for (entry :: Map in (json.from_string(text("refused/index.json")) :~ List)):
+ //======================================================================
+ // The preconditions, decided from a declared SMT model
+ 
+-// PILLE_MLIR_SMT_PLUGIN names a built query plugin; otherwise one is built
+-// under the checkout's ignored build folder (CMake and a C++ compiler).
+-runtime_path.def plugin_build: "../../../build/pille-smt-query"
+-def plugin:
+-  envvar.getenv("PILLE_MLIR_SMT_PLUGIN") || smt.build_plugin(Path(plugin_build))
+-
+ def instances :: Map = json.from_string(text("instances.json"))
+-def needs = decide(model, instances["items"], ~plugin: plugin)
++def needs = decide(model, instances["items"])
+ 
+ // Z3 agrees with the walk-state pass on every need, and with the earlier
+ // oracle, and the one need a later page invalidates is refuted.
+@@ -206,7 +199,7 @@ check:
+ // Z3, given only the operations declared from those tables, proves each need
+ // exactly where the rules, Mojo's walk and the earlier solver check hold it.
+ check:
+-  decide_from_tables(tables, instances, model, ~plugin: plugin)
++  decide_from_tables(tables, instances, model)
+   ~is (for List (need in needs): [need.occurrence, need.thing, [need.state], need.holds])
+ 
+ //======================================================================
+@@ -276,8 +269,7 @@ check body_of(from_pages["text"]).length() ~is program.split("\n").length() - 2
+ // the Redex rules over them, and Z3 over the operations declared from the
+ // rules' tables, with the answers Mojo's walk gave.
+ check:
+-  decide_from_tables(tables_of(from_pages["record"], model), from_pages["record"], model,
+-                     ~plugin: plugin)
++  decide_from_tables(tables_of(from_pages["record"], model), from_pages["record"], model)
+   ~is (for List (finding :: Map in (walk["findings"] :~ List)):
+          [finding["occurrence"], finding["thing"], [finding["needs"]],
+           (finding["walk"] :~ Map)["held"]])
+@@ -916,7 +908,7 @@ def safetynet_compile :: Map = compiled_in_place_copy(Path(safetynet))
+ def safetynet_notation :: Path = Path(rfile.#{make-temporary-directory}())
+ def _safetynet_built = build_notation(Path(safetynet).add("rhombus"), safetynet_notation, ~pages: Path(safetynet))
+ def safetynet_model :: Map = model_of(Path(safetynet), ~ran_from: Path(checkout), ~notation: safetynet_notation)
+-def safetynet_judged :: List = judge_requirements(phrase_safetynet.read, safetynet_model, ~strengths: #true, ~plugin: plugin)
++def safetynet_judged :: List = judge_requirements(phrase_safetynet.read, safetynet_model, ~strengths: #true)
+ fun tv(value): (value == #true && 1) || (value == #false && 0) || -1
+ // The space reads every step Mojo's compile reads, a words file's verb and the
+ // steps a forwarding verb lowers to included.
+@@ -1056,7 +1048,7 @@ fun off_shape(record :: Map) :: List:
+ // A key the shape does not declare is found, and a list where it says a map.
+ check off_shape({"no such key": 1, "readings": {}}) ~is ["compiled.no such key", "compiled.readings"]
+ fun record_against_mojo(project :: Path, read :: Map, compile :: Map) :: List:
+-  let ours :: Map = compile_record(project, ~plugin: plugin, ~read: read)
++  let ours :: Map = compile_record(project, ~read: read)
+   fun mojo_of(key :: String):
+     match key
+     | "requirements":
+@@ -1087,7 +1079,7 @@ fun record_against_mojo(project :: Path, read :: Map, compile :: Map) :: List:
+   // but each reading's tree (`syntax`), which only the runtime read's
+   // lexicon gives (closer_exports/derivation; editor_check holds the trees
+   // to Mojo's)
+-  let at_runtime_whole :: Map = compile_record(project, ~plugin: plugin, ~read: read_at_runtime(project))
++  let at_runtime_whole :: Map = compile_record(project, ~read: read_at_runtime(project))
+   let at_runtime :: Map:
+     at_runtime_whole ++ {"readings": for List (r :: Map in list_at(at_runtime_whole, "readings")): r.remove("syntax")}
+   (for List (key :: String in record_keys):
+@@ -1128,7 +1120,7 @@ fun strengths_against_mojo(read :: Map, model :: Map, compile :: Map) :: List:
+     for Map (n :: Map in (read["namings"] :~ List)): values(n["phrase"], to_string(n["sort"]).split(".").last.downcase())
+   fun ordered(rests :: List) :: List: rests.sort(fun (a, b): to_string(a) < to_string(b))
+   for values(found :: List = [[], []]):
+-    each c :: Map in page_claim_strengths(read, model, ~plugin: plugin)
++    each c :: Map in page_claim_strengths(read, model)
+     let [agree :: List, differ :: List] = found
+     let at = [c["file"], c["line"]]
+     let theirs_rests :: List:
+@@ -1151,13 +1143,13 @@ check [(safetynet_strengths[0] :~ List).length(), safetynet_strengths[1]] ~is [2
+ // What the consequences conclude, decided by Z3, is the Redex model's.
+ def safetynet_problems :: List = solver_problems(phrase_safetynet.read, safetynet_model)
+ check:
+-  decided(safetynet_problems, ~plugin: plugin, ~strengths: ["guaranteed", "regardless", "given", ["without", "pr-high"]])
++  decided(safetynet_problems, ~strengths: ["guaranteed", "regardless", "given", ["without", "pr-high"]])
+   ~is modeled(safetynet_problems, ~strengths: ["guaranteed", "regardless", "given", ["without", "pr-high"]])
+ // On the last page, every start a lifecycle gives is one the pages say too,
+ // so given the Materials alone is the guarantee; without pr-high's start it is
+ // not.
+ check:
+-  let both :: Map = decided(safetynet_problems, ~plugin: plugin, ~strengths: ["guaranteed", "given", ["without", "pr-high"]]).last
++  let both :: Map = decided(safetynet_problems, ~strengths: ["guaranteed", "given", ["without", "pr-high"]]).last
+   [both["guaranteed"] == both["given"], both["guaranteed"] == both[["without", "pr-high"]]]
+   ~is [#true, #false]
+ 
+@@ -1176,7 +1168,7 @@ fun judged_against_mojo(project :: Path, read :: Map) :: List:
+   let notation :: Path = Path(rfile.#{make-temporary-directory}())
+   build_notation(project.add("rhombus"), notation, ~pages: project)
+   let model = model_of(project, ~ran_from: Path(checkout), ~notation: notation)
+-  let judged :: List = judge_requirements(read, model, ~strengths: #true, ~plugin: plugin)
++  let judged :: List = judge_requirements(read, model, ~strengths: #true)
+   rfile.#{delete-directory/files}(notation)
+   [for List (j :: Map in judged): judgement_key(j), mojo_keys(compile, judged), judged.length(),
+    strengths_judged(read, judged, compile), record_against_mojo(project, read, compile)]
+@@ -1203,7 +1195,7 @@ def safetynet_package :: Path = Path(rfile.#{make-temporary-directory}()).add("p
+ def _safetynet_packed:
+   receiving_package(phrase_safetynet.read, Path(safetynet), safetynet_package,
+                     ~claims: page_claim_values(phrase_safetynet.read, safetynet_model),
+-                    ~strengths: page_claim_strengths(phrase_safetynet.read, safetynet_model, ~plugin: plugin))
++                    ~strengths: page_claim_strengths(phrase_safetynet.read, safetynet_model))
+ check python_says("-I", Path(receiving_contract), safetynet_package) ~is [#true, "valid"]
+ def safetynet_capture :: Map = json_at(safetynet_package.add("capture.json"))
+ fun asserted_key(file, line, assertions :: List, value, propositions :: Map) :: List:
+@@ -1386,7 +1378,7 @@ def strength_cases :: List:
+            [[[], [], []], [[["a|state", "OFF"]], [], []]], 0, ~asserts: [[1, "a|state", "ON"]]),
+    Problem([["a|state", "closed", ["OFF", "ON"], "OFF"]], [],
+            [[[["a|state", "ON"]], [], []], [[["a|state", "OFF"]], [], []]], 0, ~asserts: [[1, "a|state", "ON"], [2, "a|state", "ON"]])]
+-check decided(strength_cases, ~plugin: plugin) ~is modeled(strength_cases)
++check decided(strength_cases) ~is modeled(strength_cases)
+ // And on the worlds fixture's pages, what its openers assert as Mojo's
+ // solver asserts it.
+ def worlds_problems :: List:
+@@ -1402,7 +1394,7 @@ check:
+         [8, "k-2|state", "HOT"], [9, "k-2|state", "HOT"],
+         [10, "k-1|state", "HOT"], [10, "k-2|state", "HOT"], [11, "k-1|state", "HOT"], [11, "k-2|state", "HOT"],
+         [12, "k-1|state", "HOT"], [12, "k-2|state", "HOT"]]]
+-check decided(worlds_problems, ~plugin: plugin) ~is modeled(worlds_problems)
++check decided(worlds_problems) ~is modeled(worlds_problems)
+ 
+ // The plan as a Kripke structure (models/kripke_model.rkt): each page claim
+ // judged over its strength's runs is the solver's strength of it, at both
+@@ -1416,7 +1408,7 @@ fun built_model(project :: Path) :: Map:
+   rfile.#{delete-directory/files}(notation)
+   model
+ fun kripke_against_solver(read :: Map, model :: Map) :: List:
+-  for List (k :: Map in kripke_claims(read, model), s :: Map in page_claim_strengths(read, model, ~plugin: plugin)):
++  for List (k :: Map in kripke_claims(read, model), s :: Map in page_claim_strengths(read, model)):
+     keep_when k["guaranteed"] != s["guaranteed"] || k["regardless"] != s["regardless"]
+     [k["file"], k["line"], k["claim"], [k["guaranteed"], s["guaranteed"]], [k["regardless"], s["regardless"]]]
+ check kripke_against_solver(phrase_safetynet.read, safetynet_model) ~is []
+@@ -1441,7 +1433,7 @@ fun z3_against_redex(p :: Problem, atoms :: List) :: List:
+     each f in formulas_of(atoms) ++ [["diamond", strength, ["box", strength, ["eventually", ["atom", atoms[0]]]]]]
+     each modal in [["box", strength, f], ["diamond", strength, f]]
+     each t in 0 .. p.steps.length() + 1
+-    let ours = decide_formula(p, modal, t, [[], []], [], ~plugin: plugin)
++    let ours = decide_formula(p, modal, t, [[], []], [])
+     let theirs = kripke_spec.value(modal, frame, #false, t, context)
+     keep_when ours != theirs
+     [strength, modal, t, ours, theirs]
+@@ -1478,7 +1470,7 @@ fun witnesses_against_redex(p :: Problem, atoms :: List) :: List:
+     each f in formulas_of(atoms)
+     each t in 0 .. p.steps.length() + 1
+     each wanted in [1, 0]
+-    let found = witness_of(p, strength, f, t, wanted, [[], []], [], ~plugin: plugin)
++    let found = witness_of(p, strength, f, t, wanted, [[], []], [])
+     let agrees:
+       match found
+       | starts :: Map:
+@@ -1522,8 +1514,8 @@ check witnesses_against_redex(guarded_asserted, asserted_atoms) ~is []
+ // says the assertion: the strength has no run; regardless, the runs where it
+ // is taken or a starts ON
+ check:
+-  [values_given(guarded_asserted, "guaranteed", ["atom", ["state", "a", "ON"]], 1, [[], []], [], ~plugin: plugin),
+-   (values_given(guarded_asserted, "regardless", ["atom", ["state", "b", "ON"]], 0, [[], []], [], ~plugin: plugin)
++  [values_given(guarded_asserted, "guaranteed", ["atom", ["state", "a", "ON"]], 1, [[], []], []),
++   (values_given(guarded_asserted, "regardless", ["atom", ["state", "b", "ON"]], 0, [[], []], [])
+       :~ List).sort()]
+   ~is [[], [0, 1]]
+ // A quantity a run will give, claimed on its page: page A of
+@@ -1546,13 +1538,13 @@ check:
+   let read = read_at_runtime(unmeasured)
+   let model = built_model(unmeasured)
+   let k :: Map = kripke_claims(read, model)[0]
+-  let s :: Map = page_claim_strengths(read, model, ~plugin: plugin)[0]
++  let s :: Map = page_claim_strengths(read, model)[0]
+   let p :: Problem = kripke_problems(read, model)[0]
+   let w :: Map = pages_walked(read, model)
+   let done_at = for List (m :: List in (w["named_moments"] :~ List)): m[3]
+   fun witness(wanted) :: String:
+     let found :: Map = witness_of(p, "guaranteed", ["atom", k["claim"]], k["moment"], wanted, [w["kinds"], w["parents"]],
+-                                  done_at, ~plugin: plugin) || {}
++                                  done_at) || {}
+     found.get("choice|pr-high|latency|2", "none")
+   [s["guaranteed"], k["guaranteed"], (k["runs"] :~ Map)["guaranteed"] > 0, witness(1) in ["5 s|time|5", "10 s|time|10"],
+    witness(0)]
+@@ -1566,7 +1558,7 @@ check:
+ // Redex model's run from its starts.
+ runtime_path.def modal_project: "../phrase/tests/modal"
+ def modal_model :: Map = built_model(Path(modal_project))
+-def modal_record :: Map = kripke_record(phrase_modal.read, modal_model, ~plugin: plugin)
++def modal_record :: Map = kripke_record(phrase_modal.read, modal_model)
+ check phrase_modal.read["modal"] ~is read_at_runtime(Path(modal_project))["modal"]
+ check:
+   for List (m :: Map in (modal_record["modal"] :~ List)):
+@@ -1642,7 +1634,7 @@ check projection_changes(phrase_worlds.read, built_model(Path(worlds))) ~is []
+ check projection_changes(phrase_recycled.read, built_model(Path(recycled))) ~is []
+ check:
+   record_against_redex(phrase_safetynet.read, safetynet_model,
+-                       kripke_record(phrase_safetynet.read, safetynet_model, ~plugin: plugin))
++                       kripke_record(phrase_safetynet.read, safetynet_model))
+   ~is []
+ fun z3_claims_against_redex(read :: Map, model :: Map) :: List:
+   let w :: Map = pages_walked(read, model)
+@@ -1652,8 +1644,7 @@ fun z3_claims_against_redex(read :: Map, model :: Map) :: List:
+     each k :: Map in kripke_claims(read, model)
+     let p :: Problem = problems[(w["pages"] :~ List).find_index(fun (pg): pg == k["file"])]
+     each strength in ["guaranteed", "regardless"]
+-    let ours = judged_formula(p, strength, ["atom", k["claim"]], k["moment"], [w["kinds"], w["parents"]], done_at,
+-                              ~plugin: plugin)
++    let ours = judged_formula(p, strength, ["atom", k["claim"]], k["moment"], [w["kinds"], w["parents"]], done_at)
+     keep_when ours != k[strength]
+     [k["file"], k["line"], strength, ours, k[strength]]
+ check z3_claims_against_redex(phrase_safetynet.read, safetynet_model) ~is []
+@@ -1680,10 +1671,10 @@ check:
+   ~is [[["key", "a|latency", "8 s|time|8.0"]], [], [["key", "a|latency", "9 s|time|9.0"]]]
+ def meanings_problems :: List = solver_problems(phrase_meanings.read, meanings_model)
+ check meanings_problems.length() ~is 7
+-check decided(meanings_problems, ~plugin: plugin) ~is modeled(meanings_problems)
++check decided(meanings_problems) ~is modeled(meanings_problems)
+ // Asked in one batch of one session, every value a function can give, the
+ // facts are those asked a question at a time, a process each.
+-check decided(meanings_problems.take(2), ~plugin: plugin) ~is decided_singly(meanings_problems.take(2), ~plugin: plugin)
++check decided(meanings_problems.take(2)) ~is decided_singly(meanings_problems.take(2))
+ def meanings_strengths :: List = strengths_against_mojo(phrase_meanings.read, meanings_model, meanings_compile)
+ check [(meanings_strengths[0] :~ List).length(), meanings_strengths[1]] ~is [11, []]
+ def _meanings_removed = rfile.#{delete-directory/files}(meanings_scratch)
+@@ -1729,7 +1720,7 @@ check:
+ // a premise and no requirement.
+ def meanings_judged :: List:
+   judge_requirements(phrase_meanings.read, model_of(Path(meanings_project), ~ran_from: Path(checkout), ~notation: every_notation),
+-                     ~strengths: #true, ~plugin: plugin)
++                     ~strengths: #true)
+ check:
+   for List (judged :: Map in meanings_judged): judgement_key(judged)
+   ~is mojo_keys(meanings_compile, meanings_judged)
+@@ -1751,7 +1742,7 @@ def _meanings_packed:
+   let model = model_of(Path(meanings_project), ~ran_from: Path(checkout), ~notation: every_notation)
+   receiving_package(phrase_meanings.read, Path(meanings_project), meanings_package,
+                     ~claims: page_claim_values(phrase_meanings.read, model),
+-                    ~strengths: page_claim_strengths(phrase_meanings.read, model, ~plugin: plugin),
++                    ~strengths: page_claim_strengths(phrase_meanings.read, model),
+                     ~checks: for List (m :: Map in (derive_language_of(every_notation)["meanings"] :~ List)):
+                                keep_when m["kind"] == "check"
+                                m["name"])
+@@ -1913,7 +1904,7 @@ fun package_against_model(read :: Map, model :: Map, package :: Path, pages :: P
+        each q in with_parts(a)
+        q]
+   let claims :: List:
+-    for List (c :: Map in page_claim_values(read, model), s :: Map in page_claim_strengths(read, model, ~plugin: plugin)):
++    for List (c :: Map in page_claim_values(read, model), s :: Map in page_claim_strengths(read, model)):
+       let o :: Map = occurrence(c["file"], c["line"], #true)
+       let judged = receiving_model.#{judgements-of}(c["value"], PairList(s["guaranteed"], s["regardless"], s["given"]))
+       [c["file"], c["line"],
+@@ -1950,7 +1941,7 @@ def two_alarms_package :: Path = two_alarms_scratch.add("package")
+ def _two_alarms_packed:
+   receiving_package(phrase_two_alarms.read, two_alarms_pages, two_alarms_package,
+                     ~claims: page_claim_values(phrase_two_alarms.read, language_model), ~checks: language_checks,
+-                    ~strengths: page_claim_strengths(phrase_two_alarms.read, language_model, ~plugin: plugin))
++                    ~strengths: page_claim_strengths(phrase_two_alarms.read, language_model))
+ check python_says("-I", Path(receiving_contract), two_alarms_package) ~is [#true, "valid"]
+ runtime_path.def capture_script: "../../../mojo/exports/capture.py"
+ def two_alarms_closer :: Map:
+@@ -1995,7 +1986,7 @@ check chart_lines > 100 ~is #true
+ // moment in every run, 0 where it fails in every run, else -1; a diamond, the
+ // claim inside it holding in some run. The first grid as worked by hand: k-1
+ // starts COLD, is cold until heat k-1.
+-def modal_view :: Map = worlds_view(Path(modal_project), ~plugin: plugin)
++def modal_view :: Map = worlds_view(Path(modal_project))
+ fun view_against_record(view :: Map) :: List:
+   for List:
+     each c :: Map in (view["claims"] :~ List)
+@@ -2017,7 +2008,7 @@ fun view_against_record(view :: Map) :: List:
+     keep_when from_grid != c[strength]
+     [c["file"], c["line"], strength, from_grid, c[strength]]
+ check view_against_record(modal_view) ~is []
+-check view_against_record(worlds_view(Path(worlds), ~plugin: plugin)) ~is []
++check view_against_record(worlds_view(Path(worlds))) ~is []
+ check:
+   let c :: Map = (modal_view["claims"] :~ List)[0]
+   [c["said"], ((c["grids"] :~ Map)["guaranteed"] :~ Map)["runs"], (modal_view["moments"] :~ List).length()]
+@@ -2037,7 +2028,7 @@ check:
+     [k["line"], k["guaranteed"], k["regardless"]]
+   ~is [[10, 0, -1], [13, 1, -1], [16, 1, 1]]
+ check:
+-  for List (m :: Map in (kripke_record(phrase_branching.read, branching_model, ~plugin: plugin)["modal"] :~ List)):
++  for List (m :: Map in (kripke_record(phrase_branching.read, branching_model)["modal"] :~ List)):
+     [m["line"], m["guaranteed"], m["regardless"]]
+   ~is [[11, 0, 1]]
+ check:
+@@ -2046,7 +2037,7 @@ check:
+ check z3_claims_against_redex(phrase_branching.read, branching_model) ~is []
+ check:
+   record_against_redex(phrase_branching.read, branching_model,
+-                       kripke_record(phrase_branching.read, branching_model, ~plugin: plugin))
++                       kripke_record(phrase_branching.read, branching_model))
+   ~is []
+ check projection_changes(phrase_branching.read, branching_model) ~is []
+-check view_against_record(worlds_view(Path(branching_project), ~plugin: plugin)) ~is []
++check view_against_record(worlds_view(Path(branching_project))) ~is []
+diff --git a/closer-exports/closer_exports/mlir/kripke.rhm b/closer-exports/closer_exports/mlir/kripke.rhm
+index d1689d91..b02c69fb 100644
+--- a/closer-exports/closer_exports/mlir/kripke.rhm
++++ b/closer-exports/closer_exports/mlir/kripke.rhm
+@@ -268,12 +268,12 @@ def mutable kept_witnesses :: Map = {}
+ // compiled to its function, with what its answer is kept by:
+ // [memo, arguments, body, result, fixed], or #false where the strength has
+ // no run (its assertions settle no start).
+-fun prepared(question :: List, ~plugin: plugin) :: maybe(List):
++fun prepared(question :: List) :: maybe(List):
+   let [p :: Problem, strength, formula, moment :: Int, context :: List, done_at :: List] = question
+   match asserted_starts(p, strength)
+   | #false: #false
+   | fixed :: Map:
+-      fun modal(f, m :: Int) :: Int: decide_formula(p, f, m, context, done_at, ~plugin: plugin)
++      fun modal(f, m :: Int) :: Int: decide_formula(p, f, m, context, done_at)
+       let [arguments :: List, body :: List, result] = compiled(p, formula, moment, context, done_at, modal)
+       [[arguments, body, result, strength, fixed], arguments, body, result, fixed]
+ 
+@@ -305,8 +305,8 @@ fun function_of(name :: String, p :: Problem, strength, fixed :: Map, arguments
+ // The values each question's formula gives over its strength's runs, all
+ // asked in one module and one batch: for each, a list of -1, 0 and 1, empty
+ // where the strength has no run.
+-fun values_of_many(questions :: List, ~plugin: plugin = #false) :: List:
+-  let ready :: List = for List (q :: List in questions): prepared(q, ~plugin: plugin)
++fun values_of_many(questions :: List) :: List:
++  let ready :: List = for List (q :: List in questions): prepared(q)
+   // the questions not yet answered, each once
+   let (asked :: List, _):
+     for values(asked :: List = [], seen :: List = []) (r in ready, q :: List in questions):
+@@ -322,7 +322,7 @@ fun values_of_many(questions :: List, ~plugin: plugin = #false) :: List:
+     let specs :: List:
+       for List ([_, inputs, preconditions] in functions, i in 0 ..):
+         smt.ValuesSpec(~function: "f" ++ to_string(i), ~inputs: inputs, ~preconditions: preconditions)
+-    let batch = kripke_dialect.smt_values_batch(program, specs, ~plugin: plugin)
++    let batch = kripke_dialect.smt_values_batch(program, specs)
+     for ([[memo, & _], _] in asked, query in batch.queries):
+       match session().values(query, ~limit: 5)
+       | v :: smt.Values:
+@@ -335,19 +335,18 @@ fun values_of_many(questions :: List, ~plugin: plugin = #false) :: List:
+     | [memo, & _]: kept[memo]
+     | ~else: []
+ 
+-fun values_given(p :: Problem, strength, formula, moment :: Int, context :: List, done_at :: List,
+-                 ~plugin: plugin = #false) :: List:
+-  values_of_many([[p, strength, formula, moment, context, done_at]], ~plugin: plugin)[0]
++fun values_given(p :: Problem, strength, formula, moment :: Int, context :: List, done_at :: List) :: List:
++  values_of_many([[p, strength, formula, moment, context, done_at]])[0]
+ 
+ // For each request, [question, wanted], a run where the question's formula
+ // has the value wanted (1 or 0): {key: its start, ...} for the keys and
+ // relations the formula reads (a relation's "true" or "false"), or #false
+ // where no run gives it. Z3's counterexample to "the formula does not have
+ // the value" is such a run. All asked in one module and one batch.
+-fun witnesses_of_many(requests :: List, ~plugin: plugin = #false) :: List:
++fun witnesses_of_many(requests :: List) :: List:
+   let ready :: List:
+     for List ([q :: List, wanted] in requests):
+-      match prepared(q, ~plugin: plugin)
++      match prepared(q)
+       | [memo, & more]: [[memo, wanted], memo, & more]
+       | ~else: #false
+   let (asked :: List, _):
+@@ -367,7 +366,7 @@ fun witnesses_of_many(requests :: List, ~plugin: plugin = #false) :: List:
+         smt.Spec(~function: "w" ++ to_string(i), ~inputs: inputs,
+                  ~property: smt.or(& (for List (v in others): smt.eq(smt.result(~width: bits), smt.const(v, ~width: bits)))),
+                  ~preconditions: preconditions)
+-    let outcomes :: List = kripke_dialect.smt_batch(program, specs, ~plugin: plugin).check()
++    let outcomes :: List = kripke_dialect.smt_batch(program, specs).check()
+     for ([[key, _, arguments :: List, & _], _, _] in asked, outcome in outcomes):
+       let found:
+         match outcome
+@@ -382,21 +381,19 @@ fun witnesses_of_many(requests :: List, ~plugin: plugin = #false) :: List:
+     | [key, & _]: kept_witnesses[key]
+     | ~else: #false
+ 
+-fun witness_of(p :: Problem, strength, formula, moment :: Int, wanted :: Int, context :: List, done_at :: List,
+-               ~plugin: plugin = #false) :: maybe(Map):
+-  witnesses_of_many([[[p, strength, formula, moment, context, done_at], wanted]], ~plugin: plugin)[0]
++fun witness_of(p :: Problem, strength, formula, moment :: Int, wanted :: Int, context :: List, done_at :: List) :: maybe(Map):
++  witnesses_of_many([[[p, strength, formula, moment, context, done_at], wanted]])[0]
+ 
+ // A box or a diamond at a moment: ["box", strength, φ] or ["diamond", strength, φ].
+-fun decide_formula(p :: Problem, f, moment :: Int, context :: List, done_at :: List, ~plugin: plugin = #false) :: Int:
++fun decide_formula(p :: Problem, f, moment :: Int, context :: List, done_at :: List) :: Int:
+   match f
+-  | ["box", strength, a]: k_and_all(values_given(p, strength, a, moment, context, done_at, ~plugin: plugin))
+-  | ["diamond", strength, a]: k_or_all(values_given(p, strength, a, moment, context, done_at, ~plugin: plugin))
++  | ["box", strength, a]: k_and_all(values_given(p, strength, a, moment, context, done_at))
++  | ["diamond", strength, a]: k_or_all(values_given(p, strength, a, moment, context, done_at))
+ 
+ // A strength's three-valued judgement of a formula at a moment: 1 where
+ // every run gives 1, 0 where every run gives 0, -1 otherwise or with no run.
+-fun judged_formula(p :: Problem, strength, f, moment :: Int, context :: List, done_at :: List,
+-                   ~plugin: plugin = #false) :: Int:
+-  let vs :: List = values_given(p, strength, f, moment, context, done_at, ~plugin: plugin)
++fun judged_formula(p :: Problem, strength, f, moment :: Int, context :: List, done_at :: List) :: Int:
++  let vs :: List = values_given(p, strength, f, moment, context, done_at)
+   let all_true = for all (v in vs): v == 1
+   let all_false = for all (v in vs): v == 0
+   cond
+diff --git a/closer-exports/closer_exports/mlir/rules.rhm b/closer-exports/closer_exports/mlir/rules.rhm
+index 0d7c757f..c42b92fb 100644
+--- a/closer-exports/closer_exports/mlir/rules.rhm
++++ b/closer-exports/closer_exports/mlir/rules.rhm
+@@ -234,7 +234,6 @@ fun rule_dialect(tables :: List, numbered :: List) :: dialect.Dialect:
+ // needing operation itself; nothing is claimed of the result, so the query is
+ // proved exactly when the operation's own requirement holds there.
+ fun decide_from_tables(tables :: List, record :: Map, model :: Map,
+-                       ~plugin: plugin :: maybe(Path || ReadableString) = #false,
+                        ~timeout: timeout :: PosReal = 10) :: List:
+   let instances = instances_of(record)
+   let kind_of :: Map:
+@@ -307,7 +306,7 @@ fun decide_from_tables(tables :: List, record :: Map, model :: Map,
+                                 | []
+                                 | [smt.eq(before, smt.const(number_in(numbered, initial), ~width: bits))]))
+   let outcomes :: List:
+-    if specs == [] | [] | made.smt_batch(program, specs, ~plugin: plugin).check(~timeout: timeout)
++    if specs == [] | [] | made.smt_batch(program, specs).check(~timeout: timeout)
+   for List (question :: List in questions, outcome :: smt.Outcome in outcomes):
+     let [occurrence :: String, thing :: String, state :: List, _, _] = question
+     match outcome
+diff --git a/closer-exports/closer_exports/mlir/smt.rhm b/closer-exports/closer_exports/mlir/smt.rhm
+index 9c53140a..0228d4a5 100644
+--- a/closer-exports/closer_exports/mlir/smt.rhm
++++ b/closer-exports/closer_exports/mlir/smt.rhm
+@@ -62,7 +62,6 @@ fun instances_of(items :: List) :: List:
+     item
+ 
+ fun decide(model :: Map, items :: List,
+-           ~plugin: plugin :: maybe(Path || ReadableString) = #false,
+            ~timeout: timeout :: PosReal = 10) :: List.of(Need):
+   let instances = instances_of(items)
+   let kind_of :: Map:
+@@ -128,7 +127,7 @@ fun decide(model :: Map, items :: List,
+                                 | []
+                                 | [smt.eq(before, smt.const(number(initial), ~width: bits))]))
+   let outcomes :: List:
+-    if specs == [] | [] | state_dialect.smt_batch(program, specs, ~plugin: plugin).check(~timeout: timeout)
++    if specs == [] | [] | state_dialect.smt_batch(program, specs).check(~timeout: timeout)
+   for List (question :: List in questions, outcome :: smt.Outcome in outcomes):
+     let [occurrence :: String, thing :: String, state :: String, _] = question
+     match outcome
+diff --git a/closer-exports/closer_exports/mlir/strengths.rhm b/closer-exports/closer_exports/mlir/strengths.rhm
+index 30cdb922..692989b3 100644
+--- a/closer-exports/closer_exports/mlir/strengths.rhm
++++ b/closer-exports/closer_exports/mlir/strengths.rhm
+@@ -253,7 +253,7 @@ fun derived_body(p :: Problem, relation :: String, moment :: Int) :: List:
+ // Both strengths of each problem, a question at a time: whether the function
+ // gives each candidate value, one smt_query and one solver process each. The
+ // path decided is held to (check.rhm), kept for that.
+-fun decided_singly(problems :: List, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10) :: List:
++fun decided_singly(problems :: List, ~timeout: timeout :: PosReal = 10) :: List:
+   // One function per distinct chain of numbered values, and one per relation
+   // that follows at each moment, all in one module.
+   let chains :: List:
+@@ -294,7 +294,7 @@ fun decided_singly(problems :: List, ~plugin: plugin = #false, ~timeout: timeout
+     runs := runs + 1
+     let outcome:
+       strength_dialect.smt_query(program, ~function: function, ~inputs: inputs, ~property: property,
+-                                 ~preconditions: preconditions, ~plugin: plugin)
++                                 ~preconditions: preconditions)
+         .check(~timeout: timeout)
+     match outcome
+     | _ :: smt.Proved: #true
+@@ -446,7 +446,7 @@ def backbones_kept :: MutableMap = MutableMap{}
+ fun problem_key(p :: Problem, strength) :: List:
+   [p.keys, p.relations, p.steps, p.from, p.grounds, p.lifecycle_only, p.asserts, strength]
+ 
+-fun decided(problems :: List, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10, ~strengths: strengths :: List = ["guaranteed", "regardless"]) :: List:
++fun decided(problems :: List, ~timeout: timeout :: PosReal = 10, ~strengths: strengths :: List = ["guaranteed", "regardless"]) :: List:
+   let fresh :: List:
+     for values(fresh :: List = []):
+       each p :: Problem in problems
+@@ -454,13 +454,13 @@ fun decided(problems :: List, ~plugin: plugin = #false, ~timeout: timeout :: Pos
+       skip_when (for any (other :: Problem in fresh): problem_key(other, #false) == problem_key(p, #false))
+       fresh.add(p)
+   unless fresh == []
+-  | for (p :: Problem in fresh, answer :: Map in decide(fresh, ~plugin: plugin, ~timeout: timeout, ~strengths: strengths)):
++  | for (p :: Problem in fresh, answer :: Map in decide(fresh, ~timeout: timeout, ~strengths: strengths)):
+       for ((strength, backbone) in answer):
+         backbones_kept[problem_key(p, strength)] := backbone
+   for List (p :: Problem in problems):
+     for Map (strength in strengths): values(strength, backbones_kept[problem_key(p, strength)])
+ 
+-fun decide(problems :: List, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10, ~strengths: strengths :: List = ["guaranteed", "regardless"]) :: List:
++fun decide(problems :: List, ~timeout: timeout :: PosReal = 10, ~strengths: strengths :: List = ["guaranteed", "regardless"]) :: List:
+   load_answers()
+   fun started_of(p :: Problem, key :: List, strength, relation :: Boolean) :: List:
+     let vals = values_of(key)
+@@ -541,7 +541,7 @@ fun decide(problems :: List, ~plugin: plugin = #false, ~timeout: timeout :: PosR
+             each c in started(inputs[i], count, assumed)
+             c
+         smt.ValuesSpec(~function: name, ~inputs: inputs, ~preconditions: preconditions)
+-    let batch = strength_dialect.smt_values_batch(program, specs, ~plugin: plugin)
++    let batch = strength_dialect.smt_values_batch(program, specs)
+     for (q :: Question in asked_here, query in batch.queries):
+       runs := runs + 1
+       match session().values(query, ~limit: q.limit, ~timeout: timeout)
+diff --git a/closer-exports/closer_exports/mlir/survey.rhm b/closer-exports/closer_exports/mlir/survey.rhm
+index 34481514..9abcbc64 100644
+--- a/closer-exports/closer_exports/mlir/survey.rhm
++++ b/closer-exports/closer_exports/mlir/survey.rhm
+@@ -18,7 +18,6 @@ import:
+   closer_exports/mlir/program open
+   closer_exports/mlir/rules open
+   lib("file/sha1.rkt") as sha
+-  rhombus/envvar
+ 
+ export:
+   survey
+@@ -262,13 +261,8 @@ fun coupling_of(project :: Path, pages :: Path, compile :: Map, model :: Map, re
+   let z3 :: Map:
+     try:
+       unless instances | error(~who: #'survey, to_string(made["failed"]))
+-      let built = Path(checkout).add("build").add("pille-smt-query").add("PilleSmtQuery.so")
+-      let plugin:
+-        envvar.getenv("PILLE_MLIR_SMT_PLUGIN")
+-          || (rkt.#{file-exists?}(built) && built)
+-          || error(~who: #'survey, "no SMT query plugin: set PILLE_MLIR_SMT_PLUGIN")
+       let answers :: List:
+-        decide_from_tables(tables_of(instances!!, model), instances!!, model, ~plugin: plugin)
++        decide_from_tables(tables_of(instances!!, model), instances!!, model)
+       {"needs": (for List (answer :: List in answers):
+                    let [occurrence, thing, states :: List, holds] = answer
+                    [& place(occurrence), thing, names_of_states(states), holds])}
+diff --git a/closer-exports/closer_exports/reader/pages_cli.rhm b/closer-exports/closer_exports/reader/pages_cli.rhm
+index 32f47ccf..88b57c86 100644
+--- a/closer-exports/closer_exports/reader/pages_cli.rhm
++++ b/closer-exports/closer_exports/reader/pages_cli.rhm
+@@ -3,7 +3,6 @@
+ import:
+   lib("racket/base.rkt") as rkt
+   rhombus/json
+-  closer_exports/closer.checkout
+   closer_exports/record open
+   closer_exports/compile.compile_record
+   "read.rhm" open
+@@ -19,9 +18,7 @@ module main:
+     parameterize { rkt.#{current-output-port}: rkt.#{current-error-port}() }:
+       let answer = read_at_runtime(root, ~pages: pages, ~words: words)
+       if to_string(mode) == "analysis"
+-      | let plugin = (rkt.getenv("PILLE_MLIR_SMT_PLUGIN") && Path(to_string(rkt.getenv("PILLE_MLIR_SMT_PLUGIN"))))
+-                     || Path(checkout).add("build").add("pille-smt-query").add("PilleSmtQuery.so")
+-        compile_record(root, ~plugin: plugin, ~read: answer, ~pages: pages, ~words: for List (word in words): word.parent())
++      | compile_record(root, ~read: answer, ~pages: pages, ~words: for List (word in words): word.parent())
+       | {"namings": answer["namings"], "sets": answer["sets"],
+          "readings": answer["readings"] ++ answer["claims"] ++ answer["modal"], "issues": answer["unread"],
+          "requirements": for List (req :: Map in list_at(answer, "requirements")):
+diff --git a/closer-exports/closer_exports/requirements.rhm b/closer-exports/closer_exports/requirements.rhm
+index e069b0b0..fc79c878 100644
+--- a/closer-exports/closer_exports/requirements.rhm
++++ b/closer-exports/closer_exports/requirements.rhm
+@@ -452,10 +452,9 @@ fun walk_pages(read :: Map, model :: Map) :: Map:
+ // a page with no claim of its own, whose solver constructs no path; "empty:
+ // …" for one that models no moment), and the "verdict": a safety property's
+ // is its guarantee, a liveness one's its planned value.
+-fun judge_requirements(read :: Map, model :: Map, ~strengths: strengths :: Boolean = #false,
+-                       ~plugin: plugin = #false) :: List:
++fun judge_requirements(read :: Map, model :: Map, ~strengths: strengths :: Boolean = #false) :: List:
+   let w = pages_walked(read, model)
+-  let paths :: List = (strengths && solver_paths(read, model, ~plugin: plugin)) || []
++  let paths :: List = (strengths && solver_paths(read, model)) || []
+   let [pages :: List, instances :: List, named_moments :: List, kinds, parents, rules, units, durations]:
+     [w["pages"], w["instances"], w["named_moments"], w["kinds"], w["parents"], w["rules"], w["units"], w["durations"]]
+   for List:
+@@ -888,7 +887,7 @@ fun shaped(moments :: List, named_moments :: List, ~consumed: keep_consumed :: B
+ // regardless and given), its moments shaped for the claim model; #false for
+ // a page with no claim of its own, for which the compile constructs none.
+ // [{strength: moments, ...} or #false, ...]
+-fun solver_paths(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10,
++fun solver_paths(read :: Map, model :: Map, ~timeout: timeout :: PosReal = 10,
+                  ~strengths: strengths :: List = ["guaranteed", "regardless", "given"]) :: List:
+   let w = pages_walked(read, model)
+   let pages :: List = w["pages"]
+@@ -900,7 +899,7 @@ fun solver_paths(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout:
+     for List (p in problems, page in pages):
+       keep_when page in claimed
+       p
+-  let answers :: List = decided(asked, ~plugin: plugin, ~timeout: timeout, ~strengths: strengths)
++  let answers :: List = decided(asked, ~timeout: timeout, ~strengths: strengths)
+   let (paths :: List, _):
+     for values(paths :: List = [], next = 0) (page in pages):
+       if page in claimed
+@@ -932,7 +931,7 @@ fun distinct_problems(ps :: List) :: List:
+       | ~else: values(found.add(p), at.add(found.length()))
+   [found, at]
+ 
+-fun solver_premises(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10) :: List:
++fun solver_premises(read :: Map, model :: Map, ~timeout: timeout :: PosReal = 10) :: List:
+   let w = pages_walked(read, model)
+   let pages :: List = w["pages"]
+   let instances :: List = w["instances"]
+@@ -953,7 +952,7 @@ fun solver_premises(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeou
+       let number :: Int = number_at(i, "moment")
+       [number, upto(problems[page_index], number - 1)]
+   let [asked :: List, placed_at :: List] = distinct_problems(for List ([_, p] in questions): p)
+-  let answers :: List = decided(asked, ~plugin: plugin, ~timeout: timeout, ~strengths: ["guaranteed", "regardless"])
++  let answers :: List = decided(asked, ~timeout: timeout, ~strengths: ["guaranteed", "regardless"])
+   let paths :: Map:
+     for Map ([number, _] in questions, k in placed_at):
+       let answered :: Map = answers[k]
+@@ -995,13 +994,13 @@ fun solver_premises(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeou
+ // regardless rests on each thing whose start a naming or an assumption says,
+ // without which (nothing assumed of the thing) it is no longer entailed.
+ // {page: [thing, ...], ...}, each page's things in the order their starts are said.
+-fun premise_rests(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10) :: Map:
++fun premise_rests(read :: Map, model :: Map, ~timeout: timeout :: PosReal = 10) :: Map:
+   let w = pages_walked(read, model)
+   let pages :: List = w["pages"]
+   let instances :: List = w["instances"]
+   let named_moments :: List = w["named_moments"]
+   let steps :: List = list_at(read, "steps")
+-  let premises :: List = solver_premises(read, model, ~plugin: plugin, ~timeout: timeout)
++  let premises :: List = solver_premises(read, model, ~timeout: timeout)
+   let problems :: List = solver_problems(read, model)
+   let said :: List:
+     for List ([name :: String, _, said] in (w["starting"] :~ List)): keep_when said; name
+@@ -1024,7 +1023,7 @@ fun premise_rests(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout:
+   let answers :: List:
+     if asked == [] || withouts == []
+     | []
+-    | decided(asked, ~plugin: plugin, ~timeout: timeout, ~strengths: withouts)
++    | decided(asked, ~timeout: timeout, ~strengths: withouts)
+   // whether a premise is still entailed without a thing (where no world says
+   // every assertion, it is, the premises contradicting each other)
+   fun still(p :: Map, k :: Int, name, without) :: Boolean:
+@@ -1054,7 +1053,7 @@ fun premise_rests(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout:
+ // step; and where the walk says a step left the state found, whether it was so
+ // just before that step, at each moment from it to just before the one that
+ // needs it, and with that step taken as doing nothing. `needs` is the fold's.
+-fun solver_need_checks(read :: Map, model :: Map, needs :: List, ~plugin: plugin = #false,
++fun solver_need_checks(read :: Map, model :: Map, needs :: List,
+                        ~timeout: timeout :: PosReal = 10) :: List:
+   let w = pages_walked(read, model)
+   let named_moments :: List = w["named_moments"]
+@@ -1078,7 +1077,7 @@ fun solver_need_checks(read :: Map, model :: Map, needs :: List, ~plugin: plugin
+     let produced :: List:
+       for List (n :: Map in needs): keep_when by_a_step(n); n
+     let answers :: List:
+-      decided([whole, & (for List (n :: Map in produced): without(n["by_step"]))], ~plugin: plugin,
++      decided([whole, & (for List (n :: Map in produced): without(n["by_step"]))],
+               ~timeout: timeout, ~strengths: ["guaranteed"])
+     let worlds :: List = shaped((answers[0] :~ Map)["guaranteed"], named_moments, ~consumed: #true)
+     let steps = last.steps.length()
+@@ -1234,12 +1233,12 @@ fun rkt_unit(text :: String) :: maybe(String):
+ // (nothing assumed of the thing) it is no longer guaranteed, [thing, state].
+ // [{"file", "line", "claim", "guaranteed", "guaranteed_moments", "regardless",
+ // "regardless_moments", "given", "rests_on"}, ...]
+-fun page_claim_strengths(read :: Map, model :: Map, ~plugin: plugin = #false, ~timeout: timeout :: PosReal = 10) :: List:
++fun page_claim_strengths(read :: Map, model :: Map, ~timeout: timeout :: PosReal = 10) :: List:
+   let w = pages_walked(read, model)
+   let pages :: List = w["pages"]
+   let steps :: List = list_at(read, "steps")
+   let named_moments :: List = w["named_moments"]
+-  let paths :: List = solver_paths(read, model, ~plugin: plugin, ~timeout: timeout)
++  let paths :: List = solver_paths(read, model, ~timeout: timeout)
+   let problems :: List = solver_problems(read, model)
+   for List (c :: Map in list_at(read, "claims")):
+     let moment = claim_moment(c, pages, steps)
+@@ -1260,7 +1259,7 @@ fun page_claim_strengths(read :: Map, model :: Map, ~plugin: plugin = #false, ~t
+           each [name :: String, initial :: String, said] in (w["starting"] :~ List)
+           keep_when said
+           let without = ["without", name]
+-          let answer :: Map = decided([problems[page]], ~plugin: plugin, ~timeout: timeout, ~strengths: [without])[0]
++          let answer :: Map = decided([problems[page]], ~timeout: timeout, ~strengths: [without])[0]
+           keep_when valued(shaped(answer[without], named_moments))[0] != 1
+           [name, last_part(initial)]
+     {"file": c["file"], "line": c["line"], "claim": claim, "moment": moment,
+@@ -1501,7 +1500,7 @@ fun kripke_formula(form, strength) :: List:
+ //           a box or a diamond, or contingent, the run that shows it; a form
+ //           with a claim the language does not read is unread
+ // A quantity a run will give is split over its cases (kripke_problems).
+-fun kripke_record(read :: Map, model :: Map, ~plugin: plugin = #false) :: Map:
++fun kripke_record(read :: Map, model :: Map) :: Map:
+   let w = pages_walked(read, model)
+   let pages :: List = w["pages"]
+   let steps :: List = list_at(read, "steps")
+@@ -1538,7 +1537,7 @@ fun kripke_record(read :: Map, model :: Map, ~plugin: plugin = #false) :: Map:
+         each [_, _, p, moment, form] in judged_entries
+         each strength in strengths
+         question(p, strength, form, moment)
+-    let answers :: List = values_of_many(asked, ~plugin: plugin)
++    let answers :: List = values_of_many(asked)
+     fun judgement(vs :: List) :: Int:
+       let all_true = for all (v in vs): v == 1
+       let all_false = for all (v in vs): v == 0
+@@ -1567,7 +1566,7 @@ fun kripke_record(read :: Map, model :: Map, ~plugin: plugin = #false) :: Map:
+         let some_run = (answers[k * strengths.length() + strengths.find_index(fun (x): x == strength)] :~ List) != []
+         each [shown_form, wanted] in to_show(form, judged[strength], some_run)
+         [[k, strength, if wanted == 1 | "holds" | "fails"], [question(p, strength, shown_form, moment), wanted]]
+-    let found :: List = witnesses_of_many(for List ([_, r] in requests): r, ~plugin: plugin)
++    let found :: List = witnesses_of_many(for List ([_, r] in requests): r)
+     fun shown(k :: Int) :: Map:
+       for values(m :: Map = {}) ([[kk, strength, which], _] in requests, run in found):
+         if kk == k && run | m ++ {strength: (m.get(strength, {}) :~ Map) ++ {which: run}} | m
+diff --git a/closer-exports/closer_exports/serve.rhm b/closer-exports/closer_exports/serve.rhm
+index 93bc7c57..0e0dc3c0 100644
+--- a/closer-exports/closer_exports/serve.rhm
++++ b/closer-exports/closer_exports/serve.rhm
+@@ -94,8 +94,6 @@ export:
+ // files as the request gives them and links everything else of the folder
+ // (its rhombus folder, languages, settings, readings record and build).
+ 
+-def plugin_default = Path(checkout).add("build").add("pille-smt-query").add("PilleSmtQuery.so")
+-
+ def scratches :: MutableMap = MutableMap{}
+ 
+ fun complete(p :: Path) :: Path: Path(rkt.#{simplify-path}(rkt.#{path->complete-path}(p)))
+@@ -162,7 +160,7 @@ fun read_kept(scratch :: Path, files :: List) :: Map:
+       reads_kept[to_string(scratch)] := [key, read]
+       read
+ 
+-fun compile_answer(request :: Map, plugin) :: String:
++fun compile_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let files :: List = request.get("files", [])
+   let scratch = scratch_for(folder, files)
+@@ -176,7 +174,7 @@ fun compile_answer(request :: Map, plugin) :: String:
+     match records_kept.get(to_string(scratch), #false)
+     | [r, o, made, with_resolutions] when r === read && o == only && with_resolutions == resolutions: made
+     | ~else:
+-        let made = compile_record(scratch, ~plugin: plugin, ~read: read, ~only: only, ~resolutions: resolutions)
++        let made = compile_record(scratch, ~read: read, ~only: only, ~resolutions: resolutions)
+         records_kept[to_string(scratch)] := [read, only, made, resolutions]
+         made
+   as_folder(json.to_string(record), scratch, folder)
+@@ -227,14 +225,14 @@ fun next_words_answer(request :: Map) :: String:
+   json.to_string(next_words(read["lexicon"], to_string(request.get("text", "")),
+                             ~limit: request.get("limit", 12)))
+ 
+-fun try_saying_answer(request :: Map, plugin) :: String:
++fun try_saying_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let name = to_string(request.get("name", ""))
+   let line :: Int = request.get("line", 0)
+   let text = to_string(request.get("text", ""))
+   let files = with_line(request.get("files", []), name, line, text.trim())
+   // compiled as the editor's compile is, the line said otherwise
+-  let record :: Map = json.from_string(compile_answer({"folder": request.get("folder", "."), "files": files}, plugin))
++  let record :: Map = json.from_string(compile_answer({"folder": request.get("folder", "."), "files": files}))
+   let read :: Map = read_kept(scratch_for(folder, files), files)
+   json.to_string(tried_saying(record, read["lexicon"], files, name, line, text))
+ 
+@@ -252,19 +250,19 @@ fun blanked_below(files :: List, name :: String, line :: Int) :: List:
+                                   | l,
+                                 "\n")}
+ 
+-fun derivation_answer(request :: Map, plugin) :: String:
++fun derivation_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let name = to_string(request.get("name", ""))
+   let line :: Int = request.get("line", 0)
+   let text = to_string(request.get("text", "")).trim()
+   let files = blanked_below(with_line(request.get("files", []), name, line, text), name, line)
+-  let record :: Map = json.from_string(compile_answer({"folder": request.get("folder", "."), "files": files}, plugin))
++  let record :: Map = json.from_string(compile_answer({"folder": request.get("folder", "."), "files": files}))
+   let read :: Map = read_kept(scratch_for(folder, files), files)
+   let d :: Map = derivation_of(read, operation_roles(model_kept(folder)), text)
+   let step = d["complete"] && step_value(record, name, line)
+   json.to_string(if step | d ++ {"step": step} | d)
+ 
+-fun record_requirements_answer(request :: Map, plugin) :: String:
++fun record_requirements_answer(request :: Map) :: String:
+   let said = to_string(request.get("folder", "."))
+   let folder = complete(Path(said))
+   let files :: List:
+@@ -272,13 +270,13 @@ fun record_requirements_answer(request :: Map, plugin) :: String:
+       let name = to_string(entry)
+       keep_when name.ends_with(".md") && rkt.#{file-exists?}(folder.add(name))
+       {"name": name, "text": to_string(rfile.#{file->string}(folder.add(name)))}
+-  let record :: Map = json.from_string(compile_answer({"folder": said, "files": files}, plugin))
++  let record :: Map = json.from_string(compile_answer({"folder": said, "files": files}))
+   json.to_string(recorded_index(record, folder, said, ~recording: #true, ~only: request.get("ids", [])))
+ 
+ // A checked layer from elsewhere (closer_exports/checked), against the pages
+ // as the request gives them: its JSON text read, its context and propositions
+ // checked, what is accepted judged again here.
+-fun ingest_answer(request :: Map, plugin) :: String:
++fun ingest_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let files :: List = request.get("files", [])
+   let scratch = scratch_for(folder, files)
+@@ -287,7 +285,7 @@ fun ingest_answer(request :: Map, plugin) :: String:
+   let payload = request.get("payload", "")
+   let text = if payload is_a String | payload | json.to_string(payload)
+   json.to_string(ingest_checked_text(text, guarded_read(needs_resolved(without_notes(read), model), model), model,
+-                                     ~pages: scratch, ~plugin: plugin))
++                                     ~pages: scratch))
+ 
+ // What is near a selection, in the pages as the request gives them
+ // (closer_exports/neighborhood, over closer_exports/semantic's snapshot):
+@@ -305,11 +303,11 @@ fun assembly_for(request :: Map, scratch :: Path) :: maybe(Map):
+       instantiate(materials_model(scratch.add(page), models), name)
+   | ~else: #false
+ 
+-fun snapshot_for(request :: Map, plugin) :: Semantic:
++fun snapshot_for(request :: Map) :: Semantic:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let files :: List = request.get("files", [])
+   let scratch = scratch_for(folder, files)
+-  let record :: Map = json.from_string(compile_answer(request.remove("only").remove("assembly"), plugin))
++  let record :: Map = json.from_string(compile_answer(request.remove("only").remove("assembly")))
+   let wanted = request.get("assembly", #false)
+   let key = to_string(scratch) ++ (if wanted | " + " ++ json.to_string(wanted) | "")
+   match semantics_kept.get(key, #false)
+@@ -319,8 +317,8 @@ fun snapshot_for(request :: Map, plugin) :: Semantic:
+       semantics_kept[key] := [record["digest"], s]
+       s
+ 
+-fun neighborhood_answer(request :: Map, plugin) :: String:
+-  json.to_string(neighborhood(snapshot_for(request, plugin), (request.get("request", {}) :~ Map)))
++fun neighborhood_answer(request :: Map) :: String:
++  json.to_string(neighborhood(snapshot_for(request), (request.get("request", {}) :~ Map)))
+ 
+ // The registered views, with whether the pages' snapshot can answer each; and
+ // a destination in one view taken to another (closer_exports/views): what
+@@ -329,20 +327,20 @@ fun neighborhood_answer(request :: Map, plugin) :: String:
+ // The refinement record of the pages (closer_exports/refinement/record): what
+ // the graph page and the editor's graph panel draw from, made here with no
+ // Mojo. The folder is named as the request names it, not as the scratch copy.
+-fun refinement_answer(request :: Map, plugin) :: String:
++fun refinement_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let scratch = scratch_for(folder, request.get("files", []))
+-  let compile :: Map = json.from_string(compile_answer(request.remove("only"), plugin))
++  let compile :: Map = json.from_string(compile_answer(request.remove("only")))
+   json.to_string(refinement_record(scratch, compile, ~said_of: folder))
+ 
+ // A line of a page tried, the lines above it taken as done
+ // (closer_exports/run/try): {"what": "try", "folder", "files", "name", "line"}.
+ // The trial is answered under "tried": a trial has an "error" of its own (why
+ // the line did not pass), which is not the server failing to answer.
+-fun try_answer(request :: Map, plugin) :: String:
++fun try_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let scratch = scratch_for(folder, request.get("files", []))
+-  let compile :: Map = json.from_string(compile_answer(request.remove("only").remove("name").remove("line"), plugin))
++  let compile :: Map = json.from_string(compile_answer(request.remove("only").remove("name").remove("line")))
+   let name = to_string(request.get("name", ""))
+   let line = request.get("line", 0)
+   if !(for any (f :: Map in (request.get("files", []) :~ List)): f["name"] == name)
+@@ -358,11 +356,11 @@ def mutable telling :: Function = fun (_): #void
+ 
+ // The pages run (closer_exports/run/page): {"what": "run", "folder", "files",
+ // "only"?}, answered as {"lines": [each step as it ended, then each page]}.
+-fun run_answer(request :: Map, plugin) :: String:
++fun run_answer(request :: Map) :: String:
+   let folder = complete(Path(to_string(request.get("folder", "."))))
+   let scratch = scratch_for(folder, request.get("files", []))
+   let only :: List = request.get("only", [])
+-  let compile :: Map = json.from_string(compile_answer(request.remove("only"), plugin))
++  let compile :: Map = json.from_string(compile_answer(request.remove("only")))
+   let pages :: List:
+     (for List (f :: Map in (request.get("files", []) :~ List)):
+        keep_when to_string(f["name"]).ends_with(".md") && !(f["name"] in ["settings.md", "rows.md"])
+@@ -385,16 +383,16 @@ fun run_answer(request :: Map, plugin) :: String:
+ 
+ // What the pages' procedure does to its things, step by step
+ // (closer_exports/procedure): what an assembly of the same folder is driven by.
+-fun procedure_answer(request :: Map, plugin) :: String:
+-  let s = snapshot_for(request.remove("assembly"), plugin)
++fun procedure_answer(request :: Map) :: String:
++  let s = snapshot_for(request.remove("assembly"))
+   json.to_string({"revision": s.revision, "effects": effects_of(s)})
+ 
+ def view_registry :: Map = registry_of(standard_views)
+-fun views_answer(request :: Map, plugin) :: String:
+-  let s = snapshot_for(request, plugin)
++fun views_answer(request :: Map) :: String:
++  let s = snapshot_for(request)
+   json.to_string({"revision": s.revision, "views": view_descriptors(view_registry, s)})
+-fun navigate_answer(request :: Map, plugin) :: String:
+-  json.to_string(navigate(snapshot_for(request, plugin), view_registry, (request.get("from", {}) :~ Map),
++fun navigate_answer(request :: Map) :: String:
++  json.to_string(navigate(snapshot_for(request), view_registry, (request.get("from", {}) :~ Map),
+                           request.get("to", #false)))
+ 
+ // The lines of a folder the language does not read, read by the reader
+@@ -405,34 +403,34 @@ fun read_unread_answer(request :: Map) :: String:
+   json.to_string(read_unread(complete(Path(to_string(request.get("folder", "."))))))
+ 
+ // One request's answer, as a line of JSON.
+-fun answer_of(line :: String, ~plugin: plugin = plugin_default) :: String:
++fun answer_of(line :: String) :: String:
+   try:
+     let request :: Map = json.from_string(line)
+     // what the work would print goes to standard error
+     parameterize { rkt.#{current-output-port}: rkt.#{current-error-port}() }:
+       match request.get("what", "")
+-      | "compile": compile_answer(request, plugin)
++      | "compile": compile_answer(request)
+       | "module": module_answer(request)
+       | "words": words_answer(request)
+       | "next-words": next_words_answer(request)
+-      | "try-saying": try_saying_answer(request, plugin)
+-      | "derivation": derivation_answer(request, plugin)
+-      | "record-requirements": record_requirements_answer(request, plugin)
+-      | "ingest-checked": ingest_answer(request, plugin)
+-      | "neighborhood": neighborhood_answer(request, plugin)
+-      | "try": try_answer(request, plugin)
+-      | "run": run_answer(request, plugin)
+-      | "views": views_answer(request, plugin)
+-      | "refinement": refinement_answer(request, plugin)
+-      | "procedure-effects": procedure_answer(request, plugin)
+-      | "navigate": navigate_answer(request, plugin)
++      | "try-saying": try_saying_answer(request)
++      | "derivation": derivation_answer(request)
++      | "record-requirements": record_requirements_answer(request)
++      | "ingest-checked": ingest_answer(request)
++      | "neighborhood": neighborhood_answer(request)
++      | "try": try_answer(request)
++      | "run": run_answer(request)
++      | "views": views_answer(request)
++      | "refinement": refinement_answer(request)
++      | "procedure-effects": procedure_answer(request)
++      | "navigate": navigate_answer(request)
+       | "read-unread": read_unread_answer(request)
+       | what: json.to_string({"error": "closer serve answers compile, module, words, next-words, try-saying, derivation, record-requirements, ingest-checked, neighborhood, views, navigate, procedure-effects, refinement, try, run and read-unread; not "
+                                          ++ to_string(what)})
+     ~catch e:
+       json.to_string({"error": to_string(rkt.#{exn-message}(e))})
+ 
+-fun serve(~plugin: plugin = plugin_default) :: Void:
++fun serve() :: Void:
+   // the solver's answers kept across the server's runs
+   keep_answers_on_disk()
+   let out = rkt.#{current-output-port}()
+@@ -444,7 +442,7 @@ fun serve(~plugin: plugin = plugin_default) :: Void:
+       | telling := fun (said):
+                      rkt.#{write-string}(json.to_string({"partial": said}) ++ "\n", out)
+                      rkt.#{flush-output}(out)
+-        rkt.#{write-string}(answer_of(text, ~plugin: plugin) ++ "\n", out)
++        rkt.#{write-string}(answer_of(text) ++ "\n", out)
+         rkt.#{flush-output}(out)
+       loop()
+ 

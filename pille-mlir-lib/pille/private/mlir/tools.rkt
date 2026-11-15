@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require json racket/file racket/path racket/runtime-path racket/string racket/system
+(require racket/file racket/path racket/system
          racket/treelist
          "temporary.rkt")
 
@@ -11,11 +11,7 @@
                      [mlir-module-ir module_ir]
                      [mlir-module-irdl module_irdl]
                      [module-generic module_generic]
-                     [run-smt-query-pass run_smt_query_pass]
-                     [run-smt-batch-pass run_smt_batch_pass]
                      [parse-stock-module parse_stock_module]
-                     [resolve-smt-plugin resolve_smt_plugin]
-                     [build-smt-plugin build_smt_plugin]
                      [run-passes run_passes]
                      [to-llvm-ir to_llvm_ir]
                      [to-bitcode to_bitcode]
@@ -65,10 +61,7 @@
   (define executable (executable-name name))
   (check-tool (build-path (toolchain-bin chain) executable) executable))
 
-(define (run-tool chain name input arguments #:irdl [irdl ""] #:binary? [binary? #f]
-                  #:pass-plugins [extra-plugins '()]
-                  #:in-directory [extra-arguments (lambda (_directory) '())]
-                  #:read-output [read-output (lambda (_directory value) value)])
+(define (run-tool chain name input arguments #:irdl [irdl ""] #:binary? [binary? #f])
   ;; Files avoid pipe-buffer deadlocks for large modules and diagnostics. Run
   ;; directly, without a shell, so paths and pipelines remain literal arguments.
   (define executable (tool-path chain name))
@@ -88,7 +81,7 @@
             (append
              (for/list ([path (in-list (toolchain-dialect-plugins chain))])
                (string-append "--load-dialect-plugin=" (path->string path)))
-             (for/list ([path (in-list (append (toolchain-pass-plugins chain) extra-plugins))])
+             (for/list ([path (in-list (toolchain-pass-plugins chain))])
                (string-append "--load-pass-plugin=" (path->string path)))
              (if (equal? irdl "") '()
                  (list (string-append "--irdl-file=" (path->string definitions)))))
@@ -104,14 +97,13 @@
                                [current-output-port output-port]
                                [current-error-port output-port])
                   (apply system* executable
-                         (append registration-args arguments (extra-arguments directory)
+                         (append registration-args arguments
                                  (list "-" "-o" (path->string output))))))))))
       (unless ok?
         (raise-user-error 'pille/mlir "~a failed:\n~a" name (file->string diagnostics)))
-      (read-output directory
-                   (if binary?
-                       (bytes->immutable-bytes (file->bytes output))
-                       (string->immutable-string (file->string output)))))
+      (if binary?
+          (bytes->immutable-bytes (file->bytes output))
+          (string->immutable-string (file->string output))))
     (lambda () (delete-directory/files directory))))
 
 (define (parse-module source [irdl ""] [chain (make-toolchain)])
@@ -163,118 +155,10 @@
   (run-tool (mlir-module-toolchain module) "mlir-translate" (mlir-module-ir module)
             '("--export-smtlib")))
 
-;; SMT queries. The lowering itself is a native pass that reads a declarative
-;; manifest, so this layer only supplies files and arguments. The plugin is
-;; never built or located implicitly.
-(define-runtime-path native-source "../../mlir/native")
-
-(define plugin-instructions
-  (string-append
-   "build pille/mlir/native with the MLIR installation that supplies mlir-opt "
-   "(see the package README, or use build_plugin), then pass its path explicitly "
-   "or set PILLE_MLIR_SMT_PLUGIN"))
-
-(define (resolve-smt-plugin [explicit #f])
-  (unless (or (not explicit) (path-string? explicit))
-    (raise-argument-error 'smt_query "path-string? or #f" explicit))
-  (define selected (or explicit (getenv "PILLE_MLIR_SMT_PLUGIN")))
-  (unless selected
-    (raise-user-error 'pille/mlir "no SMT query plugin was selected; ~a" plugin-instructions))
-  (define path (path->complete-path selected))
-  (unless (file-exists? path)
-    (raise-user-error 'pille/mlir "cannot find the SMT query plugin ~a; ~a" path plugin-instructions))
-  path)
-
-;; A pass option is one token of the textual pipeline; quoting keeps a
-;; temporary directory containing spaces intact.
-(define (quote-pass-option who text)
-  (define quotation
-    (for/first ([candidate (in-list '("\"" "'"))]
-                #:unless (string-contains? text candidate))
-      candidate))
-  (unless quotation
-    (raise-user-error who "cannot pass ~s as a pass option: it contains both kinds of quotation mark"
-                      text))
-  (string-append quotation text quotation))
-
-(define (run-smt-query-pass module plugin manifest)
-  (unless (mlir-module? module) (raise-argument-error 'smt_query "mlir-module?" module))
-  (unless (string? manifest) (raise-argument-error 'smt_query "string?" manifest))
-  (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
-            '("--verify-each" "--mlir-print-debuginfo")
-            #:irdl (mlir-module-irdl module)
-            #:pass-plugins (list plugin)
-            #:in-directory
-            (lambda (directory)
-              (define path (build-path directory "manifest.json"))
-              (display-to-file manifest path #:exists 'truncate)
-              (list (string-append
-                     "--pass-pipeline=builtin.module(pille-smt-query{manifest="
-                     (quote-pass-option 'smt_query (path->string path))
-                     "})")))))
-
-;; One lowering invocation for all specs. The plugin also prints standalone
-;; query modules through MLIR's printer into one JSON sidecar. Keeping these
-;; texts avoids parsing MLIR here or launching a process per batch member.
-(define (run-smt-batch-pass module plugin manifest)
-  (unless (mlir-module? module) (raise-argument-error 'smt_batch "mlir-module?" module))
-  (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
-            '("--verify-each" "--mlir-print-debuginfo")
-            #:irdl (mlir-module-irdl module)
-            #:pass-plugins (list plugin)
-            #:in-directory
-            (lambda (directory)
-              (define path (build-path directory "manifest.json"))
-              (call-with-output-file path #:exists 'truncate
-                (lambda (out)
-                  (write-json
-                   (hash-set manifest 'query_modules
-                             (path->string (build-path directory "queries.json"))) out)))
-              (list (string-append
-                     "--pass-pipeline=builtin.module(pille-smt-query{manifest="
-                     (quote-pass-option 'smt_batch (path->string path)) "})")))
-            #:read-output
-            (lambda (directory output)
-              (define modules (call-with-input-file (build-path directory "queries.json") read-json))
-              (unless (and (list? modules) (andmap string? modules))
-                (raise-user-error 'smt_batch "invalid standalone query modules from lowering plugin"))
-              (values output (map string->immutable-string modules)))))
-
 ;; Verify with the stock tools only: no IRDL definitions and no plugins. This
-;; is what mlir-translate sees, so a residual custom operation fails here.
+;; is what mlir-translate sees, so a residual custom operation fails here. The
+;; SMT lowering (lower.rhm) writes its queries as text, and this is where the
+;; toolchain reads them.
 (define (parse-stock-module source module)
   (define chain (mlir-module-toolchain module))
   (parse-module source "" (toolchain (toolchain-bin chain) '() '())))
-
-;; Configure and build the plugin against the installation that supplies the
-;; toolchain's mlir-opt. This is an explicit, caller-requested action.
-(define (build-smt-plugin directory [chain (make-toolchain)] [cmake #f])
-  (unless (path-string? directory) (raise-argument-error 'build_plugin "path-string?" directory))
-  (unless (toolchain? chain) (raise-argument-error 'build_plugin "toolchain?" chain))
-  (define executable
-    (or cmake (find-executable-path (executable-name "cmake"))
-        (raise-user-error 'pille/mlir "cannot find cmake on PATH to build the SMT query plugin")))
-  (define build (path->complete-path directory))
-  (define prefix (simplify-path (build-path (toolchain-bin chain) 'up)))
-  (define configuration (build-path prefix "lib" "cmake" "mlir"))
-  (unless (directory-exists? configuration)
-    (raise-user-error 'pille/mlir
-                      "cannot find MLIR's CMake package at ~a; the plugin needs the MLIR development files of the installation that supplies mlir-opt"
-                      configuration))
-  (make-directory* build)
-  (define log (open-output-string))
-  (define (run . arguments)
-    (unless (parameterize ([current-output-port log] [current-error-port log]
-                           [current-input-port (open-input-string "")])
-              (apply system* executable arguments))
-      (raise-user-error 'pille/mlir "building the SMT query plugin failed:\n~a"
-                        (get-output-string log))))
-  (run "-S" (path->string native-source) "-B" (path->string build)
-       (string-append "-DMLIR_DIR=" (path->string configuration))
-       "-DCMAKE_BUILD_TYPE=Release")
-  (run "--build" (path->string build))
-  (define plugin (build-path build "PilleSmtQuery.so"))
-  (unless (file-exists? plugin)
-    (raise-user-error 'pille/mlir "the plugin build did not produce ~a:\n~a"
-                      plugin (get-output-string log)))
-  plugin)

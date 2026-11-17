@@ -1,7 +1,7 @@
 #lang racket/base
 
 (require racket/file racket/path racket/system
-         racket/treelist
+         racket/treelist file/sha1
          "temporary.rkt")
 
 (provide (rename-out [toolchain? is_toolchain]
@@ -61,10 +61,92 @@
   (define executable (executable-name name))
   (check-tool (build-path (toolchain-bin chain) executable) executable))
 
+;; A tool's answer is kept by what it was asked. The tools are deterministic: the same executable given the same
+;; arguments, plugins, dialect definitions and input writes the same output, so a second request for it is answered
+;; from the kept output, with no process started. A lowering asks the same few things many times over (the same
+;; module parsed, printed and exported for each query), and starting the tool is most of what each costs.
+;;
+;; The key is a digest of everything the output depends on: the executable (its path, size and modification time,
+;; so another installation or a rebuilt tool is another key), each plugin the same way, the arguments, the working
+;; directory (a pass option may name a file relative to it), the dialect definitions and the input. Only an answer
+;; is kept: a failure runs the tool again and reports its diagnostics as before.
+;;
+;; PILLE_MLIR_CACHE names the folder (default: pille-mlir in the system's cache folder); "off" keeps nothing.
+;; An entry not asked for in 30 days is removed, once a process, when the cache is first used.
+(define memory (make-hash))   ; key -> output, for the process: no file is read twice
+
+(define (cache-directory)
+  (define said (getenv "PILLE_MLIR_CACHE"))
+  (cond [(equal? said "off") #f]
+        [(and said (not (equal? said ""))) (path->complete-path said)]
+        [else (build-path (find-system-path 'cache-dir) "pille-mlir")]))
+
+(define (file-identity path)
+  (list (path->string path)
+        (if (file-exists? path) (file-size path) -1)
+        (if (file-exists? path) (file-or-directory-modify-seconds path) -1)))
+
+(define (cache-key chain name executable input arguments irdl binary?)
+  (sha1-bytes
+   (string->bytes/utf-8
+    (format "~s"
+            (list 1 name (file-identity executable)
+                  (if (equal? name "mlir-opt")
+                      (map file-identity (append (toolchain-dialect-plugins chain) (toolchain-pass-plugins chain)))
+                      '())
+                  arguments (path->string (current-directory)) irdl binary? input)))))
+
+(define pruned? #f)
+(define (prune! directory)
+  (unless pruned?
+    (set! pruned? #t)
+    (define oldest (- (current-seconds) (* 30 24 60 60)))
+    (with-handlers ([exn:fail? void])
+      (for ([entry (in-list (directory-list directory #:build? #t))])
+        (with-handlers ([exn:fail? void])
+          (when (and (file-exists? entry) (< (file-or-directory-modify-seconds entry) oldest))
+            (delete-file entry)))))))
+
+(define (kept directory key binary?)
+  (define file (build-path directory (bytes->hex-string key)))
+  (and (file-exists? file)
+       (with-handlers ([exn:fail? (lambda (_) #f)])
+         ;; asked for again: its day is today's, so an entry in use is not the one removed
+         (when (< (file-or-directory-modify-seconds file) (- (current-seconds) (* 24 60 60)))
+           (file-or-directory-modify-seconds file (current-seconds)))
+         (if binary?
+             (bytes->immutable-bytes (file->bytes file))
+             (string->immutable-string (file->string file))))))
+
+(define (keep! directory key output)
+  ;; written beside its place and moved there, so a reader never sees a part of it and two writers of one key
+  ;; (the same answer) do not mix; a cache that cannot be written is no failure of the tool
+  (with-handlers ([exn:fail? void])
+    (make-directory* directory)
+    (define part (make-temporary-file "part-~a" #f directory))
+    (if (bytes? output)
+        (call-with-output-file part #:exists 'truncate (lambda (out) (write-bytes output out)))
+        (display-to-file output part #:exists 'truncate))
+    (rename-file-or-directory part (build-path directory (bytes->hex-string key)) #t)))
+
 (define (run-tool chain name input arguments #:irdl [irdl ""] #:binary? [binary? #f])
+  (define executable (tool-path chain name))
+  (define directory (cache-directory))
+  (define key (cache-key chain name executable input arguments irdl binary?))
+  (when directory (prune! directory))
+  (or (hash-ref memory key #f)
+      (let ([output (or (and directory (kept directory key binary?))
+                        (let ([made (run-tool/process chain name executable input arguments irdl binary?)])
+                          (when directory (keep! directory key made))
+                          made))])
+        ;; a process that lives long (a server) does not hold every answer it ever had
+        (when (>= (hash-count memory) 4096) (hash-clear! memory))
+        (hash-set! memory key output)
+        output)))
+
+(define (run-tool/process chain name executable input arguments irdl binary?)
   ;; Files avoid pipe-buffer deadlocks for large modules and diagnostics. Run
   ;; directly, without a shell, so paths and pipelines remain literal arguments.
-  (define executable (tool-path chain name))
   (define directory (make-work-directory "pille-mlir-~a"))
   (dynamic-wind
     void

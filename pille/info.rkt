@@ -10,6 +10,7 @@
 
 (define build-deps
   '("racket-doc"
+    "redex-lib"
     "rhombus"
     "rhombus-scribble-lib"
     "rhombus-ffi"

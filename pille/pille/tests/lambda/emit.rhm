@@ -1,0 +1,164 @@
+#lang rhombus
+
+export:
+  emit_module
+
+// MLIR for a closure-converted program (lambda/model.rkt's Λc), in the LLVM dialect (SYNTHETIC), for
+// pille/tests/mlir_lambda.rhm.
+//
+// Every value is an i64: a number, or the address of a closure record. A record is a run of i64
+// words on a heap: the address of its code first, then the values it captured, in the order the
+// conversion gave them. A code block takes its record and its argument:
+//
+//   (code ℓ x c)         llvm.func @ℓ(%self: i64, %arg: i64) -> i64
+//   x                    %arg
+//   (env-ref k)          load word k + 1 of %self's record
+//   (closure ℓ c ...)    allocate 1 + n words, store @ℓ's address and each value, give the address
+//   (call f a)           load the code's address from f's record, call it with f and a
+//   (+ a b)              llvm.add, which wraps at 64 bits
+//
+// The heap is one global array with a bump pointer, so the module needs no symbol from outside
+// it (no malloc), and nothing is freed: each entry point starts the heap over. Running out of it
+// traps. There are no tags, so a program the model says gets stuck has no meaning here.
+
+def heap_words = 65536
+
+def prelude = @str|{
+  llvm.mlir.global internal @lambda_heap(dense<0> : tensor<65536xi64>) : !llvm.array<65536 x i64>
+  llvm.mlir.global internal @lambda_top(0 : i64) : i64
+  llvm.func internal @lambda_alloc(%words: i64) -> !llvm.ptr {
+    %top_at = llvm.mlir.addressof @lambda_top : !llvm.ptr
+    %top = llvm.load %top_at : !llvm.ptr -> i64
+    %next = llvm.add %top, %words : i64
+    %room = llvm.mlir.constant(65536 : i64) : i64
+    %full = llvm.icmp "ugt" %next, %room : i64
+    llvm.cond_br %full, ^full, ^fits
+  ^full:
+    llvm.intr.trap
+    llvm.unreachable
+  ^fits:
+    llvm.store %next, %top_at : i64, !llvm.ptr
+    %heap = llvm.mlir.addressof @lambda_heap : !llvm.ptr
+    %at = llvm.getelementptr %heap[%top] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.return %at : !llvm.ptr
+  }
+}|
+
+//======================================================================
+// A block of SSA lines
+
+class Block(mutable lines :: List, mutable count :: Int):
+  constructor ():
+    super([], 0)
+  method fresh() :: String:
+    count := count + 1
+    "%v" +& (count - 1)
+  method add(line :: String):
+    lines := lines.add("    " ++ line)
+  method text() :: String:
+    String.join(lines, "\n")
+
+// The address of word `index` of the record at `record` (an i64 SSA name).
+fun word_at(b :: Block, record :: String, index :: Int) :: String:
+  let p = b.fresh()
+  b.add(p ++ " = llvm.inttoptr " ++ record ++ " : i64 to !llvm.ptr")
+  if index == 0
+  | p
+  | let at = b.fresh()
+    b.add(at ++ " = llvm.getelementptr " ++ p ++ "[" +& index +& "] : (!llvm.ptr) -> !llvm.ptr, i64")
+    at
+
+//======================================================================
+// Expressions
+
+// The SSA name of `c`'s value, its lines added to `b`. `param` is the code block's parameter (#false
+// in an entry point), and `prefix` the program's, before each label.
+fun expr(b :: Block, c, param, prefix :: String) :: String:
+  match c
+  | n :: Int:
+      let v = b.fresh()
+      b.add(v ++ " = llvm.mlir.constant(" +& n +& " : i64) : i64")
+      v
+  | x :: Symbol:
+      unless param && x == param
+      | error(#'emit_module, "a variable other than the code block's parameter: " +& x)
+      "%arg"
+  | PairList[#'#{+}, left, right]:
+      let l = expr(b, left, param, prefix)
+      let r = expr(b, right, param, prefix)
+      let v = b.fresh()
+      b.add(v ++ " = llvm.add " ++ l ++ ", " ++ r ++ " : i64")
+      v
+  | PairList[#'#{env-ref}, k :: Int]:
+      let at = word_at(b, "%self", k + 1)
+      let v = b.fresh()
+      b.add(v ++ " = llvm.load " ++ at ++ " : !llvm.ptr -> i64")
+      v
+  | PairList[#'closure, label :: Symbol, field, ...]:
+      // the captured values first, in order, as the model reduces them
+      let captured = for List (f in [field, ...]): expr(b, f, param, prefix)
+      let words = b.fresh()
+      b.add(words ++ " = llvm.mlir.constant(" +& (1 + captured.length()) +& " : i64) : i64")
+      let record = b.fresh()
+      b.add(record ++ " = llvm.call @lambda_alloc(" ++ words ++ ") : (i64) -> !llvm.ptr")
+      let code = b.fresh()
+      b.add(code ++ " = llvm.mlir.addressof @" ++ prefix +& label ++ " : !llvm.ptr")
+      let code_word = b.fresh()
+      b.add(code_word ++ " = llvm.ptrtoint " ++ code ++ " : !llvm.ptr to i64")
+      b.add("llvm.store " ++ code_word ++ ", " ++ record ++ " : i64, !llvm.ptr")
+      for (v in captured, i in 1 ..):
+        let at = b.fresh()
+        b.add(at ++ " = llvm.getelementptr " ++ record ++ "[" +& i +& "] : (!llvm.ptr) -> !llvm.ptr, i64")
+        b.add("llvm.store " ++ v ++ ", " ++ at ++ " : i64, !llvm.ptr")
+      let v = b.fresh()
+      b.add(v ++ " = llvm.ptrtoint " ++ record ++ " : !llvm.ptr to i64")
+      v
+  | PairList[#'call, callee, argument]:
+      let f = expr(b, callee, param, prefix)
+      let a = expr(b, argument, param, prefix)
+      let at = word_at(b, f, 0)
+      let code_word = b.fresh()
+      b.add(code_word ++ " = llvm.load " ++ at ++ " : !llvm.ptr -> i64")
+      let code = b.fresh()
+      b.add(code ++ " = llvm.inttoptr " ++ code_word ++ " : i64 to !llvm.ptr")
+      let v = b.fresh()
+      b.add(v ++ " = llvm.call " ++ code ++ "(" ++ f ++ ", " ++ a ++ ") : !llvm.ptr, (i64, i64) -> i64")
+      v
+  | ~else:
+      error(#'emit_module, "not a converted expression: " +& c)
+
+//======================================================================
+// Programs
+
+fun emit_code(prefix :: String, label :: Symbol, param :: Symbol, body) :: String:
+  let b = Block()
+  let result = expr(b, body, param, prefix)
+  "  llvm.func internal @" ++ prefix +& label ++ "(%self: i64, %arg: i64) -> i64 {\n"
+    ++ b.text() ++ "\n    llvm.return " ++ result ++ " : i64\n  }"
+
+// The entry point starts the heap over, then computes the program's main expression.
+fun emit_entry(name :: String, prefix :: String, main) :: String:
+  let b = Block()
+  b.add("%top_at = llvm.mlir.addressof @lambda_top : !llvm.ptr")
+  b.add("%zero = llvm.mlir.constant(0 : i64) : i64")
+  b.add("llvm.store %zero, %top_at : i64, !llvm.ptr")
+  let result = expr(b, main, #false, prefix)
+  "  llvm.func @" ++ name ++ "() -> i64 {\n" ++ b.text() ++ "\n    llvm.return " ++ result ++ " : i64\n  }"
+
+// One module holding each program, given as [[entry name, converted program], ...]: each program's code
+// blocks are named with its entry's name before them, and its entry point is a function of no
+// arguments that returns its answer.
+fun emit_module(programs :: List) :: String:
+  let parts:
+    for List (named in programs):
+      let [name :: String, program] = named
+      let prefix = name ++ "_"
+      match program
+      | PairList[#'program, item, ...]:
+          let items = [item, ...]
+          let codes:
+            for List (code in items.take(items.length() - 1)):
+              match code
+              | PairList[#'code, label :: Symbol, param :: Symbol, body]: emit_code(prefix, label, param, body)
+          String.join(codes.add(emit_entry(name, prefix, items.last)), "\n")
+  "module {\n" ++ prelude ++ "\n" ++ String.join(parts, "\n") ++ "\n}\n"

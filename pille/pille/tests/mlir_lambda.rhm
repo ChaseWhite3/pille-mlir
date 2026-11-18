@@ -1,0 +1,94 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/llvm
+  pille/mlir
+  pille/private/util/defer open
+  "lambda/model.rkt" as model
+  "lambda/emit.rhm" open
+
+// Lambdas through MLIR, with Redex as their specification (SYNTHETIC).
+//
+// MLIR has function values but no closures: a lambda that captures a variable is compiled by closure
+// conversion into code blocks and records on a heap, as an assembly program would have it.
+// lambda/model.rkt gives the source language and the converted one each a reduction relation in
+// Redex, and checks that conversion keeps a program's answer. lambda/emit.rhm writes a converted
+// program as MLIR in the LLVM dialect. Here each program is verified and turned into bitcode by
+// pille/mlir, compiled and run by Pille's ORC JIT, and its answer held to the model's.
+
+//======================================================================
+// The model: conversion keeps each program's answer
+
+// [name, term, answer] for each example; a term is the model's, a Racket list
+def examples :: List:
+  for List (ex in (model.examples :~ PairList)):
+    let PairList[name, term, expected] = ex
+    [name, term, expected]
+
+// the examples come to what they say, in the source and converted
+check:
+  for List ([name, term, expected] in examples):
+    [name, model.answer_of_source(term), model.answer_of_converted(model.convert(term))]
+  ~is for List ([name, term, expected] in examples): [name, expected, expected]
+
+// and so do random programs: from the grammar (a number, a procedure, or stuck) and from a type
+// judgment (a number, through variables captured)
+check model.conversion_holds(300) ~is #true
+
+//======================================================================
+// MLIR: each program verified, compiled and run
+
+// [name, term, answer] for each example, and for random programs that capture a variable
+def programs :: List:
+  examples
+    ++ (for List (r in (model.random_programs(24) :~ PairList), i in 0 ..):
+          let PairList[term, answer] = r
+          ["random " +& i, term, answer])
+
+// one module: each program's code blocks, and an entry point of no arguments named entry_N
+def module_text :: String:
+  emit_module(for List ([_, term, _] in programs, i in 0 ..): ["entry_" +& i, model.convert(term)])
+
+// verified by MLIR, and already in the LLVM dialect: nothing to lower but the module itself
+def bitcode = mlir.Module(module_text).to_bitcode()
+
+llvm.initialize_all_target_infos()
+llvm.initialize_all_targets()
+llvm.initialize_all_target_mcs()
+llvm.initialize_all_asm_printers()
+
+def object_code:
+  let context = llvm.Context()
+  defer context.dispose()
+  let module = llvm.Module.from_bitcode(context, bitcode)!!
+  defer module.dispose()
+  module.verify()
+  let target = llvm.Target.for_triple(llvm.Target.host_triple)!!
+  let machine = target.create_target_machine(
+    ~triple: llvm.Target.host_triple,
+    ~cpu: llvm.Target.host_cpu,
+    ~features: llvm.Target.host_features,
+    ~reloc_mode: llvm.RelocMode.pic,
+  )!!
+  defer machine.dispose()
+  let layout = machine.create_data_layout()
+  defer layout.dispose()
+  module.data_layout := layout
+  module.compile(machine)
+
+block:
+  let jit = llvm.orc.Lljit()
+  defer jit.dispose()
+  jit.add_object_file(object_code)
+  fun run(i :: Int) :: Int:
+    let entry = cast (() -> int64_t) cpointer_to_ptr(jit.lookup("entry_" +& i))
+    entry()
+  // the machine's answer is the model's, for each example and each random program
+  check:
+    for List ([name, _, _] in programs, i in 0 ..): [name, run(i)]
+    ~is for List ([name, _, answer] in programs): [name, answer]
+  // and the same again: each entry point starts its heap over
+  check:
+    for List (_ in programs, i in 0 ..): run(i)
+    ~is for List ([_, _, answer] in programs): answer

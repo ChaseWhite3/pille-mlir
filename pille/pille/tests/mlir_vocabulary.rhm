@@ -1,0 +1,129 @@
+#lang rhombus/static/and_meta
+
+import:
+  pille/hosted open
+  "vocabulary/mlir.rhm" open
+
+// A second vocabulary for Pille's expressions (a PROTOTYPE, vocabulary/mlir.rhm): each program here is
+// written once and read twice, by Pille's own vocabulary (pille_expr, lowered to LLVM) and by the MLIR
+// vocabulary (mlir_expr, lowered to MLIR's arith, scf and func dialects). Both run, and give the same
+// answers. The inputs stay clear of overflow, which Pille's default policy checks and the MLIR
+// vocabulary does not.
+
+// `both name(x :: T, ...): body` defines name_pille, which runs body in Pille, and name_mlir, which
+// runs the same body in the MLIR vocabulary.
+defn.macro 'both $(name :: Identifier)($(arg :: Identifier) :: $(ty :: Group), ...): $(body :: Group)':
+  let in_pille = Syntax.make_id(to_string(name.unwrap()) ++ "_pille", name)
+  let in_mlir = Syntax.make_id(to_string(name.unwrap()) ++ "_mlir", name)
+  'fun $in_pille($arg, ...):
+     pille($arg :: $ty, ...):
+       $body
+   mlir_fun $in_mlir($arg :: $ty, ...):
+     $body'
+
+// what each vocabulary gives for the same inputs
+fun answers(pille_version :: Function, mlir_version :: MlirFunction, inputs :: List) :: List:
+  for List (args :: List in inputs):
+    [args, pille_version(& args), mlir_version.call(args)]
+fun agreeing(inputs :: List, answers :: List) :: Boolean:
+  for all ([_, a, b] in answers): a == b
+
+def pairs :: List:
+  for List:
+    each x in [-7, -1, 0, 1, 2, 9, 100, 1000]
+    each y in [-3, 0, 5, 42]
+    [x, y]
+
+//==============================================================================
+// Arithmetic, with literals: the literal takes the arguments' type
+
+both poly(x :: Int(32), y :: Int(32)):
+  3 * x * x + 2 * y + 1
+
+check:
+  answers(poly_pille, poly_mlir, pairs)
+  ~is for List ([x, y] in pairs): [[x, y], 3*x*x + 2*y + 1, 3*x*x + 2*y + 1]
+
+//==============================================================================
+// `if` and a comparison, nested, with literal branches unified with Int(32)
+
+both clamp(x :: Int(32)):
+  if x < 0
+  | 0
+  | if 100 < x
+    | 100
+    | x
+
+check:
+  answers(clamp_pille, clamp_mlir, for List ([x, _] in pairs): [x])
+  ~is for List ([x, _] in pairs): [[x], math.max(0, math.min(100, x)), math.max(0, math.min(100, x))]
+
+both larger(x :: Int(32), y :: Int(32)):
+  if x < y
+  | y
+  | x
+
+check:
+  answers(larger_pille, larger_mlir, pairs)
+  ~is for List ([x, y] in pairs): [[x, y], math.max(x, y), math.max(x, y)]
+
+both same(x :: Int(32), y :: Int(32)):
+  if x == y
+  | 1
+  | 0
+
+check:
+  answers(same_pille, same_mlir, [[1, 1], [1, 2], [-3, -3]])
+  ~is [[[1, 1], 1, 1], [[1, 2], 0, 0], [[-3, -3], 1, 1]]
+
+//==============================================================================
+// Pille's unification: widths widen, signed with unsigned is signed and one wider
+
+// Int(8) with Int(32) is Int(32): the narrower is sign-extended
+both widen(a :: Int(8), b :: Int(32)):
+  a + b
+
+// UInt(8) with Int(8) is Int(9): an odd width, which MLIR's integers take as they are
+both mixed(u :: UInt(8), i :: Int(8)):
+  u + i
+
+check:
+  answers(widen_pille, widen_mlir, [[-128, 1000], [127, -5], [-1, 0]])
+  ~is [[[-128, 1000], 872, 872], [[127, -5], 122, 122], [[-1, 0], -1, -1]]
+check:
+  answers(mixed_pille, mixed_mlir, [[255, -128], [200, 50], [0, -1]])
+  ~is [[[255, -128], 127, 127], [[200, 50], 250, 250], [[0, -1], -1, -1]]
+
+// where they differ: 200 + 100 does not fit Int(9). Pille's default policy panics; the MLIR vocabulary
+// has no policies, and arith.addi wraps (300 - 512)
+check mixed_pille(200, 100) ~throws "integer overflow"
+check mixed_mlir.call([200, 100]) ~is -212
+
+//==============================================================================
+// Compile-time values fold, in both: the test is known, so only one branch is built
+
+both folded(x :: Int(32)):
+  if 1 < 2
+  | x + (2 * 3)
+  | x * 1000
+
+check:
+  answers(folded_pille, folded_mlir, [[1], [36]])
+  ~is [[[1], 7, 7], [[36], 42, 42]]
+check folded_mlir.mlir().contains("scf.if") ~is #false
+check folded_mlir.mlir().contains("arith.muli") ~is #false
+
+// the MLIR of an `if` that is not folded
+check clamp_mlir.mlir().contains("scf.if") ~is #true
+check clamp_mlir.mlir().contains("arith.cmpi slt") ~is #true
+
+//==============================================================================
+// A test that is not a Boolean fails to concretize, in both
+
+both not_boolean(x :: Int(32)):
+  if x
+  | 1
+  | 2
+
+check not_boolean_pille(1) ~throws "Boolean"
+check not_boolean_mlir.call([1]) ~throws "not a Boolean"

@@ -1,0 +1,390 @@
+#lang rhombus/static/and_meta
+
+import:
+  ffi open
+  pille/llvm
+  pille/mlir
+  pille/hosted as hosted
+  pille/concretize open
+  pille/private/kernel/core_types open
+  pille/private/kernel/unify.eval_unify
+  pille/private/runtime/compiler open
+  pille/private/runtime/ub_policy open
+  pille/private/util/defer open
+  rhombus/delay open
+
+export:
+  mlir_expr
+  mlir_fun
+  MlirFunction
+
+// A second vocabulary for a few of Pille's expression forms (a PROTOTYPE): the same source text Pille
+// lowers to LLVM, read instead into MLIR's arith, scf and func dialects.
+//
+// In the terms of Culpepper, Felleisen, Flatt and Krishnamurthi, "From Macros to DSLs" (SNAPL 2019),
+// each form below is a micro and this space is its vocabulary:
+//
+//   vocabulary            the space mlir_expr, beside Pille's pille_expr; a name such as `if` is bound
+//                         in each, separately
+//   define-micro          mlir_expr.macro; its expansion is a builder, as each pille_expr macro's is
+//   Output                MExpr: a Pille Type, and an emitter of MLIR
+//   dispatch              a subterm parsed in this space (mlir_expr_meta.Parsed), its builder called
+//   inherited attribute   what the emitter is given: the block it writes into and the type wanted
+//   extend-vocabulary     importing the space's bindings, one at a time, as any module's
+//
+// The type side is Pille's own: its Type values, `eval_unify` (which widens: Int(8) with Int(32) is
+// Int(32), a literal 1000 with Int(8) is Int(11)), and folding where a value is known at compile time,
+// as `concretize_if` folds an `if` whose test is. Only the emitting is new. Its coercions are the
+// widenings unification produces, as sign or zero extension.
+//
+// Not covered: Pille's undefined-behavior policies (arith.addi and arith.muli wrap where Pille's
+// default policy panics on overflow), floats, mutation, loops, calls, and any form not defined here.
+
+//==============================================================================
+// The space
+
+space.enforest mlir_expr:
+  space_path pille/tests/vocabulary/mlir_expr
+  macro_definer macro
+  meta_namespace mlir_expr_meta:
+    reflection space
+    description "MLIR-vocabulary expression"
+    operator_description "MLIR-vocabulary operator"
+
+    parse_syntax_class Parsed
+    parse_prefix_more_syntax_class AfterPrefixParsed
+    parse_infix_more_syntax_class AfterInfixParsed
+
+    identifier_parser parse_name
+
+    fun parse_name(nm):
+      syntax_meta.error("not bound in the MLIR vocabulary", nm)
+
+    private parsed_packer _pack
+    private parsed_unpacker _unpack
+
+    // A Rhombus expression that builds an MExpr, as a parsed term of this space; and back.
+    export fun pack(rhm_expr :: Group):
+      _pack(expr_meta.pack_expr(rhm_expr)).relocate_span([rhm_expr])
+
+    export fun unpack(parsed) :~ Term:
+      _unpack(parsed)
+
+  export:
+    build
+
+  // An expression of this space, as the Rhombus expression that builds its MExpr.
+  expr.macro 'build($(e :: mlir_expr_meta.Parsed))':
+    mlir_expr_meta.unpack(e)
+
+//==============================================================================
+// What a micro gives
+
+// `emit(block, wanted)` writes the expression's MLIR into `block` and gives the SSA name of its value
+// as a value of the type `wanted`, which is the expression's own type or one unification widened it to.
+class MExpr(type :: Type, emit :: Function.of_arity(2))
+
+// SSA lines, with names fresh across the regions of one function.
+class Block(mutable lines :: List, counter :: Box):
+  constructor ():
+    super([], Box(0))
+  method fresh() :: String:
+    let n :: Int = counter.value
+    counter.value := n + 1
+    "%v" +& n
+  method add(line :: String):
+    lines := lines.add(line)
+  // the lines `body` adds, taken out of this block, for a region
+  method region(body :: Function) :: List:
+    let outer = lines
+    lines := []
+    body()
+    let inner = lines
+    lines := outer
+    inner
+  method text(indent :: String) :: String:
+    String.join(for List (l in lines): indent ++ l, "\n")
+
+fun is_int(t) :: Boolean: t is_a IntType || t is_a UIntType
+fun width(t) :: Int:
+  match t
+  | i :: IntType: i.width
+  | u :: UIntType: u.width
+fun mlir_type(t :: Type) :: String:
+  cond
+  | is_int(t): "i" +& width(t)
+  | t is_a BooleanType: "i1"
+  | ~else: error(~exn: Exn.Fail.Concretize, "no MLIR type for this Pille type", error.val(~label: "type", t))
+
+fun refuse(message :: String, & vals):
+  error(~exn: Exn.Fail.Concretize, message, & vals)
+
+// A value of type `from`, named `v`, as a value of type `to`: the widenings unification gives.
+fun coerced(b :: Block, v :: String, from :: Type, to :: Type) :: String:
+  cond
+  | from === to: v
+  | is_int(from) && is_int(to) && width(to) > width(from) && (from is_a UIntType || to is_a IntType):
+      let r = b.fresh()
+      let op = if from is_a UIntType | "arith.extui" | "arith.extsi"
+      b.add(r ++ " = " ++ op ++ " " ++ v ++ " : " ++ mlir_type(from) ++ " to " ++ mlir_type(to))
+      r
+  | ~else:
+      refuse("no MLIR coercion between these types", error.val(~label: "from", from), error.val(~label: "to", to))
+
+// A value known at compile time, emitted where it is wanted at a type.
+fun constant(value) :: MExpr:
+  MExpr(SpeclType(value),
+        fun (b :: Block, wanted :: Type):
+          let r = b.fresh()
+          match value
+          | n :: Int when is_int(wanted):
+              b.add(r ++ " = arith.constant " +& n +& " : " ++ mlir_type(wanted))
+          | flag :: Boolean when wanted is_a BooleanType:
+              b.add(r ++ " = arith.constant " ++ (if flag | "true" | "false"))
+          | ~else:
+              refuse("a compile-time value is wanted at a type it has no MLIR value of",
+                     error.val(~label: "value", value), error.val(~label: "type", wanted))
+          r)
+
+// An expression with a type of its own, whose `produce(b)` gives its value at that type.
+fun typed(type :: Type, produce :: Function.of_arity(1)) :: MExpr:
+  MExpr(type, fun (b :: Block, wanted :: Type): coerced(b, produce(b), type, wanted))
+
+// the value of an expression known at compile time, or #false; an integer's only, so that #false is
+// never mistaken for a known Boolean
+fun specl_int(e :: MExpr):
+  match e.type
+  | s :: SpeclType when s.value is_a Int: s.value
+  | ~else: #false
+
+//==============================================================================
+// The micros
+
+export mlir_expr.macro
+| '#%literal $(lit :: Int)':
+    mlir_expr_meta.pack('constant($lit)')
+| '#%literal $(lit :: Boolean)':
+    mlir_expr_meta.pack('constant($lit)')
+
+export mlir_expr.macro '#%parens($(e :: mlir_expr_meta.Parsed))':
+  e
+
+// An arithmetic operator: compile-time values fold; otherwise the operands are unified, as Pille does,
+// and the operation is done at the unified type.
+fun arith(op :: String, fold :: Function, l :: MExpr, r :: MExpr) :: MExpr:
+  match [specl_int(l), specl_int(r)]
+  | [a :: Int, c :: Int]: constant(fold(a, c))
+  | ~else:
+      let t = eval_unify([l.type, r.type])
+      unless is_int(t) | refuse("not an integer type", error.val(~label: "type", t))
+      typed(t, fun (b :: Block):
+                 let x = l.emit(b, t)
+                 let y = r.emit(b, t)
+                 let v = b.fresh()
+                 b.add(v ++ " = " ++ op ++ " " ++ x ++ ", " ++ y ++ " : " ++ mlir_type(t))
+                 v)
+
+fun compare(signed :: String, unsigned :: String, fold :: Function, l :: MExpr, r :: MExpr) :: MExpr:
+  match [specl_int(l), specl_int(r)]
+  | [a :: Int, c :: Int]: constant(fold(a, c))
+  | ~else:
+      let t = eval_unify([l.type, r.type])
+      unless is_int(t) | refuse("not an integer type", error.val(~label: "type", t))
+      typed(BooleanType(),
+            fun (b :: Block):
+              let x = l.emit(b, t)
+              let y = r.emit(b, t)
+              let v = b.fresh()
+              let pred = if t is_a UIntType | unsigned | signed
+              b.add(v ++ " = arith.cmpi " ++ pred ++ ", " ++ x ++ ", " ++ y ++ " : " ++ mlir_type(t))
+              v)
+
+fun add_of(l, r): arith("arith.addi", fun (a :: Int, c :: Int): a + c, l, r)
+fun mul_of(l, r): arith("arith.muli", fun (a :: Int, c :: Int): a * c, l, r)
+fun less_of(l, r): compare("slt", "ult", fun (a :: Int, c :: Int): a < c, l, r)
+fun equal_of(l, r): compare("eq", "eq", fun (a :: Int, c :: Int): a == c, l, r)
+
+export mlir_expr.macro '$l * $r':
+  ~stronger_than: + < ==
+  ~associativity: ~left
+  mlir_expr_meta.pack('mul_of(mlir_expr.build($l), mlir_expr.build($r))')
+
+export mlir_expr.macro '$l + $r':
+  ~stronger_than: < ==
+  ~associativity: ~left
+  mlir_expr_meta.pack('add_of(mlir_expr.build($l), mlir_expr.build($r))')
+
+export mlir_expr.macro '$l < $r':
+  ~associativity: ~none
+  mlir_expr_meta.pack('less_of(mlir_expr.build($l), mlir_expr.build($r))')
+
+export mlir_expr.macro '$l == $r':
+  ~associativity: ~none
+  mlir_expr_meta.pack('equal_of(mlir_expr.build($l), mlir_expr.build($r))')
+
+// As Pille's `concretize_if`: a test known at compile time chooses its branch, and only that branch is
+// built; otherwise the test must be a Boolean and the branches' types are unified.
+fun if_of(test :: MExpr, then_k :: Function, else_k :: Function) :: MExpr:
+  match test.type
+  | s :: SpeclType when s.value is_a Boolean:
+      if s.value
+      | then_k()
+      | else_k()
+  | ~else:
+      unless test.type is_a BooleanType
+      | refuse("the test of an `if` is not a Boolean", error.val(~label: "type", test.type))
+      let th :~ MExpr = then_k()
+      let el :~ MExpr = else_k()
+      let t = eval_unify([th.type, el.type])
+      typed(t, fun (b :: Block):
+                 let c = test.emit(b, BooleanType())
+                 let v = b.fresh()
+                 let ty = mlir_type(t)
+                 let then_lines = b.region(fun (): b.add("scf.yield " ++ th.emit(b, t) ++ " : " ++ ty))
+                 let else_lines = b.region(fun (): b.add("scf.yield " ++ el.emit(b, t) ++ " : " ++ ty))
+                 b.add(v ++ " = scf.if " ++ c ++ " -> (" ++ ty ++ ") {")
+                 for (l in then_lines): b.add("  " ++ l)
+                 b.add("} else {")
+                 for (l in else_lines): b.add("  " ++ l)
+                 b.add("}")
+                 v)
+
+export mlir_expr.macro 'if $(test :: mlir_expr_meta.Parsed)
+                        | $(then_e :: mlir_expr_meta.Parsed)
+                        | $(else_e :: mlir_expr_meta.Parsed)':
+  mlir_expr_meta.pack('if_of(mlir_expr.build($test), fun (): mlir_expr.build($then_e), fun (): mlir_expr.build($else_e))')
+
+//==============================================================================
+// Functions
+
+meta fun type_expr(stx):
+  match stx
+  | 'Int($(w :: Int))': 'IntType($w)'
+  | 'UInt($(w :: Int))': 'UIntType($w)'
+  | ~else: syntax_meta.error("the MLIR vocabulary takes Int(N) and UInt(N) arguments", stx)
+
+// `mlir_fun name(x :: Int(32), ...): body` defines `name` as an MlirFunction. Its body is built (Pille's
+// concretization: types unified, compile-time values folded) and lowered to MLIR the first time it is
+// called, and compiled through pille/mlir and Pille's ORC JIT.
+export defn.macro 'mlir_fun $(name :: Identifier)($(arg :: Identifier) :: $(ty :: Group), ...):
+                     $(body :: Group)':
+  // the body is parsed in the space only where the arguments are bound in it, below
+  let [ref, ...] = for List (a in [arg, ...]): Syntax.make_temp_id(a)
+  let [type, ...] = for List (t in [ty, ...]): type_expr(t)
+  let [index, ...] = for List (i in 0 .. [arg, ...].length()): i
+  'def $name = MlirFunction(
+     #'$name,
+     fun ():
+       let $ref = parameter($index, $type)
+       ...
+       let types = [$type, ...]
+       [types,
+        block:
+          mlir_expr.macro '$arg': '$(mlir_expr_meta.pack(ref))'
+          ...
+          mlir_expr.build($body)])'
+
+// The function's argument as an MExpr: the i64 the function is called with, narrowed to its type.
+fun parameter(index :: Int, type :: Type) :: MExpr:
+  typed(type, fun (_): "%p" +& index)
+
+class MlirFunction(name :: Symbol, concretize :: Function, mutable compiled :: maybe(Function), mutable text :: maybe(String)):
+  constructor (name, concretize):
+    super(name, concretize, #false, #false)
+
+  // The MLIR for the function: arguments and result as i64 at the C ABI, narrowed and widened inside.
+  method mlir() :: String:
+    unless text | compile()
+    text!!
+
+  method compile() :: Void:
+    parameterize { Compiler.current: the_compiler.force() }:
+      let [types :~ List, body :~ MExpr] = concretize()
+      let result_type :: Type:
+        match body.type
+        | s :: SpeclType:
+            unless s.value is_a Int | refuse("the function's result is not an integer", error.val(~label: "value", s.value))
+            IntType(64)
+        | t: t
+      unless is_int(result_type) && width(result_type) <= 64
+      | refuse("the function's result is not an integer of 64 bits or fewer", error.val(~label: "type", result_type))
+      let b = Block()
+      for (t :~ Type in types, i in 0 ..):
+        if width(t) == 64
+        | b.add("%p" +& i ++ " = arith.addi %a" +& i ++ ", %zero : i64")
+        | b.add("%p" +& i ++ " = arith.trunci %a" +& i ++ " : i64 to " ++ mlir_type(t))
+      let v = body.emit(b, result_type)
+      let out:
+        if width(result_type) == 64
+        | v
+        | let w = b.fresh()
+          let op = if result_type is_a UIntType | "arith.extui" | "arith.extsi"
+          b.add(w ++ " = " ++ op ++ " " ++ v ++ " : " ++ mlir_type(result_type) ++ " to i64")
+          w
+      let params = String.join(for List (i in 0 .. types.length()): "%a" +& i ++ ": i64", ", ")
+      text := ("module {\n  func.func @" +& name ++ "(" ++ params ++ ") -> i64 {\n"
+                 ++ "    %zero = arith.constant 0 : i64\n"
+                 ++ b.text("    ") ++ "\n    return " ++ out ++ " : i64\n  }\n}\n")
+      compiled := jit_compiled(to_string(name), text!!, types.length(),
+                               result_type is_a UIntType)
+
+  method call(args :: List) :: Int:
+    unless compiled | compile()
+    (compiled!!)(args)
+
+def the_compiler:
+  delay:
+    Compiler(~code_gen_opt_level: llvm.CodeGenOptLevel.aggressive,
+             ~code_model: llvm.CodeModel.jit_default,
+             ~ub_policy: UbPolicy.from_env.force(),
+             ~using_hosted_execution: #true)
+
+//==============================================================================
+// Running: pille/mlir verifies and lowers, Pille's LLVM bindings compile, ORC runs (as tests/mlir.rhm)
+
+def pipeline = "builtin.module(convert-scf-to-cf,convert-arith-to-llvm,convert-cf-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)"
+
+def targets_ready:
+  delay:
+    llvm.initialize_all_target_infos()
+    llvm.initialize_all_targets()
+    llvm.initialize_all_target_mcs()
+    llvm.initialize_all_asm_printers()
+
+fun jit_compiled(name :: String, text :: String, arity :: Int, unsigned :: Boolean) :: Function:
+  targets_ready.force()
+  let bitcode = mlir.Module(text).run_passes(pipeline).to_bitcode()
+  let object_code:
+    let context = llvm.Context()
+    defer context.dispose()
+    let module = llvm.Module.from_bitcode(context, bitcode)!!
+    defer module.dispose()
+    module.verify()
+    let target = llvm.Target.for_triple(llvm.Target.host_triple)!!
+    let machine = target.create_target_machine(
+      ~triple: llvm.Target.host_triple,
+      ~cpu: llvm.Target.host_cpu,
+      ~features: llvm.Target.host_features,
+      ~reloc_mode: llvm.RelocMode.pic,
+    )!!
+    defer machine.dispose()
+    let layout = machine.create_data_layout()
+    defer layout.dispose()
+    module.data_layout := layout
+    module.compile(machine)
+  // kept for the life of the function: its code lives in it
+  let jit = llvm.orc.Lljit()
+  jit.add_object_file(object_code)
+  let address = cpointer_to_ptr(jit.lookup(name))
+  fun read(n :: Int) :: Int:
+    if unsigned && n < 0 | n + 2 ** 64 | n
+  match arity
+  | 0: let f = cast (() -> int64_t) address
+       fun (args :: List): read(f())
+  | 1: let f = cast ((int64_t) -> int64_t) address
+       fun (args :: List): read(f(args[0]))
+  | 2: let f = cast ((int64_t, int64_t) -> int64_t) address
+       fun (args :: List): read(f(args[0], args[1]))
+  | 3: let f = cast ((int64_t, int64_t, int64_t) -> int64_t) address
+       fun (args :: List): read(f(args[0], args[1], args[2]))
+  | ~else: refuse("the prototype calls functions of at most three arguments")

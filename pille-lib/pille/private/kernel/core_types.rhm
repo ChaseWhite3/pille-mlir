@@ -136,10 +136,12 @@ export class IntType(width :: PosInt):
           lowering.builder().create_store(~alignment: 1, val, ptr),
       ~read_from_rhombus:
         fun(frame, offset):
-          let unsigned = read_rhombus_int_bytes(frame, offset, num_bytes)
+          // Only the low `width` bits are the value: an Int(9) is kept in two bytes, and its sign is
+          // bit 8, not bit 15.
+          let unsigned = read_rhombus_int_bytes(frame, offset, num_bytes) bits.and (2**width - 1)
           cond
-          | unsigned bits.(?) (num_bytes*8 - 1):
-              unsigned bits.or (-1 bits.(<<) (num_bytes*8))
+          | unsigned bits.(?) (width - 1):
+              unsigned - 2**width
           | ~else:
               unsigned)
 
@@ -176,7 +178,8 @@ export class UIntType(width :: PosInt):
           lowering.builder().create_store(~alignment: 1, val, ptr),
       ~read_from_rhombus:
         fun(frame, offset):
-          read_rhombus_int_bytes(frame, offset, num_bytes))
+          // only the low `width` bits are the value
+          read_rhombus_int_bytes(frame, offset, num_bytes) bits.and max_val)
 
   private implements Printable
   private override describe(_, rec):

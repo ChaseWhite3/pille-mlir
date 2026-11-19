@@ -26,6 +26,23 @@ check dynamic_bit_width(8, 42) ~is 42
 check dynamic_bit_width(16, 42) ~is 42
 check dynamic_bit_width(4, 42) ~throws "argument does not satisfy annotation"
 
+// a width that is not a whole number of bytes: the value is the low bits, its sign the top one of them
+check dynamic_bit_width(9, -1) ~is -1
+check dynamic_bit_width(9, -256) ~is -256
+check dynamic_bit_width(9, 255) ~is 255
+check dynamic_bit_width(12, -2048) ~is -2048
+
+fun dynamic_unsigned_width(width :: PosInt, val :: Int):
+  pille(specl width, val :: UInt(width)): val
+
+check dynamic_unsigned_width(9, 511) ~is 511
+check dynamic_unsigned_width(12, 4095) ~is 4095
+
+// UInt(8) with Int(8) is Int(9), and a sum that is negative comes back negative
+check:
+  pille(u :: UInt(8) = 0, i :: Int(8) = -1): u + i
+  ~is -1
+
 check:
   pille(x :: Int(32) = 41, y :: Int(32) = 1): x + y
   ~is 42

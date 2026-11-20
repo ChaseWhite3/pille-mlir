@@ -1,0 +1,48 @@
+name: Test
+
+# Pille's test suites on every push and pull request. Pille tracks unreleased Racket and Rhombus changes
+# (README.md), so this runs on the current Racket snapshot, with Rhombus from the snapshot's catalog, and on
+# Homebrew's LLVM 23, which includes the LLVM shared library and the MLIR tools.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      PILLE_UB_POLICY: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LLVM 23 and Z3
+        run: |
+          brew install llvm@23 z3
+          echo "PILLE_LLVM_PREFIX=$(brew --prefix llvm@23)" >> "$GITHUB_ENV"
+          echo "PILLE_MLIR_PREFIX=$(brew --prefix llvm@23)" >> "$GITHUB_ENV"
+
+      # Northwestern's snapshot site: the Utah site's catalog sends some packages to a host that times out
+      # (seen 2026-11-20)
+      - name: Racket snapshot
+        uses: Bogdanp/setup-racket@v1.11
+        with:
+          version: current
+          distribution: minimal
+          variant: CS
+          architecture: arm64
+          snapshot_site: northwestern
+
+      - name: Package catalogs
+        run: raco pkg config --set catalogs https://plt.cs.northwestern.edu/snapshots/current/catalog/ https://pkgs.racket-lang.org
+
+      - name: Install Pille's packages
+        run: raco pkg install --auto --batch --no-docs pille-llvm-lib/ pille-lib/ pille-spmd-lib/ pille-mlir-lib/ pille/
+
+      - name: Pille's tests
+        run: raco test --jobs 3 pille/pille/tests
+
+      - name: pille/mlir's tests
+        run: raco test --jobs 3 pille-mlir-lib/pille/mlir/tests

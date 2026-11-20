@@ -16,6 +16,7 @@
          solver-result
          run_solver
          run_solver_core
+         run_solver_objective
          core-options
          parse-core
          (rename-out [solver-result? is_solver_result]
@@ -38,6 +39,9 @@
 ;;                                   set of them, as the solver reported it
 ;;   'feasible                       a feasibility check found them satisfiable
 ;;                                   (internal: never a query's answer)
+;;   'optimum                        an objective's best value was found; values
+;;                                   is then the objective's symbol first, and
+;;                                   the inputs that reach it
 ;; values is a list of (name width value) and is only non-empty for 'sat.
 ;; Only 'unsat means that no counterexample exists.
 (struct solver-result (status values diagnostics command seconds) #:transparent)
@@ -380,4 +384,50 @@
             => (lambda (names) (result 'infeasible names))]
            [else
             (result 'malformed-response '() "the solver answered unsat, but its unsat core was malformed" stdout stderr)]))
+       (lambda () (delete-directory/files directory #:must-exist? #f)))]))
+
+;; Runs an objective script: assertions, (minimize s) or (maximize s),
+;; (check-sat), (get-value (s input ...)). `expected` is (name . width) for the
+;; symbol and then each input. Status 'optimum carries their values; 'unsat
+;; means no input satisfies the assertions (the value request then fails, which
+;; is not an error here).
+(define (run_solver_objective smtlib expected [executable #f] [timeout 10] [arguments '()])
+  (unless (string? smtlib) (raise-argument-error 'run_solver_objective "string?" smtlib))
+  (define extra (text-list 'run_solver_objective arguments))
+  (define started (current-inexact-milliseconds))
+  (define deadline (+ started (* 1000.0 timeout)))
+  (define-values (solver missing) (find-solver executable))
+  (define command
+    (append (list (if solver (path->string solver) (or (and executable (format "~a" executable)) "z3")))
+            extra (list "<objective.smt2>")))
+  (define (result status values . notes)
+    (solver-result status values
+                   (string->immutable-string (string-join (filter non-empty-string? notes) "\n"))
+                   command
+                   (/ (- (current-inexact-milliseconds) started) 1000.0)))
+  (cond
+    [(not solver) (result 'missing-executable '() missing)]
+    [else
+     (define directory (make-work-directory "pille-smt-~a"))
+     (dynamic-wind
+       void
+       (lambda ()
+         (define-values (state code stdout stderr)
+           (run-script solver extra directory "objective" smtlib deadline))
+         (define forms
+           (with-handlers ([exn:fail? (lambda (_error) #f)]) (map car (smtlib-commands stdout))))
+         (cond
+           [(eq? state 'failed) (result 'missing-executable '() (format "cannot run the solver: ~a" stderr))]
+           [(eq? state 'timeout)
+            (result 'timeout '() (format "the solver did not answer within ~a seconds and was terminated" timeout))]
+           [(not (and forms (pair? forms)))
+            (result 'malformed-response '() "expected sat, unsat, or unknown from the objective" stdout stderr)]
+           [(equal? (car forms) "unsat") (result 'unsat '())]
+           [(equal? (car forms) "unknown") (result 'unknown '() stdout)]
+           [(and (equal? (car forms) "sat") (pair? (cdr forms)))
+            (define-values (assignments reason) (parse-model (cadr forms) expected))
+            (if assignments
+                (result 'optimum assignments)
+                (result 'bad-model '() (format "the solver answered sat, but ~a" reason) stdout stderr))]
+           [else (result 'malformed-response '() "the solver answered sat without the objective's value" stdout stderr)]))
        (lambda () (delete-directory/files directory #:must-exist? #f)))]))

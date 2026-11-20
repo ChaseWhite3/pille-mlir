@@ -17,6 +17,7 @@
 (provide smt_input smt_result smt_result_at smt_const smt_binary smt_ite
          smt_eq smt_cmp smt_no_overflow smt_not smt_and smt_or
          smt_named
+         make_smt_objective objective_check objective_inputs objective_assumptions objective_value
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -30,6 +31,15 @@
                      [named? is_named]
                      [query-feasibility query_feasibility]
                      [query? is_query]
+                     [objective? is_objective]
+                     [get-objective-module objective_module]
+                     [objective-smtlib objective_smtlib]
+                     [objective-feasibility objective_feasibility]
+                     [objective-function objective_function]
+                     [objective-dialect objective_dialect]
+                     [objective-direction objective_direction]
+                     [objective-term objective_term]
+                     [objective-signed? objective_signed]
                      [get-query-module query_module]
                      [query-smtlib query_smtlib]
                      [query-function query_function]
@@ -79,6 +89,12 @@
 (struct values-batch (module smtlib queries))
 (struct values-query (module smtlib dialect function inputs preconditions result-name result-width defined-name))
 
+;; The least or greatest value of `term` over the inputs that satisfy the
+;; preconditions. `symbol` is the SMT-LIB constant the term is bound to.
+(struct objective (module smtlib dialect function inputs preconditions term direction signed? symbol
+                          feasibility))
+
+(define (get-objective-module value) (objective-module value))
 (define (get-query-module value) (force (query-module value)))
 (define (get-values-query-module value) (force (values-query-module value)))
 (define (get-batch-module value)
@@ -361,12 +377,14 @@
   (let loop ([name initial])
     (if (member name names) (loop (string-append name "_")) name)))
 
-(define (spec-manifest value)
+(define (spec-manifest value [also '()])
   (define-values (function declared property given) (spec-fields value))
   (define-values (_declared assumptions) (validate-inputs function declared given))
   (when (spec? value) (check-formula 'smt_query property))
+  ;; `also`: terms the query uses beside its property and preconditions
   (define references (remove-duplicates (append-map result-widths
-                                                   (if property (cons property assumptions) assumptions))))
+                                                   (append also
+                                                           (if property (cons property assumptions) assumptions)))))
   (define widths (for/list ([reference (in-list references)] #:unless (car reference)) (cdr reference)))
   (when (> (length widths) 1)
     (builder-error 'smt_query "the result is referenced with conflicting widths: ~a"
@@ -554,6 +572,88 @@
          (query member-module named (dialect_name dialect) function inputs property assumptions
                 feasibility feasibility-body)])))
   ((if values? values-batch batch) verified text queries))
+
+;; An objective is lowered as a query of its own mode: the preconditions, then
+;; the term bound to a fresh symbol. The dialect has no objective, so Z3's
+;; (minimize s) or (maximize s) is written into the exported SMT-LIB before
+;; its (check-sat), and (get-value ...) after it, in place of the exporter's
+;; closing (reset).
+(define (make_smt_objective dialect module function inputs term direction signed? preconditions)
+  (check-context 'smt_objective dialect module)
+  (unless (term? term) (raise-argument-error 'smt_objective "term" term))
+  (unless (memq direction '(minimize maximize))
+    (raise-argument-error 'smt_objective "'minimize or 'maximize" direction))
+  (unless (boolean? signed?) (raise-argument-error 'smt_objective "boolean?" signed?))
+  (define description (make_values_spec function inputs preconditions))
+  (define declared (values-spec-inputs description))
+  (define symbol (fresh-name "pille_objective" declared))
+  (define manifest
+    (for/fold ([manifest (context-manifest dialect 1)])
+              ([(key value) (in-hash (hash-set* (hash-remove (hash-remove (spec-manifest description (list term))
+                                                                         'result_symbol)
+                                                            'defined_symbol)
+                                               'mode "objective"
+                                               'objective (term->manifest term declared)
+                                               'objective_symbol symbol
+                                               'signed signed?))])
+      (hash-set manifest key value)))
+  (define-values (lowered _members) (run-lowering module manifest))
+  (define verified (parse_stock_module lowered module))
+  (define-values (exported feasibility _body)
+    (named-scripts 'smt_objective (to_smtlib verified) (values-spec-preconditions description)))
+  (define expected (append (expected-inputs declared) (list (cons symbol (term-width term)))))
+  (unless (equal? (smtlib-declarations exported) expected)
+    (builder-error 'smt_objective "internal error: the exported SMT-LIB does not declare exactly the inputs and the objective:\n~a" exported))
+  (define checks
+    (for/list ([command (in-list (smtlib-commands exported))] #:when (equal? (car command) '("check-sat")))
+      (cdr command)))
+  (unless (= (length checks) 1)
+    (builder-error 'smt_objective "internal error: expected exactly one (check-sat) in the exported SMT-LIB"))
+  (define before (substring exported 0 (- (car checks) (string-length "(check-sat)"))))
+  (define script
+    (string->immutable-string
+     (string-append "(set-option :produce-models true)\n" before
+                    (format "(~a ~a)\n(check-sat)\n(get-value (~a))\n" direction symbol
+                            (string-join (cons symbol (map car (expected-inputs declared))) " ")))))
+  (objective verified script (dialect_name dialect) (values-spec-function description) declared
+             (values-spec-preconditions description) term direction signed? symbol feasibility))
+
+;; 'optimum with the symbol's value first, then the inputs'; 'infeasible with a
+;; core where named preconditions cannot hold together, or with none where no
+;; input satisfies the preconditions and nothing says which.
+(define (objective_check value [executable #f] [timeout 10] [arguments '()])
+  (unless (objective? value) (raise-argument-error 'check "objective query" value))
+  (define core
+    (and (objective-feasibility value)
+         (run_solver_core (objective-feasibility value) executable timeout arguments)))
+  (cond
+    [(and core (not (memq (solver_result_status core) '(feasible unknown timeout)))) core]
+    [else
+     (define answer
+       (run_solver_objective (objective-smtlib value)
+                             (cons (cons (objective-symbol value) (term-width (objective-term value)))
+                                   (expected-inputs (objective-inputs value)))
+                             executable timeout arguments))
+     (if (eq? (solver_result_status answer) 'unsat)
+         (solver-result 'infeasible '() (solver_result_diagnostics answer) (solver_result_command answer)
+                        (solver_result_seconds answer))
+         answer)]))
+
+;; The optimum as the number asked for: the symbol's residue with the sign bit
+;; flipped back and read as two's complement where the objective is signed.
+(define (objective_value value residue)
+  (define width (term-width (objective-term value)))
+  (cond
+    [(objective-signed? value)
+     (define plain (bitwise-xor residue (expt 2 (sub1 width))))
+     (if (>= plain (expt 2 (sub1 width))) (- plain (expt 2 width)) plain)]
+    [else residue]))
+
+(define (objective_inputs value)
+  (list->treelist (for/list ([input (in-list (objective-inputs value))])
+                   (treelist (car (term-args input)) (term-width input)))))
+(define (objective_assumptions value)
+  (list->treelist (map (compose string->immutable-string render-assumption) (objective-preconditions value))))
 
 (define (make_smt_batch dialect module specs)
   (make-batch dialect module specs #f))

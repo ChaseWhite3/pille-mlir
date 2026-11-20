@@ -14,6 +14,8 @@ export:
   Query
   Spec
   Batch
+  ObjectiveQuery
+  Optimum
   ValuesSpec
   ValuesQuery
   ValuesBatch
@@ -319,6 +321,93 @@ fun solver_outcome(answer, function :: String, dialect :: String,
   | #'#{bad-model}: outcome(Failure, #'bad_model)
   | #'#{closed-session}: outcome(Failure, #'closed_session)
   | #'#{requirements-not-satisfied}: outcome(Failure, #'requirements_not_satisfied)
+
+// The objective's best value over the inputs that satisfy the preconditions
+// and keep every operation within what its model requires. `value` is the
+// number asked for: an unsigned one, or with a signed objective a two's
+// complement one. `values` is one assignment per function argument, in
+// argument order, that reaches it; other inputs may reach it too. `property`
+// says what was optimized. A bitvector objective always has a bound, so there
+// is no outcome for an unbounded one.
+class Optimum(value :: Int, values :: List.of(Assignment)):
+  extends Outcome
+
+  override method describe() :: String:
+    property ++ " is " +& value ++ " for @" ++ function ++ " under the declared SMT semantics of dialect "
+      ++ dialect ++ ", at [" ++ String.join(for List (assignment in values): assignment.describe(), ", ") ++ "]"
+      ++ (if assumptions.length() == 0
+          | ""
+          | " (satisfying [" ++ String.join(assumptions, "; ") ++ "])")
+
+// The least or greatest value of one term, over one function under one
+// dialect's declared model, subject to preconditions: Dialect.smt_objective.
+// Constructing one never runs a solver.
+//
+// MLIR's SMT dialect has no objective. The term is bound to a fresh symbol in
+// the verified SMT module, and Z3's `(minimize s)` or `(maximize s)` is
+// written into the exported SMT-LIB before its `(check-sat)`, with
+// `(get-value ...)` after it: `to_smtlib` is that text, and running it
+// through z3 prints the answer. Z3 orders bitvectors as unsigned numbers, so
+// a signed objective's symbol is the term with its sign bit flipped, which
+// keeps the signed order; `Optimum.value` is flipped back.
+veneer ObjectiveQuery(this :: satisfying(query.is_objective)):
+  constructor ~error
+
+  // The verified SMT dialect module, before the objective is written in.
+  property module :: mlir.Module:
+    query.objective_module(this)
+
+  property function :: String:
+    query.objective_function(this)
+
+  property dialect :: String:
+    query.objective_dialect(this)
+
+  // [[name, width], ...] in argument order.
+  property inputs :: List:
+    query.objective_inputs(this)
+
+  // #'minimize or #'maximize, and whether the term is read as signed.
+  property direction :: Symbol:
+    query.objective_direction(this)
+
+  property is_signed :: Boolean:
+    query.objective_signed(this)
+
+  property assumptions :: List.of(String):
+    query.objective_assumptions(this)
+
+  method to_smtlib() :: String:
+    query.objective_smtlib(this)
+
+  // As Query.feasibility_smtlib: #false where no precondition is named.
+  method feasibility_smtlib() :: maybe(String):
+    query.objective_feasibility(this)
+
+  // What is optimized, as text: "least unsigned R".
+  method describe() :: String:
+    (if direction == #'minimize | "least " | "greatest ") ++ (if is_signed | "signed " | "unsigned ")
+      ++ query.render_term(query.objective_term(this))
+
+  // `Optimum`; `Infeasible` where no input satisfies the preconditions (its
+  // core names which, where they are named and cannot hold together, and is
+  // empty otherwise); or `Unknown`, `Timeout` or `Failure`. Runs a standalone
+  // solver.
+  method check(~solver: executable :: maybe(Path || ReadableString) = #false,
+               ~timeout: timeout :: PosReal = 10,
+               ~arguments: arguments :: List.of(ReadableString) = []) :: Outcome:
+    let answer = query.objective_check(this, executable, timeout,
+                                       for List (argument in arguments): to_string(argument))
+    match solver.solver_result_status(answer)
+    | #'optimum:
+        let [[_, _, residue], [name, width, value], ...] = solver.solver_result_assignments(answer)
+        Optimum(function, dialect, describe(), assumptions, to_smtlib(),
+                solver.solver_result_diagnostics(answer), solver.solver_result_command_line(answer),
+                query.objective_value(this, residue),
+                [Assignment(name, width, value), ...])
+    | ~else:
+        solver_outcome(answer, function, dialect, describe(), assumptions, to_smtlib(), timeout,
+                       ~feasibility: feasibility_smtlib())
 
 // A spec holds the same arguments as Dialect.smt_query. Semantic validation
 // happens in the batch so errors can identify the zero-based spec index.

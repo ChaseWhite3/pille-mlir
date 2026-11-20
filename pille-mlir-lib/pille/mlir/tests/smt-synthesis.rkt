@@ -332,3 +332,273 @@
   (define answer (query_check beside z3))
   (check-eq? (solver_result_status answer) 'infeasible)
   (check-equal? (core-of answer) '()))
+
+;;==============================================================================
+;; A6. Objectives
+
+(define (objective module function inputs term direction signed? [preconditions '()])
+  (make_smt_objective arithmetic module function inputs term direction signed? preconditions))
+;; the optimum as the number asked for, or the answer's status
+(define (optimum value)
+  (define answer (objective_check value z3))
+  (if (eq? (solver_result_status answer) 'optimum)
+      (objective_value value (caddr (car (solver_result_values answer))))
+      (solver_result_status answer)))
+
+(test-case "the least and greatest value of a term, unsigned and signed"
+  ;; a between -5 and 3 as signed numbers: as unsigned ones, 0..3 and 251..255
+  (define within (list (smt_cmp 'sge a8 (smt_const -5 8)) (smt_cmp 'sle a8 (smt_const 3 8))))
+  (define (of direction signed?) (optimum (objective comparisons "cmp_eq" (list a8 b8) a8 direction signed? within)))
+  (check-equal? (of 'minimize #t) -5)
+  (check-equal? (of 'maximize #t) 3)
+  ;; the unsigned order is another order: its least and greatest are elsewhere
+  (check-equal? (of 'minimize #f) 0)
+  (check-equal? (of 'maximize #f) 255)
+  ;; a term of the inputs, not only an input: the greatest a + b that does not wrap
+  (check-equal? (optimum (objective comparisons "cmp_eq" (list a8 b8) (smt_binary 'add a8 b8) 'maximize #f
+                                    (list (smt_no_overflow 'add a8 b8 #f) (smt_cmp 'ule a8 (smt_const 100 8)))))
+                255)
+  ;; a result of the function may be the objective: the least a <u b is 0
+  (check-equal? (optimum (objective comparisons "cmp_ult" (list a8 b8) (smt_result 1) 'minimize #f)) 0)
+  ;; the inputs reported reach the optimum
+  (define value (objective comparisons "cmp_eq" (list a8 b8) a8 'minimize #t within))
+  (define answer (objective_check value z3))
+  (check-equal? (map car (solver_result_values answer)) '("pille_objective" "a" "b"))
+  (check-equal? (caddr (cadr (solver_result_values answer))) #xfb)
+  ;; the text is the question, with the objective written in; run by hand it answers
+  (define script (objective_smtlib value))
+  (check-true (string-contains? script "(minimize pille_objective)"))
+  (check-regexp-match #rx"^sat\n[(][(]pille_objective #x7b[)]\n [(]a #xfb[)]" (by-hand script))
+  ;; no input at all: infeasible, with a core where names say which
+  (check-eq? (optimum (objective comparisons "cmp_eq" (list a8 b8) a8 'minimize #f
+                                 (list (smt_cmp 'ult a8 (smt_const 0 8)))))
+             'infeasible)
+  (define conflict
+    (objective comparisons "cmp_eq" (list a8 b8) a8 'minimize #f
+               (list (smt_named (smt_cmp 'ult a8 (smt_const 3 8)) "low") (smt_named (smt_cmp 'ugt a8 (smt_const 9 8)) "high")
+                     (smt_named (smt_cmp 'ult b8 (smt_const 9 8)) "aside"))))
+  (define refused (objective_check conflict z3))
+  (check-eq? (solver_result_status refused) 'infeasible)
+  (check-equal? (core-of refused) '("high" "low"))
+  ;; an input named as the symbol would be gets another symbol
+  (define taken (smt_input "pille_objective" 8))
+  (check-equal? (optimum (objective comparisons "cmp_eq" (list taken b8) taken 'maximize #f
+                                    (list (smt_cmp 'ult taken (smt_const 7 8)))))
+                6)
+  (check-exn exn:fail? (lambda () (objective comparisons "cmp_eq" (list a8 b8) a8 'smallest #f))))
+
+;;==============================================================================
+;; Acceptance for Slice A: a small timed machine
+;;
+;; The fixture is the test's, not the library's: nothing above knows of phases.
+;; A machine over (phase, level, since, clock), each an i32. Its durations are
+;; inputs: `initial` and `escalation`, then a `repeat` between re-escalations.
+;; Each message is a kind and an amount:
+;;
+;;   0 on          idle -> initial, since := clock
+;;   1 off         -> idle
+;;   2 disconnect  -> idle
+;;   3 respond     initial, escalation or re-escalation -> responded
+;;   4 time        clock := clock + amount
+;;   other         nothing
+;;
+;; and after every message a timed phase is what the time since `since` makes
+;; it: initial before `initial`, escalation before `initial + escalation`, then
+;; re-escalation at level 1, 2, 3 as each further `repeat` passes, and 4 after.
+
+(define-values (idle initial escalation re-escalation responded) (values 0 1 2 3 5))
+(define-values (on off disconnect respond time nothing) (values 0 1 2 3 4 9))
+(define messages 6)
+
+;; The machine, written on numbers.
+(define (machine-step state durations kind amount)
+  (define-values (phase level since clock) (apply values state))
+  (define-values (I E R) (apply values durations))
+  (define start? (and (= kind on) (= phase idle)))
+  (define clock* (if (= kind time) (wrap32 (+ clock amount)) clock))
+  (define since* (if start? clock since))
+  (define phase1
+    (let* ([p (if start? initial phase)]
+           [p (if (or (= kind off) (= kind disconnect)) idle p)])
+      (if (and (= kind respond) (memv p (list initial escalation re-escalation))) responded p)))
+  (cond
+    [(memv phase1 (list initial escalation re-escalation))
+     (define elapsed (wrap32 (- clock* since*)))
+     (define-values (l0 l1 l2 l3)
+       (values (wrap32 (+ I E)) (wrap32 (+ I E R)) (wrap32 (+ I E R R)) (wrap32 (+ I E R R R))))
+     (list (cond [(< elapsed I) initial] [(< elapsed l0) escalation] [else re-escalation])
+           (cond [(< elapsed l0) 0] [(< elapsed l1) 1] [(< elapsed l2) 2] [(< elapsed l3) 3] [else 4])
+           since* clock*)]
+    [else (list phase1 0 since* clock*)]))
+(define (wrap32 value) (modulo value (expt 2 32)))
+(define (machine-run durations kinds amounts)
+  (for/fold ([state (list idle 0 0 0)]) ([kind (in-list kinds)] [amount (in-list amounts)])
+    (machine-step state durations kind amount)))
+
+;; The same machine as one function, its step written out once for each message.
+(define machine-text
+  (let ([out (open-output-string)])
+    (define (line format-string . arguments) (fprintf out "    ~a\n" (apply format format-string arguments)))
+    (define (constant name value) (line "%~a = arith.constant ~a : i32" name value))
+    (define (op name operation lhs rhs) (line "%~a = \"arithmetic.~a\"(%~a, %~a) : (i32, i32) -> i32" name operation lhs rhs))
+    (define (compare name predicate lhs rhs) (line "%~a = arith.cmpi ~a, %~a, %~a : i32" name predicate lhs rhs))
+    (define (choose name test chosen otherwise type) (line "%~a = arith.select %~a, %~a, %~a : ~a" name test chosen otherwise type))
+    (fprintf out "  func.func @machine(%I: i32, %E: i32, %R: i32~a) -> (i32, i32, i32, i32) {\n"
+             (apply string-append (for/list ([k (in-range messages)]) (format ", %m~a: i32, %d~a: i32" k k))))
+    (for ([value '(0 1 2 3 4 5)]) (constant (format "c~a" value) value))
+    (line "%no = arith.constant false")
+    (line "%yes = arith.constant true")
+    (op "l0" "add" "I" "E")
+    (op "l1" "add" "l0" "R")
+    (op "l2" "add" "l1" "R")
+    (op "l3" "add" "l2" "R")
+    (define-values (phase level since clock)
+      (for/fold ([phase "c0"] [level "c0"] [since "c0"] [clock "c0"]) ([k (in-range messages)])
+        (define (n name) (format "~a_~a" name k))
+        (define-values (m d) (values (format "m~a" k) (format "d~a" k)))
+        (compare (n "is_on") "eq" m "c0")
+        (compare (n "is_off") "eq" m "c1")
+        (compare (n "is_dis") "eq" m "c2")
+        (compare (n "is_resp") "eq" m "c3")
+        (compare (n "is_time") "eq" m "c4")
+        (compare (n "was_idle") "eq" phase "c0")
+        (choose (n "start") (n "is_on") (n "was_idle") "no" "i1")
+        (op (n "later") "add" clock d)
+        (choose (n "clock") (n "is_time") (n "later") clock "i32")
+        (choose (n "since") (n "start") clock since "i32")
+        (choose (n "p_on") (n "start") "c1" phase "i32")
+        (choose (n "p_off") (n "is_off") "c0" (n "p_on") "i32")
+        (choose (n "p_dis") (n "is_dis") "c0" (n "p_off") "i32")
+        ;; timed: the phase so far is initial, escalation or re-escalation
+        (define (timed name of)
+          (compare (format "~a_1" name) "eq" of "c1")
+          (compare (format "~a_2" name) "eq" of "c2")
+          (compare (format "~a_3" name) "eq" of "c3")
+          (choose (format "~a_23" name) (format "~a_2" name) "yes" (format "~a_3" name) "i1")
+          (choose name (format "~a_1" name) "yes" (format "~a_23" name) "i1"))
+        (timed (n "can_respond") (n "p_dis"))
+        (choose (n "responds") (n "is_resp") (n "can_respond") "no" "i1")
+        (choose (n "p_resp") (n "responds") "c5" (n "p_dis") "i32")
+        (timed (n "timed") (n "p_resp"))
+        (op (n "elapsed") "sub" (n "clock") (n "since"))
+        (compare (n "lt_i") "ult" (n "elapsed") "I")
+        (compare (n "lt_0") "ult" (n "elapsed") "l0")
+        (compare (n "lt_1") "ult" (n "elapsed") "l1")
+        (compare (n "lt_2") "ult" (n "elapsed") "l2")
+        (compare (n "lt_3") "ult" (n "elapsed") "l3")
+        (choose (n "tp_e") (n "lt_0") "c2" "c3" "i32")
+        (choose (n "tp") (n "lt_i") "c1" (n "tp_e") "i32")
+        (choose (n "tl_3") (n "lt_3") "c3" "c4" "i32")
+        (choose (n "tl_2") (n "lt_2") "c2" (n "tl_3") "i32")
+        (choose (n "tl_1") (n "lt_1") "c1" (n "tl_2") "i32")
+        (choose (n "tl") (n "lt_0") "c0" (n "tl_1") "i32")
+        (choose (n "phase") (n "timed") (n "tp") (n "p_resp") "i32")
+        (choose (n "level") (n "timed") (n "tl") "c0" "i32")
+        (values (n "phase") (n "level") (n "since") (n "clock"))))
+    (fprintf out "    return %~a, %~a, %~a, %~a : i32, i32, i32, i32\n  }\n" phase level since clock)
+    (get-output-string out)))
+
+(define machine (program machine-text))
+
+(define-values (I E R) (values (smt_input "I" 32) (smt_input "E" 32) (smt_input "R" 32)))
+(define kinds (for/list ([k (in-range messages)]) (smt_input (format "m~a" k) 32)))
+(define amounts (for/list ([k (in-range messages)]) (smt_input (format "d~a" k) 32)))
+(define machine-inputs (append (list I E R) (append* (map list kinds amounts))))
+(define (is term value) (smt_eq term (smt_const value 32)))
+(define-values (phase-after level-after) (values (smt_result_at 0 32) (smt_result_at 1 32)))
+
+;; the messages said: each a kind and an amount, the rest nothing
+(define (said . pairs)
+  (define padded (append pairs (make-list (- messages (length pairs)) (list nothing 0))))
+  (append* (for/list ([pair (in-list padded)] [kind (in-list kinds)] [amount (in-list amounts)])
+             (list (is kind (car pair)) (is amount (cadr pair))))))
+
+(test-case "the fixture's function is the machine written on numbers, on random message sequences"
+  (define generator (make-pseudo-random-generator))
+  (parameterize ([current-pseudo-random-generator generator])
+    (random-seed 20261120)
+    (define cases
+      (for/list ([_ (in-range 60)])
+        (define durations (list (random 1 20) (random 1 40) (random 1 30)))
+        (define said-kinds (for/list ([_ (in-range messages)]) (list-ref (list on off disconnect respond time time time nothing) (random 8))))
+        (define said-amounts (for/list ([_ (in-range messages)]) (random 0 60)))
+        (list durations said-kinds said-amounts (machine-run durations said-kinds said-amounts))))
+    ;; the sequences pass through every phase the machine has, and every level
+    (define passed
+      (append* (for/list ([c (in-list cases)])
+                 (for/list ([count (in-range 1 (add1 messages))])
+                   (machine-run (first c) (take (second c) count) (take (third c) count))))))
+    (check-equal? (sort (remove-duplicates (map first passed)) <)
+                  (list idle initial escalation re-escalation responded))
+    (check-equal? (sort (remove-duplicates (map second passed)) <) '(0 1 2 3 4))
+    (define specs
+      (for/list ([c (in-list cases)])
+        (define-values (durations said-kinds said-amounts expected) (apply values c))
+        (make_spec "machine" machine-inputs
+                   (smt_and (for/list ([value (in-list expected)] [index (in-naturals)])
+                              (is (smt_result_at index 32) value)))
+                   (append (list (is I (first durations)) (is E (second durations)) (is R (third durations)))
+                           (apply said (map list said-kinds said-amounts))))))
+    (define answers (treelist->list (batch_check (make_smt_batch arithmetic machine specs) z3 20 '() 600)))
+    (check-equal? (remove-duplicates (map solver_result_status answers)) '(unsat))))
+
+;; re-escalation 2 after `on` and 65 units of time, with initial 10 and escalation 30
+(define expectation
+  (append (list (is I 10) (is E 30))
+          (said (list on 0) (list time 65))
+          (list (is phase-after re-escalation) (is level-after 2))))
+;; the sums the machine makes of its durations do not wrap
+(define sums-fit
+  (let* ([l0 (smt_binary 'add I E)] [l1 (smt_binary 'add l0 R)] [l2 (smt_binary 'add l1 R)])
+    (list (smt_no_overflow 'add I E #f) (smt_no_overflow 'add l0 R #f) (smt_no_overflow 'add l1 R #f)
+          (smt_no_overflow 'add l2 R #f))))
+
+(test-case "acceptance: the durations a page's expectation admits"
+  ;; escalation is entered at 10, re-escalation 1 at 40, re-escalation 2 at 40 + R and
+  ;; re-escalation 3 at 40 + 2R, so 40 + R <= 65 < 40 + 2R: R is 13 to 25
+  (define least (objective machine "machine" machine-inputs R 'minimize #f (append expectation sums-fit)))
+  (define greatest (objective machine "machine" machine-inputs R 'maximize #f (append expectation sums-fit)))
+  (check-equal? (optimum least) 13)
+  (check-equal? (optimum greatest) 25)
+  ;; and every R between is admitted, none outside: the expectation is exactly that range
+  (check-eq? (status (query machine "machine" machine-inputs
+                            (smt_and (list (smt_cmp 'uge R (smt_const 13 32)) (smt_cmp 'ule R (smt_const 25 32))))
+                            (append expectation sums-fit)))
+             'unsat)
+  (check-eq? (status (query machine "machine" machine-inputs
+                            (smt_and (list (is phase-after re-escalation) (is level-after 2)))
+                            (append (list (is I 10) (is E 30) (smt_cmp 'uge R (smt_const 13 32))
+                                          (smt_cmp 'ule R (smt_const 25 32)))
+                                    (said (list on 0) (list time 65)))))
+             'unsat)
+  ;; run by hand, each objective's text gives its answer
+  (check-regexp-match #rx"^sat\n[(][(]pille_objective #x0000000d[)]" (by-hand (objective_smtlib least)))
+  (check-regexp-match #rx"^sat\n[(][(]pille_objective #x00000019[)]" (by-hand (objective_smtlib greatest))))
+
+(test-case "acceptance: an answer that holds only by wrapping is found without the guards, excluded with them"
+  ;; without the guards the greatest R is one whose sums wrap, far past 25
+  (define unguarded (optimum (objective machine "machine" machine-inputs R 'maximize #f expectation)))
+  (check-true (> unguarded 25))
+  (check-true (>= (+ 40 (* 2 unguarded)) (expt 2 32)))
+  (check-equal? (optimum (objective machine "machine" machine-inputs R 'maximize #f (append expectation sums-fit))) 25))
+
+(test-case "acceptance: two named expectations that cannot both hold are infeasible, naming both"
+  (define at-65 (said (list on 0) (list time 65)))
+  (define line-22 (smt_named (smt_and (list (is phase-after re-escalation) (is level-after 2))) "event-phases.md:22"))
+  (define line-31 (smt_named (is level-after 1) "event-phases.md:31"))
+  (define settings (smt_named (smt_and (list (is I 10) (is E 30))) "settings.md:4"))
+  (define preconditions (append at-65 sums-fit (list line-22 settings line-31)))
+  (define value (query machine "machine" machine-inputs (is phase-after re-escalation) preconditions))
+  (define answer (query_check value z3))
+  (check-eq? (solver_result_status answer) 'infeasible)
+  (check-equal? (core-of answer) '("event-phases.md:22" "event-phases.md:31"))
+  (check-regexp-match #rx"^unsat\n[(][^()]*event-phases.md:(22|31)[^()]*event-phases.md:(22|31)[^()]*[)]$"
+                      (by-hand (query_feasibility value)))
+  ;; the same expectations asked of an objective
+  (define asked (objective_check (objective machine "machine" machine-inputs R 'minimize #f preconditions) z3))
+  (check-eq? (solver_result_status asked) 'infeasible)
+  (check-equal? (core-of asked) '("event-phases.md:22" "event-phases.md:31"))
+  ;; with the second expectation gone, the first is as before
+  (check-equal? (optimum (objective machine "machine" machine-inputs R 'minimize #f
+                                    (append at-65 sums-fit (list line-22 settings))))
+                13))

@@ -94,6 +94,32 @@ Automatic extraction of semantics from arbitrary Rhombus code, IRDL-to-SMT
 schema analysis, a new LLVM backend, and proving general compiler correctness
 are outside this order.
 
+**Supported since 2026-11-20** (Slice A of `CLOSER_TIMED_MACHINE_WORK_ORDER.md`;
+the policy above is unchanged, and so is everything a query could say before):
+
+- In a function body, `arith.cmpi` with every predicate (its `i1` result the
+  one-bit value 1 or 0) and `arith.select` (an `i1` condition `== 1` choosing
+  between two values of one width), beside `arith.constant` and declared
+  operations. A function may return several scalars.
+- In properties and preconditions: the orderings `ult`, `ule`, `ugt`, `uge`,
+  `slt`, `sle`, `sgt`, `sge` (signedness is the predicate's, never inferred);
+  `ite(formula, then, else)`; `result(index, ~width:)` for one of several
+  results; and `no_overflow_add`, `no_overflow_sub`, `no_overflow_mul`,
+  unsigned or `~signed`, which say an operation did not wrap. `add`, `sub` and
+  `mul` still wrap.
+- `precondition(formula, ~named: name)`, and the outcome `Infeasible(core)`
+  where a query's named preconditions cannot hold together. The core is
+  minimal as Z3 minimizes it. A query with no named precondition is as before:
+  inconsistent preconditions prove vacuously.
+- `Dialect.smt_objective(..., ~minimize: term)` or `~maximize:`, unsigned or
+  `~signed`, with the outcome `Optimum(value, values)`. MLIR's SMT dialect has
+  no objective; Z3's `minimize`/`maximize` is written into the exported
+  SMT-LIB. A bitvector objective always has a bound, so there is no
+  `Unbounded`. Objectives run a standalone solver, not a `Session`.
+
+Still unsupported: control flow, calls, regions, memory, floating point,
+`index`, quantifiers and attribute-dependent semantics.
+
 ## Declaration and descriptor changes
 
 Add an optional semantic clause to operation declarations. The following is

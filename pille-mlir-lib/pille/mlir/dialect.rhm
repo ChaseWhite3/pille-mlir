@@ -124,6 +124,22 @@ export veneer Dialect(this :: satisfying(schema.is_dialect)):
                    ~preconditions: preconditions :: List.of(smt.Formula || smt.Precondition) = []) :: smt.Query:
     query.make_smt_query(this, module, to_string(function), inputs, property, preconditions)
 
+  // The least (~minimize) or greatest (~maximize) value of one term over the
+  // inputs that satisfy the preconditions, read as an unsigned number or with
+  // ~signed as a two's complement one. Exactly one of the two is given.
+  method smt_objective(module :: mlir.Module,
+                       ~function: function :: ReadableString,
+                       ~inputs: inputs :: List.of(smt.Term) = [],
+                       ~minimize: least :: maybe(smt.Term) = #false,
+                       ~maximize: greatest :: maybe(smt.Term) = #false,
+                       ~signed: signed :: Boolean = #false,
+                       ~preconditions: preconditions :: List.of(smt.Formula || smt.Precondition) = [])
+    :: smt.ObjectiveQuery:
+    unless (least && !greatest) || (greatest && !least)
+    | error(~who: #'smt_objective, "give exactly one of ~minimize and ~maximize")
+    query.make_smt_objective(this, module, to_string(function), inputs, least || greatest,
+                             if least | #'minimize | #'maximize, signed, preconditions)
+
   // One manifest and one lowering/export for all questions. Specs are checked
   // in order; diagnostics identify their zero-based index.
   method smt_batch(module :: mlir.Module, specs :: List.of(smt.Spec)) :: smt.Batch:

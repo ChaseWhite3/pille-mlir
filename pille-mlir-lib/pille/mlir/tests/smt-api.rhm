@@ -209,3 +209,38 @@ def unnamed_conflict:
                        ~preconditions: [smt.ult(x, smt.const(10, ~width: 32)), smt.ugt(x, smt.const(20, ~width: 32))])
 check unnamed_conflict.check() ~is_a smt.Proved
 check unnamed_conflict.feasibility_smtlib() ~is #false
+
+// an objective: the greatest x whose successor does not wrap, and the least signed x at least -7
+def greatest:
+  arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x], ~maximize: x,
+                           ~preconditions: [smt.no_overflow_add(x, smt.const(1, ~width: 32))])
+check greatest.describe() ~is "greatest unsigned x"
+check greatest.direction ~is #'maximize
+check greatest.to_smtlib().contains("(maximize pille_objective)") ~is #true
+match greatest.check()
+| optimum :: smt.Optimum:
+    check optimum.value ~is 2 ** 32 - 2
+    check optimum.property ~is "greatest unsigned x"
+    check (for List (a in optimum.values): [a.name, a.value]) ~is [["x", 2 ** 32 - 2]]
+    check optimum.describe().contains("greatest unsigned x is 4294967294 for @successor") ~is #true
+| other:
+    check other ~is_a smt.Optimum
+
+def least_signed:
+  arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x], ~minimize: x, ~signed: #true,
+                           ~preconditions: [smt.sge(x, smt.const(-7, ~width: 32))])
+match least_signed.check()
+| optimum :: smt.Optimum: check optimum.value ~is -7
+| other: check other ~is_a smt.Optimum
+
+// no input at all: infeasible; and exactly one of ~minimize and ~maximize
+check:
+  arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x], ~minimize: x,
+                           ~preconditions: [smt.precondition(smt.ult(x, smt.const(0, ~width: 32)), ~named: "none")]).check()
+  ~is_a smt.Infeasible
+check:
+  arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x])
+  ~throws "give exactly one of ~minimize and ~maximize"
+check:
+  arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x], ~minimize: x, ~maximize: x)
+  ~throws "give exactly one of ~minimize and ~maximize"

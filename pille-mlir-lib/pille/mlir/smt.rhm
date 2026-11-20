@@ -34,6 +34,15 @@ export:
   not
   and
   or
+  ult
+  ule
+  ugt
+  uge
+  slt
+  sle
+  sgt
+  sge
+  ite
 
 // A bitvector-sorted value with an exact width. Terms and Boolean predicates
 // are separate sorts: a one-bit term is never usable as a predicate.
@@ -58,9 +67,14 @@ veneer Formula(this :: satisfying(query.is_formula)):
 fun input(name :: ReadableString, ~width: width :: Int) :: Term:
   query.smt_input(to_string(name), width)
 
-// The value returned by the selected function.
-fun result(~width: width :: Int) :: Term:
-  query.smt_result(width)
+// The value returned by the selected function: `result(~width: w)` of a
+// function with one result, `result(index, ~width: w)` for one of the values
+// a function with several returns, counted from 0.
+fun
+| result(~width: width :: Int) :: Term:
+    query.smt_result(width)
+| result(index :: NonnegInt, ~width: width :: Int) :: Term:
+    query.smt_result_at(index, width)
 
 // A typed literal in [-2^(w-1), 2^w - 1]; negative values denote their two's
 // complement residue. Out-of-range values are rejected.
@@ -80,6 +94,22 @@ fun mul(lhs, rhs) :: Term:
 
 fun eq(lhs, rhs) :: Formula:
   query.smt_eq(lhs, rhs)
+
+// Orderings of two terms of equal width, unsigned (ult, ule, ugt, uge) and
+// signed (slt, sle, sgt, sge). The predicate says the signedness; a term has
+// none of its own.
+fun ult(lhs, rhs) :: Formula: query.smt_cmp(#'ult, lhs, rhs)
+fun ule(lhs, rhs) :: Formula: query.smt_cmp(#'ule, lhs, rhs)
+fun ugt(lhs, rhs) :: Formula: query.smt_cmp(#'ugt, lhs, rhs)
+fun uge(lhs, rhs) :: Formula: query.smt_cmp(#'uge, lhs, rhs)
+fun slt(lhs, rhs) :: Formula: query.smt_cmp(#'slt, lhs, rhs)
+fun sle(lhs, rhs) :: Formula: query.smt_cmp(#'sle, lhs, rhs)
+fun sgt(lhs, rhs) :: Formula: query.smt_cmp(#'sgt, lhs, rhs)
+fun sge(lhs, rhs) :: Formula: query.smt_cmp(#'sge, lhs, rhs)
+
+// `chosen` where `test` holds, else `otherwise`: two terms of equal width.
+fun ite(test, chosen, otherwise) :: Term:
+  query.smt_ite(test, chosen, otherwise)
 
 fun not(operand) :: Formula:
   query.smt_not(operand)

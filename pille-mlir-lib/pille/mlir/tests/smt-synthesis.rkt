@@ -1,0 +1,180 @@
+#lang racket/base
+
+(require rackunit
+         racket/list
+         racket/runtime-path
+         racket/string
+         racket/treelist
+         "../../private/mlir/query.rkt"
+         "../../private/mlir/schema.rkt"
+         "../../private/mlir/solver.rkt"
+         "../../private/mlir/tools.rkt")
+
+;; What a query needs to ask about a small machine whose step is comparisons
+;; and choices (CLOSER_TIMED_MACHINE_WORK_ORDER.md, Slice A): orderings,
+;; selection and several results here; overflow guards, named preconditions
+;; and objectives in the sections below as they are added. These need real
+;; MLIR tools and a real Z3; a missing tool is a failure, not a skip.
+(define-runtime-path fixtures "semantics")
+(define arithmetic (dynamic-require (build-path fixtures "valid.rhm") 'arithmetic))
+
+(define chain (make_toolchain))
+(define z3
+  (or (getenv "PILLE_Z3")
+      (find-executable-path "z3")
+      (error 'smt-synthesis "these tests require Z3: put z3 on PATH or set PILLE_Z3")))
+
+(define (program . functions)
+  (parse_module (string-append "module {\n" (apply string-append functions) "}\n")
+                (dialect_irdl arithmetic) chain))
+
+(define (query module function inputs property [preconditions '()])
+  (make_smt_query arithmetic module function inputs property preconditions))
+(define (status value) (solver_result_status (query_check value z3)))
+(define (rejects pattern thunk)
+  (check-exn (lambda (error) (and (exn:fail? error) (regexp-match? pattern (exn-message error)))) thunk))
+
+(define a8 (smt_input "a" 8))
+(define b8 (smt_input "b" 8))
+(define a32 (smt_input "a" 32))
+(define b32 (smt_input "b" 32))
+(define c1 (smt_input "c" 1))
+(define one (smt_const 1 1))
+(define zero (smt_const 0 1))
+(define (bit formula) (smt_ite formula one zero))
+
+;;==============================================================================
+;; A1. Orderings
+
+(define predicates '(eq ne slt sle sgt sge ult ule ugt uge))
+
+;; What each predicate means, written without the lowering: on the unsigned
+;; residues, or on the two's complement values they stand for.
+(define (signed value width) (if (>= value (expt 2 (sub1 width))) (- value (expt 2 width)) value))
+(define (holds? predicate lhs rhs width)
+  (define-values (l r) (values (signed lhs width) (signed rhs width)))
+  (case predicate
+    [(eq) (= lhs rhs)] [(ne) (not (= lhs rhs))]
+    [(ult) (< lhs rhs)] [(ule) (<= lhs rhs)] [(ugt) (> lhs rhs)] [(uge) (>= lhs rhs)]
+    [(slt) (< l r)] [(sle) (<= l r)] [(sgt) (> l r)] [(sge) (>= l r)]))
+
+(define comparisons
+  (apply program
+         (for/list ([predicate (in-list predicates)])
+           (format "  func.func @cmp_~a(%a0: i8, %a1: i8) -> i1 {\n    %r = arith.cmpi ~a, %a0, %a1 : i8\n    return %r : i1\n  }\n"
+                   predicate predicate))))
+
+(test-case "the builders check sorts and widths, and say the signedness"
+  (rejects #rx"width mismatch" (lambda () (smt_cmp 'ult a8 a32)))
+  (rejects #rx"expected bitvector terms" (lambda () (smt_cmp 'slt a8 (smt_eq a8 b8))))
+  (check-exn exn:fail? (lambda () (smt_cmp 'lt a8 b8)))
+  (rejects #rx"expected a Boolean predicate" (lambda () (smt_ite a8 a8 b8)))
+  (rejects #rx"width mismatch" (lambda () (smt_ite (smt_eq a8 b8) a8 a32)))
+  (check-equal? (render_formula (smt_cmp 'ult a8 b8)) "a <u b")
+  (check-equal? (render_formula (smt_cmp 'sge a8 b8)) "a >=s b")
+  (check-equal? (render_term (smt_ite (smt_cmp 'slt a8 b8) a8 b8)) "(a <s b ? a : b)")
+  (check-equal? (render_term (smt_result_at 1 32)) "result[1]"))
+
+(test-case "arith.cmpi is the comparison of its predicate, on values chosen to tell them apart"
+  ;; 0x80 is the least signed and a large unsigned value, so the signed and
+  ;; unsigned orderings of each pair differ wherever they can.
+  (define pairs '((0 0) (1 2) (2 1) (#x80 1) (1 #x80) (#xff #x80) (#x7f #x80) (#xff #xff)))
+  (define specs
+    (for*/list ([predicate (in-list predicates)] [pair (in-list pairs)])
+      (define expected (if (holds? predicate (car pair) (cadr pair) 8) 1 0))
+      (make_spec (format "cmp_~a" predicate) (list a8 b8)
+                 (smt_eq (smt_result 1) (smt_const expected 1))
+                 (list (smt_eq a8 (smt_const (car pair) 8)) (smt_eq b8 (smt_const (cadr pair) 8))))))
+  (define answers (treelist->list (batch_check (make_smt_batch arithmetic comparisons specs) z3)))
+  (check-equal? (map solver_result_status answers) (make-list (length specs) 'unsat))
+  ;; and each ordering builder says what its cmpi does, for every input
+  (for ([predicate (in-list (cddr predicates))])
+    (check-eq? (status (query comparisons (format "cmp_~a" predicate) (list a8 b8)
+                              (smt_eq (smt_result 1) (bit (smt_cmp predicate a8 b8)))))
+               'unsat
+               (format "~a" predicate)))
+  ;; a comparison that is not the function's has a counterexample
+  (check-eq? (status (query comparisons "cmp_ult" (list a8 b8)
+                            (smt_eq (smt_result 1) (bit (smt_cmp 'slt a8 b8)))))
+             'sat)
+  ;; the lowering writes the SMT comparison, and no arith operation is left
+  (define ir (module_ir (query_module (query comparisons "cmp_slt" (list a8 b8) (smt_eq (smt_result 1) one)))))
+  (check-regexp-match #rx"smt.bv.cmp slt" ir)
+  (check-false (regexp-match? #rx"arith\\." ir)))
+
+;;==============================================================================
+;; A2. Selection
+
+(define choices
+  (program
+   "  func.func @choose(%a0: i1, %a1: i32, %a2: i32) -> i32 {\n    %r = arith.select %a0, %a1, %a2 : i32\n    return %r : i32\n  }\n"
+   "  func.func @larger(%a0: i32, %a1: i32) -> i32 {\n    %c = arith.cmpi ugt, %a0, %a1 : i32\n    %r = arith.select %c, %a0, %a1 : i32\n    return %r : i32\n  }\n"
+   ;; a step that stays or advances: phase 3 after `limit`, else unchanged
+   "  func.func @step(%a0: i32, %a1: i32, %a2: i32) -> i32 {\n    %three = arith.constant 3 : i32\n    %due = arith.cmpi uge, %a1, %a2 : i32\n    %r = arith.select %due, %three, %a0 : i32\n    return %r : i32\n  }\n"
+   "  func.func @vector(%a0: i1, %a1: i32, %a2: i32) -> i32 {\n    %r = arith.select %a0, %a1, %a2 : i32\n    %s = arith.addi %r, %r : i32\n    return %s : i32\n  }\n"))
+
+(test-case "arith.select chooses by an i1 that is 1, and the ite builder says the same"
+  (define r32 (smt_result 32))
+  (check-eq? (status (query choices "choose" (list c1 a32 b32)
+                            (smt_eq r32 (smt_ite (smt_eq c1 one) a32 b32))))
+             'unsat)
+  ;; the arms are not interchangeable
+  (check-eq? (status (query choices "choose" (list c1 a32 b32)
+                            (smt_eq r32 (smt_ite (smt_eq c1 one) b32 a32))))
+             'sat)
+  ;; a comparison feeding a select: the larger of two, unsigned
+  (check-eq? (status (query choices "larger" (list a32 b32)
+                            (smt_and (list (smt_cmp 'uge r32 a32) (smt_cmp 'uge r32 b32)
+                                           (smt_or (list (smt_eq r32 a32) (smt_eq r32 b32)))))))
+             'unsat)
+  (check-eq? (status (query choices "larger" (list a32 b32) (smt_cmp 'sge r32 a32))) 'sat)
+  ;; a step that stays in its phase or enters phase 3, under a precondition
+  (define-values (phase clock limit) (values (smt_input "phase" 32) (smt_input "clock" 32) (smt_input "limit" 32)))
+  (check-eq? (status (query choices "step" (list phase clock limit) (smt_eq r32 (smt_const 3 32))
+                            (list (smt_cmp 'uge clock limit))))
+             'unsat)
+  (check-eq? (status (query choices "step" (list phase clock limit) (smt_eq r32 phase)
+                            (list (smt_cmp 'ult clock limit))))
+             'unsat)
+  ;; what is still outside the fragment is still refused by name
+  (rejects #rx"unsupported operation 'arith.addi'"
+           (lambda () (query choices "vector" (list c1 a32 b32) (smt_eq r32 r32)))))
+
+;;==============================================================================
+;; A3. Several results
+
+(define several
+  (program
+   "  func.func @both(%a0: i32, %a1: i32) -> (i32, i32, i1) {\n    %s = \"arithmetic.add\"(%a0, %a1) : (i32, i32) -> i32\n    %c = arith.cmpi ult, %a0, %a1 : i32\n    return %s, %a0, %c : i32, i32, i1\n  }\n"
+   "  func.func @single(%a0: i32) -> i32 {\n    return %a0 : i32\n  }\n"))
+
+(test-case "each of a function's results is named by its index"
+  (define inputs (list a32 b32))
+  (define value
+    (query several "both" inputs
+           (smt_and (list (smt_eq (smt_result_at 0 32) (smt_binary 'add a32 b32))
+                          (smt_eq (smt_result_at 1 32) a32)
+                          (smt_eq (smt_result_at 2 1) (bit (smt_cmp 'ult a32 b32)))))))
+  (check-eq? (status value) 'unsat)
+  (check-equal? (query_function value) "both")
+  ;; a result may stand in a precondition, and results are not interchangeable
+  (check-eq? (status (query several "both" inputs (smt_cmp 'ult a32 b32)
+                            (list (smt_eq (smt_result_at 2 1) one))))
+             'unsat)
+  (check-eq? (status (query several "both" inputs (smt_eq (smt_result_at 0 32) (smt_result_at 1 32)))) 'sat)
+  ;; `result` with no index is the result of a one-result function, and stays so
+  (check-eq? (status (query several "single" (list a32) (smt_eq (smt_result 32) a32))) 'unsat)
+  (check-eq? (status (query several "single" (list a32) (smt_eq (smt_result_at 0 32) a32))) 'unsat)
+  (rejects #rx"function @both returns 3 values; the query refers to the result of a one-result function"
+           (lambda () (query several "both" inputs (smt_eq (smt_result 32) a32))))
+  (rejects #rx"refers to result 3, but function @both returns 3 value"
+           (lambda () (query several "both" inputs (smt_eq (smt_result_at 3 32) a32))))
+  (rejects #rx"refers to a 32-bit result 2, but function @both returns 'i1' there"
+           (lambda () (query several "both" inputs (smt_eq (smt_result_at 2 32) a32))))
+  (rejects #rx"result 0 is referenced with conflicting widths"
+           (lambda () (query several "both" inputs
+                             (smt_and (list (smt_eq (smt_result_at 0 32) a32)
+                                            (smt_eq (smt_result_at 0 8) a8))))))
+  ;; possible values are enumerated of one result
+  (rejects #rx"function @both returns 3 values; possible values are enumerated of a one-result function"
+           (lambda () (make_smt_values_query arithmetic several "both" inputs '()))))

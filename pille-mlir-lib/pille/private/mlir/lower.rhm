@@ -29,8 +29,14 @@ export:
 //
 // Operations are written in MLIR's generic form, and only these are ever
 // written: smt.solver, smt.set_logic, smt.declare_fun, smt.bv.constant,
-// smt.bv.add, smt.bv.mul, smt.bv.neg, smt.eq, smt.ite, smt.not, smt.and,
-// smt.or, smt.assert, smt.check and smt.yield.
+// smt.bv.add, smt.bv.mul, smt.bv.neg, smt.bv.cmp, smt.eq, smt.ite, smt.not,
+// smt.and, smt.or, smt.assert, smt.check and smt.yield.
+//
+// Beside a dialect's modeled operations, a body may hold three of MLIR's own
+// whose meaning is fixed: arith.constant, arith.cmpi (each predicate as the
+// SMT comparison of the same name, its i1 result the one-bit value 1 or 0)
+// and arith.select (an i1 condition `== 1` choosing between two values of one
+// width). A function may return several scalars.
 //
 // The module is read from the generic form the toolchain printed
 // (`generic.rhm`). Two things a native pass could ask MLIR and this cannot:
@@ -104,7 +110,7 @@ class Model(operands :: List.of(String),
 class Lowered(body :: List.of(String),
               next :: Int,
               widths :: List.of(Int),
-              returned :: Bv,
+              returned :: List.of(Bv),
               obligations :: List.of(String))
 
 // One manifest, and so one model, over one module.
@@ -117,6 +123,8 @@ class Context(module :: generic.Module,
 class Spec(function :: String,
            inputs :: List.of(Bv),
            expected_result_width :: maybe(Int),
+           // [[index, width], ...] for each result named by its index
+           expected_result_widths :: List,
            preconditions :: PairList,
            property,
            enumerate_values :: Boolean,
@@ -127,14 +135,14 @@ class Function(op :: generic.Op, block :: generic.Block)
 
 // The references an expression may use. Semantic expressions see an
 // operation's operands and locals; properties see function inputs and the
-// returned value. A tag outside its scope is a malformed manifest.
+// returned values. A tag outside its scope is a malformed manifest.
 class Scope(description :: String,
             semantic :: Boolean,
             operands :: List.of(Bv),
             locals :: List.of(Bv),
             result_width :: Int,
             inputs :: List.of(Bv),
-            result :: maybe(Bv))
+            results :: List.of(Bv))
 
 class Query(context :: Context,
             specification :: Map,
@@ -222,6 +230,26 @@ fun bv_ite(q :: Query, test :: String, chosen :: Bv, otherwise :: Bv, loc :: Str
   emit(q, name ++ " = \"smt.ite\"(" ++ test ++ ", " ++ chosen.name ++ ", " ++ otherwise.name ++ ") : (!smt.bool, "
             ++ type ++ ", " ++ type ++ ") -> " ++ type, loc)
   Bv(name, chosen.width)
+
+// smt.bv.cmp's predicates, by the names arith.cmpi and the builders give them.
+def cmp_predicates :: Map = {"slt": 0, "sle": 1, "sgt": 2, "sge": 3, "ult": 4, "ule": 5, "ugt": 6, "uge": 7}
+
+fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
+  let name = fresh(q)
+  let type = bv_type(lhs.width)
+  emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " +& predicate +& " : i64}> : ("
+            ++ type ++ ", " ++ type ++ ") -> !smt.bool", loc)
+  name
+
+// A Boolean as the one-bit value an i1 is, and an i1 as a Boolean. The two
+// sorts stay distinct: each crossing is one of these, written out.
+fun bool_bit(q :: Query, test :: String, loc :: String) :: Bv:
+  let one = bv_constant(q, 1, 1, loc)
+  let zero = bv_constant(q, 0, 1, loc)
+  bv_ite(q, test, one, zero, loc)
+
+fun bit_bool(q :: Query, bit :: Bv, loc :: String) :: String:
+  bv_eq(q, bit, bv_constant(q, 1, 1, loc), loc)
 
 fun bool_not(q :: Query, input :: String, loc :: String) :: String:
   let name = fresh(q)
@@ -321,11 +349,25 @@ fun read_spec(q :: Query) :: Spec:
         | q.malformed("invalid result width")
         number
     | ~else: #false
+  let expected_result_widths :: List:
+    cond
+    | specification.has_key(#'result_widths):
+        match as_array(get(specification, #'result_widths))
+        | entries :: PairList:
+            for List (entry in entries):
+              let pair = as_array(entry)
+              let index = pair && (pair :~ PairList).length() == 2 && as_integer((pair :~ PairList)[0])
+              let width = pair && (pair :~ PairList).length() == 2 && as_integer((pair :~ PairList)[1])
+              unless index && index >= 0 && width && is_supported_width(width)
+              | q.malformed("invalid result width")
+              [index, width]
+        | ~else: q.malformed("invalid result widths")
+    | ~else: []
   // The model is one per manifest: read with the first query, as the first
   // query's own.
   unless q.context.models
   | read_models(q, operations, unmodeled_list)
-  Spec(name, inputs, expected_result_width, preconditions,
+  Spec(name, inputs, expected_result_width, expected_result_widths, preconditions,
        get(specification, #'property), enumerate_values, result_symbol, defined_symbol)
 
 // Function-level attributes that cannot change the value computed by a
@@ -360,19 +402,29 @@ fun check_function(q :: Query, spec :: Spec) :: Function:
     match function.property("function_type")
     | type :: String: generic.split_types(type)
     | ~else: q.error(loc, "SMT query: function @" ++ name ++ " has no function type")
-  unless result_types.length() == 1
-  | q.error(loc, "SMT query: function @" ++ name ++ " returns " +& result_types.length()
-                   +& " values; exactly one scalar result is supported")
-  let result_width = supported_width(result_types[0])
-  when result_width == 0
-  | q.error(loc, "SMT query: unsupported result type '" ++ result_types[0] ++ "' of function @" ++ name
-                   ++ supported_types)
+  when result_types.length() == 0
+  | q.error(loc, "SMT query: function @" ++ name ++ " returns no value; at least one scalar result is needed")
+  for (type in result_types):
+    when supported_width(type) == 0
+    | q.error(loc, "SMT query: unsupported result type '" ++ type ++ "' of function @" ++ name
+                     ++ supported_types)
+  // `result` with no index is the one result of a one-result function.
   match spec.expected_result_width
   | expected :: Int:
-      unless expected == result_width
+      unless result_types.length() == 1
+      | q.error(loc, "SMT query: function @" ++ name ++ " returns " +& result_types.length()
+                       +& " values; the query refers to the result of a one-result function, so name each by its index")
+      unless expected == supported_width(result_types[0])
       | q.error(loc, "SMT query: the property refers to a " +& expected +& "-bit result, but function @" ++ name
                        ++ " returns '" ++ result_types[0] ++ "'")
   | ~else: #void
+  for ([index :: Int, expected :: Int] in spec.expected_result_widths):
+    unless index < result_types.length()
+    | q.error(loc, "SMT query: the query refers to result " +& index +& ", but function @" ++ name ++ " returns "
+                     +& result_types.length() +& " value(s)")
+    unless expected == supported_width(result_types[index])
+    | q.error(loc, "SMT query: the query refers to a " +& expected +& "-bit result " +& index +& ", but function @"
+                     ++ name ++ " returns '" ++ result_types[index] ++ "' there")
   unless input_types.length() == spec.inputs.length()
   | q.error(loc, "SMT query: function @" ++ name ++ " has " +& input_types.length() +& " arguments, but "
                    +& spec.inputs.length() +& " inputs were declared")
@@ -483,9 +535,21 @@ fun lower_term(q :: Query, expression, scope :: Scope, loc :: String) :: Bv:
       | tag == "local" && scope.semantic: reference(q, node, scope.locals, scope)
       | tag == "input" && !scope.semantic: reference(q, node, scope.inputs, scope)
       | tag == "result" && !scope.semantic && node.length() == 1:
-          match scope.result
-          | result :: Bv: result
+          match scope.results
+          | [result]: result
           | ~else: q.malformed("unsupported expression 'result' in " ++ scope.description)
+      // (a tag of its own: `result` with anything after it stays malformed)
+      | tag == "result_at" && !scope.semantic && node.length() == 2:
+          reference(q, node, scope.results, scope)
+      | tag == "ite" && node.length() == 4:
+          let test = lower_formula(q, node[1], scope, loc)
+          let chosen = lower_term(q, node[2], scope, loc)
+          let otherwise = lower_term(q, node[3], scope, loc)
+          unless chosen.width == otherwise.width
+          | q.error(loc, "SMT query: ite in " ++ scope.description ++ " chooses between a " +& chosen.width
+                           +& "-bit value and a " +& otherwise.width
+                           +& "-bit value; widths must be equal and are never coerced or assumed equal")
+          bv_ite(q, test, chosen, otherwise, loc)
       | tag == "const": lower_literal(q, node, scope, loc)
       | is_arithmetic(tag) && node.length() == 3:
           let lhs = lower_term(q, node[1], scope, loc)
@@ -530,6 +594,16 @@ fun lower_formula(q :: Query, expression, scope :: Scope, loc :: String) :: Stri
           | q.error(loc, "SMT query: equality in " ++ scope.description ++ " compares a " +& lhs.width
                            +& "-bit value with a " +& rhs.width +& "-bit value")
           bv_eq(q, lhs, rhs, loc)
+      | tag == "cmp" && node.length() == 4:
+          let predicate = as_string(node[1])
+          unless predicate && cmp_predicates.has_key(predicate)
+          | q.malformed("unknown comparison in " ++ scope.description)
+          let lhs = lower_term(q, node[2], scope, loc)
+          let rhs = lower_term(q, node[3], scope, loc)
+          unless lhs.width == rhs.width
+          | q.error(loc, "SMT query: comparison " ++ (predicate :~ String) ++ " in " ++ scope.description
+                           ++ " compares a " +& lhs.width +& "-bit value with a " +& rhs.width +& "-bit value")
+          bv_cmp(q, cmp_predicates[predicate], lhs, rhs, loc)
       | tag == "not" && node.length() == 2:
           bool_not(q, lower_formula(q, node[1], scope, loc), loc)
       | (tag == "and" || tag == "or") && node.length() >= 2:
@@ -571,6 +645,57 @@ fun lower_constant(q :: Query, op :: generic.Op):
   | ~else:
       q.error(loc, "SMT query: unsupported constant of type '" ++ type ++ "'" ++ supported_types)
 
+// The lowered operands of one of MLIR's own operations, each of a supported
+// integer type.
+fun standard_operands(q :: Query, op :: generic.Op) :: List.of(Bv):
+  for List (operand in op.operands, type in op.operand_types, index in 0 ..):
+    when supported_width(type) == 0
+    | q.error(op.loc, "SMT query: operand " +& index +& " of " ++ op.name ++ " has unsupported type '" ++ type ++ "'"
+                        ++ supported_types)
+    match q.values.get(operand, #false)
+    | lowered :: Bv: lowered
+    | ~else: q.error(op.loc, "SMT query: internal error: operand " +& index +& " of " ++ op.name ++ " has no lowered value")
+
+// arith.cmpi: `predicate` is 0 eq, 1 ne, then slt, sle, sgt, sge, ult, ule,
+// ugt, uge. Its i1 result is the one-bit value 1 where the comparison holds.
+def cmpi_predicates :: List.of(String) = ["eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge"]
+
+fun lower_cmpi(q :: Query, op :: generic.Op):
+  let loc = op.loc
+  for (attribute in op.attribute_names()):
+    unless attribute == "predicate"
+    | q.error(loc, "SMT query: unsupported attribute '" ++ attribute ++ "' on arith.cmpi")
+  let predicate :: maybe(Int):
+    match op.property("predicate")
+    | text :: String:
+        match rkt.#{regexp-match}(#{#px"^([0-9]+)(?: : i64)?$"}, text)
+        | PairList[_, digits]: String.to_int(to_string(digits))
+        | ~else: #false
+    | ~else: #false
+  let operands = standard_operands(q, op)
+  unless predicate && predicate < cmpi_predicates.length() && operands.length() == 2 && op.results.length() == 1
+           && op.result_types[0] == "i1" && operands[0].width == operands[1].width
+  | q.error(loc, "SMT query: unsupported arith.cmpi; an integer comparison of two scalars of one supported width is needed")
+  let name = cmpi_predicates[predicate!!]
+  let test:
+    cond
+    | name == "eq": bv_eq(q, operands[0], operands[1], loc)
+    | name == "ne": bool_not(q, bv_eq(q, operands[0], operands[1], loc), loc)
+    | ~else: bv_cmp(q, cmp_predicates[name], operands[0], operands[1], loc)
+  q.values[op.results[0]] := bool_bit(q, test, loc)
+
+// arith.select: the first operand, an i1, chooses the second where it is 1.
+fun lower_select(q :: Query, op :: generic.Op):
+  let loc = op.loc
+  match op.attribute_names()
+  | [first, & _]: q.error(loc, "SMT query: unsupported attribute '" ++ first ++ "' on arith.select")
+  | ~else: #void
+  let operands = standard_operands(q, op)
+  unless operands.length() == 3 && op.results.length() == 1 && operands[0].width == 1
+           && operands[1].width == operands[2].width && supported_width(op.result_types[0]) == operands[1].width
+  | q.error(loc, "SMT query: unsupported arith.select; an i1 condition choosing between two scalars of one supported width is needed")
+  q.values[op.results[0]] := bv_ite(q, bit_bool(q, operands[0], loc), operands[1], operands[2], loc)
+
 fun lower_modeled(q :: Query, op :: generic.Op, model :: Model, is_last :: Boolean):
   let loc = op.loc
   let name = op.name
@@ -607,8 +732,8 @@ fun lower_modeled(q :: Query, op :: generic.Op, model :: Model, is_last :: Boole
   let description = "the semantics of '" ++ name ++ "'"
   let locals :: List.of(Bv):
     for values(locals :: List.of(Bv) = []) (local :: List in model.locals):
-      locals.add(lower_term(q, local[1], Scope(description, #true, operands, locals, result_width, [], #false), loc))
-  let scope = Scope(description, #true, operands, locals, result_width, [], #false)
+      locals.add(lower_term(q, local[1], Scope(description, #true, operands, locals, result_width, [], []), loc))
+  let scope = Scope(description, #true, operands, locals, result_width, [], [])
   let result = lower_term(q, model.value, scope, loc)
   unless result.width == result_width
   | q.error(loc, "SMT query: the semantics of '" ++ name ++ "' produce a " +& result.width +& "-bit value for result '"
@@ -616,14 +741,14 @@ fun lower_modeled(q :: Query, op :: generic.Op, model :: Model, is_last :: Boole
                    ++ "'; widths are never coerced or assumed equal")
   match model.requirements
   | requirements :: PairList:
-      let required = Scope("a requirement of '" ++ name ++ "'", #true, operands, locals, result_width, [], #false)
+      let required = Scope("a requirement of '" ++ name ++ "'", #true, operands, locals, result_width, [], [])
       for (predicate in requirements):
         let obligation = lower_formula(q, predicate, required, loc)
         q.obligations := q.obligations.add(obligation)
   | ~else: #void
   q.values[op.results[0]] := result
 
-fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of(Bv), Bv):
+fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of(Bv), List.of(Bv)):
   let block = function.block
   let inputs :: List.of(Bv):
     for List (input in spec.inputs, argument in block.args):
@@ -632,17 +757,26 @@ fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of
       declared
   let count = block.ops.length()
   let models :: Map = q.context.models || {}
-  let returned :: maybe(Bv):
-    for values(returned :: maybe(Bv) = #false) (op in block.ops, position in 0 ..):
+  let returned :: maybe(List):
+    for values(returned :: maybe(List) = #false) (op in block.ops, position in 0 ..):
       let name = op.name
       cond
       | name == "arith.constant":
           lower_constant(q, op)
           returned
+      | name == "arith.cmpi":
+          lower_cmpi(q, op)
+          returned
+      | name == "arith.select":
+          lower_select(q, op)
+          returned
       | name == "func.return":
-          unless op.operands.length() == 1 && op.attribute_names().length() == 0
+          unless op.operands.length() >= 1 && op.attribute_names().length() == 0
           | q.error(op.loc, "SMT query: unsupported return in function @" ++ spec.function)
-          q.values.get(op.operands[0], #false)
+          for List (operand in op.operands):
+            match q.values.get(operand, #false)
+            | value :: Bv: value
+            | ~else: q.error(op.loc, "SMT query: function @" ++ spec.function ++ " does not return a supported value")
       | models.has_key(name):
           lower_modeled(q, op, models[name], position == count - 1)
           returned
@@ -651,9 +785,9 @@ fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of
                             ++ "' has no declared SMT semantics; add an smt clause to its declaration")
       | ~else:
           q.error(op.loc, "SMT query: unsupported operation '" ++ name
-                            ++ "'; only arith.constant, func.return, and operations with declared SMT semantics are supported")
+                            ++ "'; only arith.constant, arith.cmpi, arith.select, func.return, and operations with declared SMT semantics are supported")
   match returned
-  | value :: Bv: values(inputs, value)
+  | results :: List.of(Bv): values(inputs, results)
   | ~else: q.error(function.op.loc, "SMT query: function @" ++ spec.function ++ " does not return a supported value")
 
 //==============================================================================
@@ -667,7 +801,7 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
   let function = check_function(q, spec)
   let loc = function.op.loc
   emit(q, "\"smt.set_logic\"() <{logic = \"QF_BV\"}> : () -> ()", loc)
-  let (inputs :: List.of(Bv), returned :: Bv):
+  let (inputs :: List.of(Bv), returned :: List.of(Bv)):
     cond
     | context.lowered.has_key(spec.function):
         let prepared :: Lowered = context.lowered[spec.function]
@@ -697,6 +831,10 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
     assert(q, lower_formula(q, precondition, scope, loc), loc)
   cond
   | spec.enumerate_values:
+      unless returned.length() == 1
+      | q.error(loc, "SMT query: function @" ++ spec.function ++ " returns " +& returned.length()
+                       +& " values; possible values are enumerated of a one-result function")
+      let returned = returned[0]
       // Expose the result and definedness separately. The caller first asks
       // if any admitted input violates a requirement, so enumeration cannot
       // hide partial functions by filtering away their undefined inputs.

@@ -13,8 +13,8 @@
          "tools.rkt"
          "lower.rhm")
 
-(provide smt_input smt_result smt_const smt_binary
-         smt_eq smt_not smt_and smt_or
+(provide smt_input smt_result smt_result_at smt_const smt_binary smt_ite
+         smt_eq smt_cmp smt_not smt_and smt_or
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -50,10 +50,13 @@
 ;; and no constructor converts between the two.
 ;;
 ;;   (term 'input (name) width)   a function argument, by display name
-;;   (term 'result () width)      the value returned by the selected function
+;;   (term 'result () width)      the value returned by a one-result function
+;;   (term 'result (index) width) one of the values a function returns
 ;;   (term 'const (value) width)  a typed literal
 ;;   (term 'add|'sub|'mul (a b) width)
+;;   (term 'ite (f a b) width)    a where f holds, else b
 ;;   (formula 'eq (a b)) (formula 'not (f)) (formula 'and fs) (formula 'or fs)
+;;   (formula 'cmp (predicate a b))   predicate one of comparison-predicates
 (struct term (tag args width) #:transparent)
 (struct formula (tag args) #:transparent)
 
@@ -104,6 +107,11 @@
 (define (smt_result width)
   (term 'result '() (check-width 'result width)))
 
+(define (smt_result_at index width)
+  (unless (exact-nonnegative-integer? index)
+    (raise-argument-error 'result "exact-nonnegative-integer?" index))
+  (term 'result (list index) (check-width 'result width)))
+
 (define (smt_const value width)
   (unless (exact-integer? value)
     (raise-argument-error 'const "exact-integer?" value))
@@ -140,6 +148,17 @@
   (check-terms 'eq lhs rhs)
   (formula 'eq (list lhs rhs)))
 
+;; Unsigned and signed orderings. Signedness is said by the predicate, never
+;; inferred from a term.
+(define comparison-predicates '(ult ule ugt uge slt sle sgt sge))
+
+(define (smt_cmp predicate lhs rhs)
+  (define symbol (if (string? predicate) (string->symbol predicate) predicate))
+  (unless (memq symbol comparison-predicates)
+    (raise-argument-error 'smt_cmp "one of ult ule ugt uge slt sle sgt sge (symbol or string)" predicate))
+  (check-terms symbol lhs rhs)
+  (formula 'cmp (list symbol lhs rhs)))
+
 (define (check-formula who value)
   (unless (formula? value)
     (builder-error who "expected a Boolean predicate, received ~a; Boolean predicates and bitvectors are distinct sorts"
@@ -148,6 +167,11 @@
 (define (smt_not value)
   (check-formula 'not value)
   (formula 'not (list value)))
+
+(define (smt_ite test chosen otherwise)
+  (check-formula 'ite test)
+  (check-terms 'ite chosen otherwise)
+  (term 'ite (list test chosen otherwise) (term-width chosen)))
 
 (define (entries who values)
   (cond
@@ -176,7 +200,10 @@
 (define (render-term value)
   (match value
     [(term 'input (list name) _) name]
-    [(term 'result _ _) "result"]
+    [(term 'result '() _) "result"]
+    [(term 'result (list index) _) (format "result[~a]" index)]
+    [(term 'ite (list test chosen otherwise) _)
+     (format "(~a ? ~a : ~a)" (render-formula test) (render-term chosen) (render-term otherwise))]
     [(term 'const (list literal) 1) (format "0b~a:bv1" literal)]
     [(term 'const (list literal) width)
      (format "0x~a:bv~a"
@@ -191,6 +218,12 @@
 (define (render-formula value)
   (match value
     [(formula 'eq (list lhs rhs)) (format "~a == ~a" (render-term lhs) (render-term rhs))]
+    [(formula 'cmp (list predicate lhs rhs))
+     (format "~a ~a ~a" (render-term lhs)
+             (case predicate
+               [(ult) "<u"] [(ule) "<=u"] [(ugt) ">u"] [(uge) ">=u"]
+               [(slt) "<s"] [(sle) "<=s"] [(sgt) ">s"] [(sge) ">=s"])
+             (render-term rhs))]
     [(formula 'not (list operand)) (format "!(~a)" (render-formula operand))]
     [(formula tag operands)
      (define joined
@@ -212,7 +245,11 @@
            (builder-error 'smt_query "the property refers to input ~a, which is not among the declared inputs"
                           name)))
      (list "input" position)]
-    [(term 'result _ _) (list "result")]
+    [(term 'result '() _) (list "result")]
+    [(term 'result (list index) _) (list "result_at" index)]
+    [(term 'ite (list test chosen otherwise) _)
+     (list "ite" (formula->manifest test inputs) (term->manifest chosen inputs)
+           (term->manifest otherwise inputs))]
     [(term 'const (list literal) width)
      (list "const" (number->string literal) (list "width" width))]
     [(term tag (list lhs rhs) _)
@@ -222,15 +259,21 @@
   (match value
     [(formula 'eq (list lhs rhs))
      (list "eq" (term->manifest lhs inputs) (term->manifest rhs inputs))]
+    [(formula 'cmp (list predicate lhs rhs))
+     (list "cmp" (symbol->string predicate) (term->manifest lhs inputs) (term->manifest rhs inputs))]
     [(formula tag operands)
      (cons (symbol->string tag)
            (for/list ([operand (in-list operands)]) (formula->manifest operand inputs)))]))
 
+;; Each reference to a returned value: (index . width), index #f for the result
+;; of a one-result function.
 (define (result-widths value)
+  (define (node? part) (or (term? part) (formula? part)))
   (match value
-    [(term 'result _ width) (list width)]
-    [(term _ arguments _) (append-map result-widths (filter term? arguments))]
-    [(formula _ operands) (append-map result-widths operands)]))
+    [(term 'result '() width) (list (cons #f width))]
+    [(term 'result (list index) width) (list (cons index width))]
+    [(term _ arguments _) (append-map result-widths (filter node? arguments))]
+    [(formula _ operands) (append-map result-widths (filter node? operands))]))
 
 (define (validate-inputs function inputs preconditions)
   (unless (and (string? function) (non-empty-string? function))
@@ -270,16 +313,26 @@
   (define-values (function declared property assumptions) (spec-fields value))
   (validate-inputs function declared assumptions)
   (when (spec? value) (check-formula 'smt_query property))
-  (define widths (remove-duplicates (append-map result-widths
-                                               (if property (cons property assumptions) assumptions))))
+  (define references (remove-duplicates (append-map result-widths
+                                                   (if property (cons property assumptions) assumptions))))
+  (define widths (for/list ([reference (in-list references)] #:unless (car reference)) (cdr reference)))
   (when (> (length widths) 1)
     (builder-error 'smt_query "the result is referenced with conflicting widths: ~a"
                    (string-join (map number->string widths) ", ")))
+  (define indexed
+    (sort (for/list ([reference (in-list references)] #:when (car reference)) reference) < #:key car))
+  (define conflict (check-duplicates (map car indexed)))
+  (when conflict
+    (builder-error 'smt_query "result ~a is referenced with conflicting widths: ~a" conflict
+                   (string-join (for/list ([reference (in-list indexed)] #:when (= (car reference) conflict))
+                                  (number->string (cdr reference)))
+                                ", ")))
   (define base
     (hasheq 'function function
             'inputs (for/list ([input (in-list declared)])
                       (hasheq 'name (car (term-args input)) 'width (term-width input)))
             'result_width (if (null? widths) (json-null) (car widths))
+            'result_widths (for/list ([reference (in-list indexed)]) (list (car reference) (cdr reference)))
             'preconditions (for/list ([assumption (in-list assumptions)])
                              (formula->manifest assumption declared))
             'property (if property (formula->manifest property declared) (json-null))))

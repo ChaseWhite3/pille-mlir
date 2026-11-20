@@ -603,7 +603,9 @@
   (rejects #rx"unsupported result type 'index'" arithmetic module "index_result" inputs trivial)
   (rejects #rx"unsupported result type 'f32'" arithmetic module "float_result" inputs trivial)
   (rejects #rx"unsupported control flow: function @branch has 2 blocks" arithmetic module "branch" inputs trivial)
-  (rejects #rx"function @pair returns 2 values; exactly one scalar result is supported"
+  ;; `result` with no index is the result of a one-result function; a function with
+  ;; several is read by index (smt-synthesis.rkt).
+  (rejects #rx"function @pair returns 2 values; the query refers to the result of a one-result function"
            arithmetic module "pair" inputs trivial)
   (rejects #rx"function @declared is a declaration without a body" arithmetic module "declared" inputs trivial)
   (rejects #rx"unsupported attribute 'pille.note' on function @annotated" arithmetic module "annotated" inputs trivial)

@@ -67,14 +67,28 @@
           (values lowered (add1 refused))
           (values (add1 lowered) refused))))
   (check-equal? (list lowered refused) '(645 129))
-  ;; The differences are these three and no others.
+  ;; The differences are these and no others: two readers' own words for malformed
+  ;; JSON and for an operation with memory effects (three requests, from the port),
+  ;; and nine refusals reworded when the fragment grew on 2026-11-20 (arith.cmpi,
+  ;; arith.select and several results; the same things are refused).
   (check-equal? (sort (remove-duplicates
                        (for/list ([request (in-list requests)]
                                   #:when (hash-has-key? request 'lowering))
                          (hash-ref (hash-ref request 'plugin) 'refused)))
                       string<?)
-                '("SMT query: operation 'memref.alloca' has known memory effects, which the pure SMT model cannot represent"
-                  "malformed SMT query manifest: [1:2, byte=2]: Expected object key")))
+                (sort
+                 (append
+                  '("SMT query: operation 'memref.alloca' has known memory effects, which the pure SMT model cannot represent"
+                    "malformed SMT query manifest: [1:2, byte=2]: Expected object key"
+                    "SMT query: function @pair returns 2 values; exactly one scalar result is supported"
+                    "SMT query: function @multi returns 2 values; exactly one scalar result is supported"
+                    "SMT query: function @affine returns 0 values; exactly one scalar result is supported")
+                  (for/list ([operation '("arith.addi" "memref.alloca" "func.call" "scf.execute_region" "arith.sitofp")])
+                    (format "SMT query: unsupported operation '~a'; only arith.constant, func.return, and operations with declared SMT semantics are supported"
+                            operation)))
+                 string<?))
+  ;; and each reworded refusal still refuses, never lowers
+  (check-equal? (for/sum ([request (in-list requests)] #:when (hash-has-key? request 'lowering)) 1) 12))
 
 ;; The reader of the generic form refuses what it does not read, with the place.
 ;; The reader takes the text the tools return, which is immutable.

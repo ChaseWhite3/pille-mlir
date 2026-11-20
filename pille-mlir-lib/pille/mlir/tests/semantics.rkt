@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require json
+         (only-in "../../private/mlir/tools.rkt" llvm-search-prefixes)
          rackunit
          racket/list
          racket/treelist
@@ -14,7 +15,9 @@
     (for ([name '(#"PATH" #"PILLE_MLIR_PREFIX" #"PILLE_LLVM_PREFIX" #"PILLE_MLIR_SMT_PLUGIN" #"PILLE_Z3")])
       (environment-variables-set! (current-environment-variables) name #f))
     (environment-variables-set! (current-environment-variables) #"PATH" #"")
-    (thunk)))
+    ;; and none of the usual places either
+    (parameterize ([llvm-search-prefixes '()])
+      (thunk))))
 
 (define i32 (type_is "i32"))
 (define i64 (type_is "i64"))

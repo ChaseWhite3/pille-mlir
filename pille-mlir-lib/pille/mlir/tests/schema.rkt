@@ -2,7 +2,8 @@
 
 (require rackunit
          racket/treelist
-         "../../private/mlir/schema.rkt")
+         "../../private/mlir/schema.rkt"
+         (only-in "../../private/mlir/tools.rkt" llvm-search-prefixes))
 
 (define integer (any_of (list (type_is "i32") (type_is "i64"))))
 (define shared-integer (same "T" integer))
@@ -13,7 +14,9 @@
 
 (test-case "descriptions round-trip deterministically without an installed toolchain"
   (parameterize ([current-environment-variables
-                  (environment-variables-copy (current-environment-variables))])
+                  (environment-variables-copy (current-environment-variables))]
+                 ;; and none of the usual places either
+                 [llvm-search-prefixes '()])
     (environment-variables-set! (current-environment-variables) #"PATH" #"")
     (environment-variables-set! (current-environment-variables) #"PILLE_MLIR_PREFIX" #f)
     (environment-variables-set! (current-environment-variables) #"PILLE_LLVM_PREFIX" #f)

@@ -1,0 +1,108 @@
+#lang rhombus
+
+import:
+  lib("racket/base.rkt") as racket
+  rhombus/envvar
+
+export:
+  doctor
+
+// `raco pille doctor`: whether Pille can run here, each thing it needs checked in turn, and for each that is not
+// right, what to do. The checks that need LLVM load what they test only when they run, so that a missing piece is
+// reported, not raised before anything is said.
+
+// a module of Pille's by its file, `.rhm` or `.rkt` (a Racket module path assumes `.rkt`)
+fun dynamic(mod :: String, name :: String):
+  racket.#{dynamic-require}(racket.list(#'lib, mod), racket.#{string->symbol}(name))
+
+// The message of a failure, its first lines.
+fun said(exn :: Exn) :: String:
+  String.join(exn.message.split("\n").take(math.min(8, exn.message.split("\n").length())), "\n         ")
+
+class Check(name :: String, status :: Symbol, detail :: String, fix :: maybe(String))
+
+fun run(name :: String, required :: Boolean, body :: Function) :: Check:
+  try:
+    let [status, detail] = body()
+    Check(name, status, detail, #false)
+    ~catch exn :: Exn:
+      Check(name, if required | #'fail | #'missing, said(exn), #false)
+
+fun with_fix(c :: Check, fix :: String) :: Check:
+  if c.status == #'ok | c | Check(c.name, c.status, c.detail, fix)
+
+fun check_llvm():
+  let prefix = dynamic("pille/private/llvm/paths.rhm", "llvm_prefix")()
+  let PairList[major, minor, patch] = racket.#{call-with-values}(dynamic("pille/private/llvm/llvm_c.rkt", "LLVMGetVersion"), racket.list)
+  let how = if envvar.getenv("PILLE_LLVM_PREFIX") | " (PILLE_LLVM_PREFIX)" | " (found)"
+  [#'ok, major +& "." +& minor +& "." +& patch +& " at " +& prefix ++ how]
+
+fun check_jit():
+  let answer = dynamic("pille/private/doctor_jit.rhm", "jit_answer")()
+  if answer == 42
+  | [#'ok, "compiled and ran `40 + 2` as Int(32)"]
+  | [#'fail, "compiled `40 + 2` and got " +& answer]
+
+fun check_callbacks():
+  if dynamic("pille/private/runtime/rhombus_interop.rhm", "callbacks_work")()
+  | [#'ok, "Pille called a Rhombus function and got " +& dynamic("pille/private/doctor_jit.rhm", "callback_answer")()]
+  | [#'fail, "this Racket's FFI cannot call back into Rhombus"]
+
+fun check_mlir():
+  let chain = dynamic("pille/private/mlir/tools.rkt", "make_toolchain")()
+  [#'ok, "in " +& dynamic("pille/private/mlir/tools.rkt", "toolchain_bin")(chain)]
+
+fun check_z3():
+  let found = envvar.getenv("PILLE_Z3") || racket.#{find-executable-path}("z3")
+  if found
+  | [#'ok, to_string(found)]
+  | [#'missing, "not on PATH, and PILLE_Z3 is not set"]
+
+def llvm_fix = "install LLVM 23 with its shared library (on macOS, `brew install llvm@23`), or set PILLE_LLVM_PREFIX to one"
+def jit_fix = "see the message; `raco setup --pkgs pille-llvm-lib pille-lib pille-spmd-lib pille-mlir-lib pille` rebuilds stale compiled files"
+def callbacks_fix = "use Racket built from Git or a recent snapshot (the README suggests rackup): Pille tracks unreleased Racket and Rhombus changes"
+def mlir_fix = "only pille/mlir needs them: install LLVM 23 with MLIR (Homebrew's llvm@23 has it), or set PILLE_MLIR_PREFIX"
+def z3_fix = "only pille/mlir's SMT queries need it: `brew install z3`, or set PILLE_Z3"
+
+fun checks() :: List:
+  let racket_check = Check("Racket", #'ok, racket.version() ++ " (" +& racket.#{system-type}(#'vm) ++ ")", #false)
+  let llvm = with_fix(run("LLVM", #true, check_llvm), llvm_fix)
+  let jit:
+    if llvm.status == #'ok
+    | with_fix(run("JIT", #true, check_jit), jit_fix)
+    | Check("JIT", #'skipped, "needs LLVM", #false)
+  let callbacks:
+    if jit.status == #'ok
+    | with_fix(run("Callbacks", #true, check_callbacks), callbacks_fix)
+    | Check("Callbacks", #'skipped, "needs the JIT", #false)
+  let mlir = with_fix(run("MLIR tools", #false, check_mlir), mlir_fix)
+  let z3 = with_fix(run("Z3", #false, check_z3), z3_fix)
+  [racket_check, llvm, jit, callbacks, mlir, z3]
+
+fun mark(status :: Symbol) :: String:
+  match status
+  | #'ok: "ok      "
+  | #'fail: "FAILED  "
+  | #'missing: "missing "
+  | #'skipped: "skipped "
+
+// Prints each check, and gives #true when everything Pille needs is there (the MLIR tools and Z3 are optional).
+fun doctor() :: Boolean:
+  println("Pille: checking what it needs")
+  let results = checks()
+  for (c :: Check in results):
+    println("  " ++ mark(c.status) ++ c.name ++ ": " ++ c.detail)
+    when c.fix
+    | println("          fix: " ++ c.fix)
+  let fine = for all (c :: Check in results): c.status != #'fail && c.status != #'skipped
+  println(if fine | "Pille can run here." | "Pille cannot run here yet: see each fix above.")
+  fine
+
+module main:
+  match racket.#{current-command-line-arguments}().to_list()
+  | [] || ["doctor"]:
+      unless doctor()
+      | racket.exit(1)
+  | ~else:
+      println("usage: raco pille doctor")
+      racket.exit(2)

@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require json
+         (only-in "../../private/mlir/tools.rkt" make_toolchain toolchain_bin)
          rackunit
          racket/file
          racket/list
@@ -299,10 +300,9 @@
   (check-eq? (status (query arithmetic overflow "negative_one" '() (same r32 (literal -1 32))))
              'unsat))
 
+;; the installation the toolchain chose, however it was found
 (define mlir-opt
-  (build-path (or (getenv "PILLE_MLIR_PREFIX") (getenv "PILLE_LLVM_PREFIX")
-                  (simplify-path (build-path (path-only (find-executable-path "mlir-opt")) 'up)))
-              "bin" "mlir-opt"))
+  (build-path (toolchain_bin (make_toolchain)) (if (eq? (system-type) 'windows) "mlir-opt.exe" "mlir-opt")))
 
 ;; The generic form prints every operand and result type explicitly.
 (define (generic-ir value)

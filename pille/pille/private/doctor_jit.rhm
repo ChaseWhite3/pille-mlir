@@ -1,0 +1,20 @@
+#lang rhombus/static
+
+import:
+  pille/hosted open
+
+export:
+  jit_answer
+  callback_answer
+
+// For `raco pille doctor` (pille/doctor): one Pille expression compiled and run by the JIT, and one that calls back
+// into Rhombus. Loaded only when the doctor asks, since loading it needs LLVM.
+
+fun jit_answer() :: Int:
+  pille(x :: Int(32) = 40):
+    x + 2
+
+fun callback_answer() :: Int:
+  pille:
+    rhombus :: UInt(32):
+      42

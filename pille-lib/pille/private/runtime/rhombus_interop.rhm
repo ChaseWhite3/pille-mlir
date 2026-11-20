@@ -1,10 +1,31 @@
 #lang rhombus/static/and_meta
 
 import:
+  lib("racket/base.rkt") as racket
   ffi open
   pille/concretize open
   pille/llvm
   pille/lowering
+
+// Whether a callback into Rhombus can be made and called through a foreign call, as Pille's are: #false on a Racket
+// whose FFI cannot (the 9.3 release with ffi2 from Git). Asked once.
+def mutable callbacks_known :: maybe(Box) = #false
+export fun callbacks_work() :: Boolean:
+  unless callbacks_known
+  | callbacks_known := Box(
+      try:
+        let reached = Box(#false)
+        let callback:
+          cast ~from(ptr_t -> void_t: ~collect_safe) ~to(ptr_t) (fun (_ :: ptr_t): reached.value := #true)
+        let call:
+          cast (ptr_t/gcable -> void_t:
+                  ~allow_callback_exn
+                  ~collect_safe) callback
+        call(callback)
+        reached.value
+        ~catch _ :: Exn.Fail:
+          #false)
+  callbacks_known!!.value
 
 export class RhombusToPilleAdapter(
   make_callout :: ptr_t -> Function.assume_of((~any) -> Any),
@@ -42,7 +63,18 @@ export class RhombusToPilleAdapter(
           try:
             for (arg in args, writer in arg_writers, offset in arg_offsets):
               writer(frame, offset, arg)
-            prim_callout(frame)
+            try:
+              prim_callout(frame)
+              // On a Racket too old for the Git ffi2 it is paired with (the 9.3 release, seen 2026-11-20), every
+              // call back into Rhombus fails inside ffi2 with "not a function, given: #false". A body's own
+              // error can say that too, so the plain message is given only where callbacks fail on their own.
+              ~catch exn :: Exn.Fail when exn.message.contains("not a function") && !callbacks_work():
+                error(~who: #'pille,
+                      "cannot call back into Rhombus: this Racket's FFI does not support callbacks",
+                      error.text(~label: "Racket", racket.version()),
+                      error.text(~label: "needed", "Racket built from Git, or a recent snapshot, as Pille's README says"),
+                      error.text(~label: "check", "raco pille doctor"),
+                      error.text(~label: "cause", exn.message))
             result_reader(frame, 0)
             ~finally:
               current_cleanup()()

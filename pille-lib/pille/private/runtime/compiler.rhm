@@ -10,6 +10,7 @@ import:
   "ub_policy.rhm" open
   pille/concretize open
   pille/llvm
+  pille/private/llvm/paths.llvm_prefix
   rhombus/delay open
   rhombus/envvar open
   rhombus/rx open
@@ -167,8 +168,8 @@ export class Compiler(
       @str{@"@""@name"}
 
   private method format_obj(obj :: Bytes, sym :: ReadableStringOrSymbol.to_string) :: String:
-    let llvm_prefix = getenv("PILLE_LLVM_PREFIX")
-    let objdump_exec = llvm_prefix +/ "bin" +/ "llvm-objdump"
+    // the same installation Pille loads LLVM from (pille/private/llvm/paths)
+    let objdump_exec = llvm_prefix() +/ "bin" +/ "llvm-objdump"
     let mangle_prefix = if system.type() == #'macosx | "_" | ""
 
     let output = Port.Output.open_bytes()

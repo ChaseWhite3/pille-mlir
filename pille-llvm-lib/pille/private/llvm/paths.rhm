@@ -2,11 +2,32 @@
 
 import:
   rhombus/envvar
+  rhombus/rx open
 
-export fun llvm_lib_path() :: Path:
-  let prefix:
-    envvar.getenv("PILLE_LLVM_PREFIX")
-      || error("environment variable PILLE_LLVM_PREFIX is not set")
+export:
+  llvm_prefix
+  llvm_lib_path
+  llvm_search_prefixes
+  llvm_requirement
+
+// The LLVM installation Pille uses: PILLE_LLVM_PREFIX where it is set, and otherwise the first of the usual places
+// that holds LLVM 23 with its shared library. pille/mlir looks in the same places for its tools
+// (pille-mlir-lib/pille/private/mlir/tools.rkt `llvm-search-prefixes`); keep the two lists in step.
+
+def llvm_requirement = "LLVM 23.1 or a later 23.x, built with its shared library"
+
+// Where Pille looks when PILLE_LLVM_PREFIX is not set, in order. A parameter, so that a test can look nowhere.
+Parameter.def llvm_search_prefixes :: List.of(PathString):
+  match system.type()
+  | #'macosx:
+      ["/opt/homebrew/opt/llvm@23", "/opt/homebrew/opt/llvm", "/usr/local/opt/llvm@23", "/usr/local/opt/llvm"]
+  | #'unix:
+      ["/usr/lib/llvm-23", "/usr/lib64/llvm23", "/usr/local/llvm-23", "/opt/llvm-23"]
+  | ~else:
+      []
+
+// The shared library under an installation's prefix, where this system keeps it.
+fun lib_under(prefix :: PathString) :: Path:
   match system.type()
   | #'macosx:
       prefix +/ "lib" +/ "libLLVM.dylib"
@@ -17,3 +38,51 @@ export fun llvm_lib_path() :: Path:
       if filesystem.file_exists(lib64_path)
       | lib64_path
       | prefix +/ "lib" +/ "libLLVM.so"
+
+// The major version an installation's headers state, or #false where it has none to read.
+fun stated_major(prefix :: PathString) :: maybe(Int):
+  let header = prefix +/ "include" +/ "llvm" +/ "Config" +/ "llvm-config.h"
+  if !filesystem.file_exists(header)
+  | #false
+  | match rx'"#define LLVM_VERSION_MAJOR " ($major: digit+)'.match_in(filesystem.read_string(header))
+    | found :: RXMatch: String.to_int(found[#'major])
+    | ~else: #false
+
+fun usable(prefix :: PathString) :: Boolean:
+  filesystem.file_exists(lib_under(prefix)) && (match stated_major(prefix) | #false: #true | major: major == 23)
+
+def mutable chosen :: maybe(Path) = #false
+
+// The prefix of the LLVM installation Pille uses. Raises, saying what was looked at and how to choose one, where
+// there is none.
+fun llvm_prefix() :: Path:
+  chosen || block:
+    let prefix :: Path:
+      match envvar.getenv("PILLE_LLVM_PREFIX")
+      | given :: String:
+          unless filesystem.file_exists(lib_under(given))
+          | error(~who: #'pille,
+                  "PILLE_LLVM_PREFIX names no LLVM installation with a shared library",
+                  error.text(~label: "PILLE_LLVM_PREFIX", given),
+                  error.text(~label: "looked for", to_string(lib_under(given))),
+                  error.text(~label: "needed", llvm_requirement))
+          Path(given)
+      | ~else:
+          let candidates = llvm_search_prefixes()
+          match candidates.find(usable)
+          | found :: PathString: Path(found)
+          | ~else:
+              error(~who: #'pille,
+                    "cannot find LLVM 23",
+                    error.text(~label: "needed", llvm_requirement),
+                    error.text(~label: "looked in",
+                               if candidates == []
+                               | "nowhere (no usual place on this system)"
+                               | String.join(for List (c in candidates): to_string(c), ", ")),
+                    error.text(~label: "fix",
+                               "install it (on macOS, `brew install llvm@23`) or set PILLE_LLVM_PREFIX to its installation"))
+    chosen := prefix
+    prefix
+
+export fun llvm_lib_path() :: Path:
+  lib_under(llvm_prefix())

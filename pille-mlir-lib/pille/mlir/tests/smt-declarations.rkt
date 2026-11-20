@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require json
+         (only-in "../../private/mlir/tools.rkt" llvm-search-prefixes)
          rackunit
          racket/file
          racket/list
@@ -20,7 +21,9 @@
     (for ([name '(#"PILLE_MLIR_PREFIX" #"PILLE_LLVM_PREFIX" #"PILLE_Z3")])
       (environment-variables-set! (current-environment-variables) name #f))
     (environment-variables-set! (current-environment-variables) #"PATH" #"")
-    (thunk)))
+    ;; and none of the usual places either
+    (parameterize ([llvm-search-prefixes '()])
+      (thunk))))
 
 (define (expand-fixture filename)
   (define path (fixture filename))

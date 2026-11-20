@@ -26,7 +26,10 @@
   (LLVMGetVersion))
 
 (unless (and (= major-version 23) (>= minor-version 1))
-  (error "unsupported LLVM version"))
+  (error 'pille
+         (string-append "unsupported LLVM version\n  found: ~a.~a.~a\n  at: ~a\n  needed: ~a\n"
+                        "  fix: set PILLE_LLVM_PREFIX to such an installation (on macOS, `brew install llvm@23`)")
+         major-version minor-version patch-version (path->string (llvm_lib_path)) llvm_requirement))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (define-fun-syntax _string/symbol/utf-8

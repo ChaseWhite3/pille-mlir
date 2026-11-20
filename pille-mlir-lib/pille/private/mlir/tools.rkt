@@ -1,10 +1,12 @@
 #lang racket/base
 
-(require racket/file racket/path racket/system
+(require racket/file racket/path racket/system racket/string
          racket/treelist file/sha1
          "temporary.rkt")
 
-(provide (rename-out [toolchain? is_toolchain]
+(provide llvm-search-prefixes
+         (rename-out [toolchain? is_toolchain]
+                     [toolchain-bin toolchain_bin]
                      [make-toolchain make_toolchain]
                      [mlir-module? is_module]
                      [parse-module parse_module]
@@ -25,11 +27,25 @@
 (define (executable-name name)
   (if (eq? (system-type) 'windows) (string-append name ".exe") name))
 
+;; Where the tools are looked for when no prefix is given or set, before PATH: the usual places for LLVM 23, the
+;; same list Pille loads LLVM from (pille-llvm-lib/pille/private/llvm/paths.rhm `llvm_search_prefixes`; keep the
+;; two in step). A parameter, so that a test can look nowhere.
+(define llvm-search-prefixes
+  (make-parameter
+   (case (system-type)
+     [(macosx) '("/opt/homebrew/opt/llvm@23" "/opt/homebrew/opt/llvm" "/usr/local/opt/llvm@23" "/usr/local/opt/llvm")]
+     [(unix) '("/usr/lib/llvm-23" "/usr/lib64/llvm23" "/usr/local/llvm-23" "/opt/llvm-23")]
+     [else '()])))
+
 (define (check-tool path name)
   (unless (and path (file-exists? path))
     (raise-user-error 'pille/mlir
-                     "cannot find ~a; set PILLE_MLIR_PREFIX (or PILLE_LLVM_PREFIX) to an LLVM installation containing MLIR tools"
-                     (or path name)))
+                     (string-append
+                      "cannot find ~a\n  needed: LLVM 23 with its MLIR tools\n  looked in: ~a\n"
+                      "  fix: install it (on macOS, `brew install llvm@23`), or set PILLE_MLIR_PREFIX"
+                      " (or PILLE_LLVM_PREFIX) to its installation")
+                     (or path name)
+                     (string-join (append (llvm-search-prefixes) '("PATH")) ", ")))
   path)
 
 (define (plugin-paths paths)
@@ -52,7 +68,10 @@
     (check-tool
      (if selected-prefix
          (build-path selected-prefix "bin" executable)
-         (find-executable-path executable))
+         (or (for/first ([candidate (in-list (llvm-search-prefixes))]
+                         #:when (file-exists? (build-path candidate "bin" executable)))
+               (build-path candidate "bin" executable))
+             (find-executable-path executable)))
      executable))
   (toolchain (path-only (path->complete-path opt))
              (plugin-paths dialect-plugins) (plugin-paths pass-plugins)))

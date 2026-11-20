@@ -13,7 +13,9 @@
     (environment-variables-set! (current-environment-variables) #"PILLE_MLIR_PREFIX" #f)
     (environment-variables-set! (current-environment-variables) #"PILLE_LLVM_PREFIX" #f)
     (environment-variables-set! (current-environment-variables) #"PATH" #"")
-    (thunk)))
+    ;; and none of the usual places either
+    (parameterize ([llvm-search-prefixes '()])
+      (thunk))))
 
 (test-case "import is independent of an installed toolchain"
   (without-tools

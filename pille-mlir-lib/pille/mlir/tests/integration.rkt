@@ -122,12 +122,9 @@ MLIR
   (check-equal? (subbytes bitcode 0 4) #"BC\300\336")
   ;; Decode with the matching installation; a magic-header check alone cannot
   ;; detect invalid or truncated bitcode.
-  (define prefix (or (getenv "PILLE_MLIR_PREFIX") (getenv "PILLE_LLVM_PREFIX")))
+  ;; (the installation the toolchain chose, however it was found)
   (define executable (if (eq? (system-type) 'windows) "llvm-dis.exe" "llvm-dis"))
-  (define disassembler
-    (if prefix
-        (build-path prefix "bin" executable)
-        (build-path (path-only (find-executable-path "mlir-opt")) executable)))
+  (define disassembler (build-path (toolchain_bin chain) executable))
   (define directory (make-temporary-file "pille-mlir-test-~a" 'directory))
   (dynamic-wind
     void

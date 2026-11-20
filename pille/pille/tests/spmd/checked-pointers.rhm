@@ -1,0 +1,138 @@
+#lang rhombus/static
+
+import:
+  ffi open
+  pille/hosted open
+  pille/spmd/embedded open
+
+// Pointer arithmetic on varying values under each policy for undefined
+// behavior. Under "check" only the lanes that execute an operation count: an
+// offset that would carry a pointer past the end of the address space panics
+// in an active lane and does nothing in a masked-off one. Keep the edge lane
+// last: reducing only the first lane would miss it.
+
+//==============================================================================
+// A pointer and a signed varying offset, read
+pille.fun gather(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8)), active :: UInt(32)) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let at :: Varying(Int(64)) = index[i]
+      when i < active
+      | output[i] := input[at]
+
+fun gathered(active :: Int, last :: Int) :: List:
+  let input = new int8_t[4]
+  let index = new int64_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := i + 10
+    mem index[i] := if i == 3 | last | 3 - i
+    mem output[i] := 99
+  pille(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8)), active :: UInt(32)):
+    gather(input, index, output, active)
+  for List (i in 0 .. 4): mem output[i]
+
+//==============================================================================
+// A pointer and an unsigned varying offset, read; a signed one, written
+pille.fun gather_unsigned(input :: Ptr(Int(8)), index :: Ptr(UInt(64)), output :: PtrMut(Int(8)), active :: UInt(32)) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let at :: Varying(UInt(64)) = index[i]
+      when i < active
+      | output[i] := input[at]
+
+pille.fun scatter(output :: PtrMut(Int(8)), index :: Ptr(Int(64)), active :: UInt(32)) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let at :: Varying(Int(64)) = index[i]
+      when i < active
+      | output[at] := 7
+
+fun gathered_unsigned(active :: Int, last :: Int) :: List:
+  let input = new int8_t[4]
+  let index = new uint64_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := i + 10
+    mem index[i] := if i == 3 | last | 3 - i
+    mem output[i] := 99
+  pille(input :: Ptr(Int(8)), index :: Ptr(UInt(64)), output :: PtrMut(Int(8)), active :: UInt(32)):
+    gather_unsigned(input, index, output, active)
+  for List (i in 0 .. 4): mem output[i]
+
+fun scattered(active :: Int, last :: Int) :: List:
+  let index = new int64_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem index[i] := if i == 3 | last | 3 - i
+    mem output[i] := 99
+  pille(output :: PtrMut(Int(8)), index :: Ptr(Int(64)), active :: UInt(32)):
+    scatter(output, index, active)
+  for List (i in 0 .. 4): mem output[i]
+
+//==============================================================================
+// A varying amount and a constant taken from a pointer
+pille.fun minus_varying(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8))) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let at :: Varying(Int(64)) = index[i]
+      let p = (input + 3) - at
+      output[i] := p[]
+
+fun backward() :: List:
+  let input = new int8_t[4]
+  let index = new int64_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := i + 10
+    mem index[i] := i
+    mem output[i] := 99
+  pille(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8))):
+    minus_varying(input, index, output)
+  for List (i in 0 .. 4): mem output[i]
+
+pille.fun minus_constant(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8))) :: Void:
+  spmd(4):
+    par_for (i in 0 .. 4):
+      let at :: Varying(Int(64)) = index[i]
+      let p = ((input + 1) + at) - 1
+      output[i] := p[]
+
+fun there_and_back() :: List:
+  let input = new int8_t[4]
+  let index = new int64_t[4]
+  let output = new int8_t[4]
+  for (i in 0 .. 4):
+    mem input[i] := i + 10
+    mem index[i] := i
+    mem output[i] := 99
+  pille(input :: Ptr(Int(8)), index :: Ptr(Int(64)), output :: PtrMut(Int(8))):
+    minus_constant(input, index, output)
+  for List (i in 0 .. 4): mem output[i]
+
+//==============================================================================
+fun every_policy_agrees():
+  check gathered(4, 0) ~is [13, 12, 11, 10]
+  check gathered_unsigned(4, 0) ~is [13, 12, 11, 10]
+  check scattered(4, 0) ~is [7, 7, 7, 7]
+  check backward() ~is [13, 12, 11, 10]
+  check there_and_back() ~is [10, 11, 12, 13]
+
+pille.configure_jit(~ub_policy: #'check)
+every_policy_agrees()
+
+// the edge offset in a lane that is masked off: no panic, nothing read or written
+check gathered(3, -9223372036854775808) ~is [13, 12, 11, 99]
+check gathered_unsigned(3, 18446744073709551615) ~is [13, 12, 11, 99]
+check scattered(3, -9223372036854775808) ~is [99, 7, 7, 7]
+
+// the same offset in an active lane
+check gathered(4, -9223372036854775808) ~throws "pointer arithmetic overflow/underflow"
+check gathered_unsigned(4, 18446744073709551615) ~throws "pointer arithmetic overflow"
+check scattered(4, -9223372036854775808) ~throws "pointer arithmetic overflow/underflow"
+
+pille.configure_jit(~ub_policy: #'suppress)
+every_policy_agrees()
+
+pille.configure_jit(~ub_policy: #'allow)
+every_policy_agrees()

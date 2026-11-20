@@ -171,8 +171,8 @@ method (mask :: Simd(Boolean, n)).sparse_add(
       prim.ptradd(ptr.$sparse_data, offset.$sparse_data)
   | ub.checked:
       let new = prim.ptradd(ptr.$sparse_data, offset.$sparse_data)
-      let overflow = offset.$sparse_data > 0 && new ≤ ptr.$sparse_data
-      let underflow = offset.$sparse_data < 0 && new ≥ ptr.$sparse_data
+      let overflow = offset.$sparse_data > 0 ∧ prim.icmp_ule(new, ptr.$sparse_data)
+      let underflow = offset.$sparse_data < 0 ∧ prim.icmp_uge(new, ptr.$sparse_data)
       when mask.select(overflow ∨ underflow, #false).any() | panic("pointer arithmetic overflow/underflow")
       new
   .{data, mask}
@@ -190,7 +190,7 @@ method (mask :: Simd(Boolean, n)).sparse_add(
       prim.ptradd(ptr.$sparse_data, offset.$sparse_data)
   | ub.checked:
       let new = prim.ptradd(ptr.$sparse_data, offset.$sparse_data)
-      let overflow = new < ptr.$sparse_data
+      let overflow = prim.icmp_ult(new, ptr.$sparse_data)
       when mask.select(overflow, #false).any() | panic("pointer arithmetic overflow")
       new
   .{data, mask}
@@ -281,6 +281,10 @@ method (mask :: Simd(Boolean, n)).sparse_sub(lhs :: α, rhs :: β) :: γ:
       .{res[0], mask}
 
 //==============================================================================
+method (mask :: Simd(Boolean, n)).sparse_neg(smd :: γ && SparseSimd(Int(_), n)) :: γ:
+  mask.sparse_sub(0 :: γ, smd)
+
+//==============================================================================
 method (mask :: Simd(Boolean, n)).sparse_sub(
   ptr :: SparseSimd(RawPtr, n),
   amount :: SparseSimd(BinaryInteger, n),
@@ -305,7 +309,7 @@ method (mask :: Simd(Boolean, n)).sparse_sub(
 method (mask :: Simd(Boolean, n)).sparse_sub(
   ptr :: φ && SparseSimd(PtrTo(_), n),
   specl amount :: int,
-) :: SparseSimd(RawPtr, n):
+) :: φ:
   mask.sparse_add(ptr, -amount)
 
 //==============================================================================

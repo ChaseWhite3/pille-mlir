@@ -121,7 +121,7 @@ export veneer Dialect(this :: satisfying(schema.is_dialect)):
                    ~function: function :: ReadableString,
                    ~inputs: inputs :: List.of(smt.Term) = [],
                    ~property: property :: smt.Formula,
-                   ~preconditions: preconditions :: List.of(smt.Formula) = []) :: smt.Query:
+                   ~preconditions: preconditions :: List.of(smt.Formula || smt.Precondition) = []) :: smt.Query:
     query.make_smt_query(this, module, to_string(function), inputs, property, preconditions)
 
   // One manifest and one lowering/export for all questions. Specs are checked
@@ -135,7 +135,7 @@ export veneer Dialect(this :: satisfying(schema.is_dialect)):
   method smt_values_query(module :: mlir.Module,
                           ~function: function :: ReadableString,
                           ~inputs: inputs :: List.of(smt.Term) = [],
-                          ~preconditions: preconditions :: List.of(smt.Formula) = []) :: smt.ValuesQuery:
+                          ~preconditions: preconditions :: List.of(smt.Formula || smt.Precondition) = []) :: smt.ValuesQuery:
     query.make_smt_values_query(this, module, to_string(function), inputs, preconditions)
 
 // An alias binds a parsed constraint in its own space. Definition-site bindings

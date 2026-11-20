@@ -26,6 +26,10 @@
                             [counter #:mutable] [closed? #:mutable]))
 (struct enumeration (values complete) #:transparent)
 (struct prepared (body declarations) #:transparent)
+
+;; What a session's solver is told when it starts, and again after any reset.
+(define session-options
+  "(set-option :print-success false)\n(set-option :produce-models true)\n(set-logic QF_BV)")
 (struct exn:fail:protocol exn:fail (status))
 
 (define (enumeration_values value) (list->treelist (enumeration-values value)))
@@ -181,7 +185,7 @@
                       (unless (eof-object? line) (loop))))))
         (thread (lambda ()
                   (with-handlers ([exn:fail? void]) (copy-port stderr errors))))))
-    (expect-empty s "(set-option :print-success false)\n(set-option :produce-models true)\n(set-logic QF_BV)" deadline)))
+    (expect-empty s session-options deadline)))
 
 ;; Read actual SMT commands, retaining their original text. A query value is
 ;; already verified/exported, but only a narrowly scoped script is accepted.
@@ -300,11 +304,41 @@
      (when (and (eq? status 'timeout) (not batch-mode?)) (stop! s))
      outcome)))
 
-(define (session_check s text expected [timeout 10])
+;; Whether named assertions can hold together. `body` is declarations and
+;; assertions only. The options a core needs must precede every assertion, so
+;; the solver is reset before and after: nothing of a session's survives one
+;; question to the next, and its usual options are put back. The answer is
+;; 'infeasible with the core's names, 'feasible, or a failure as any check's.
+(define (core/internal s body timeout overall-deadline)
+  (run-protected
+   s timeout overall-deadline
+   (lambda (deadline result)
+     (define status
+       (answer s (string-append "(reset)\n(set-option :print-success false)\n" core-options
+                                "(set-logic QF_BV)\n" (timeout-option timeout) body "\n(check-sat)")
+               deadline))
+     (define names
+       (and (eq? status 'unsat)
+            (let* ([response (exchange s "(get-unsat-core)" deadline)]
+                   [forms (with-handlers ([exn:fail? (lambda (_) #f)]) (map car (smtlib-commands response)))]
+                   [names (and forms (= (length forms) 1) (parse-core (car forms)))])
+              (unless names (protocol-error 'malformed-response "malformed get-unsat-core response: ~a" response))
+              names)))
+     (expect-empty s (string-append "(reset)\n" session-options) deadline)
+     (case status
+       [(unsat) (result 'infeasible names)]
+       [(sat) (result 'feasible)]
+       [else (result status '() "the solver did not decide whether the named preconditions can hold together")]))))
+
+(define (session_check s text expected [timeout 10] [feasibility-body #f])
   (check-session 'check s)
   (positive-seconds 'check timeout)
   (call-with-semaphore (session-lock s)
-    (lambda () (check/internal s text expected timeout +inf.0 #f))))
+    (lambda ()
+      (define core (and feasibility-body (core/internal s feasibility-body timeout +inf.0)))
+      (if (and core (not (memq (solver_result_status core) '(feasible unknown timeout))))
+          core
+          (check/internal s text expected timeout +inf.0 #f)))))
 
 (define (annotate value index)
   (solver-result (solver_result_status value) (solver_result_values value)
@@ -324,11 +358,19 @@
            [(<= deadline (current-inexact-monotonic-milliseconds))
             (stop! s)
             (solver-result 'timeout '() "overall batch timeout elapsed" (session-command s) overall-timeout)]
-           [else (check/internal s (car request) (cadr request) timeout deadline batch-mode?)]))
+           [else
+            ;; A question with named preconditions asks first whether they can
+            ;; hold together; where they cannot, that is its answer.
+            (define core
+              (and (pair? (cddr request)) (caddr request)
+                   (core/internal s (caddr request) timeout deadline)))
+            (if (and core (not (memq (solver_result_status core) '(feasible unknown timeout))))
+                core
+                (check/internal s (car request) (cadr request) timeout deadline batch-mode?))]))
        (define tagged (annotate result index))
        (define status (solver_result_status result))
        (cond
-         [(or (memq status '(unsat sat unknown))
+         [(or (memq status '(unsat sat unknown infeasible))
               (and (eq? status 'timeout) (or (not batch-mode?) (session-process s))))
           (loop (cdr remaining) (add1 index) (cons tagged outcomes))]
          [else
@@ -346,9 +388,10 @@
   (positive-seconds 'check timeout)
   (define inputs (as-list 'check requests))
   (for ([request (in-list inputs)])
-    (unless (and (list? request) (= (length request) 2) (string? (car request))
-                 (list? (cadr request)))
-      (raise-argument-error 'check "list of (list SMT-LIB expected-inputs)" requests)))
+    (unless (and (list? request) (memv (length request) '(2 3)) (string? (car request))
+                 (list? (cadr request))
+                 (or (= (length request) 2) (not (caddr request)) (string? (caddr request))))
+      (raise-argument-error 'check "list of (list SMT-LIB expected-inputs [feasibility-body])" requests)))
   (define overall (or overall-timeout (+ 1 (* timeout (length inputs)))))
   (positive-seconds 'check overall)
   (values inputs overall))

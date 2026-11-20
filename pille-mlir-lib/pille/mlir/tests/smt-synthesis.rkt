@@ -1,12 +1,16 @@
 #lang racket/base
 
 (require rackunit
+         racket/file
          racket/list
+         racket/port
+         racket/system
          racket/runtime-path
          racket/string
          racket/treelist
          "../../private/mlir/query.rkt"
          "../../private/mlir/schema.rkt"
+         "../../private/mlir/session.rkt"
          "../../private/mlir/solver.rkt"
          "../../private/mlir/tools.rkt")
 
@@ -238,3 +242,93 @@
   (check-eq? (status (query sums "sum" (list a32 b32) (smt_not (smt_cmp 'ult r32 a32))
                             (list (smt_no_overflow 'add a32 b32 #f))))
              'unsat))
+
+;;==============================================================================
+;; A5. Named preconditions and unsat cores
+
+;; What `z3` prints for a script, run by hand: no option but the file.
+(define (by-hand script)
+  (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
+  (dynamic-wind
+    void
+    (lambda ()
+      (display-to-file script file #:exists 'truncate)
+      (string-trim (with-output-to-string (lambda () (system* z3 (path->string file))))))
+    (lambda () (delete-file file))))
+
+(define (core-of answer) (sort (treelist->list (solver_result_core answer)) string<?))
+
+(test-case "a name is a nonempty string that can be written between bars, once a query"
+  (define p (smt_cmp 'ult a32 (smt_const 10 32)))
+  (rejects #rx"invalid precondition name" (lambda () (smt_named p "")))
+  (rejects #rx"invalid precondition name" (lambda () (smt_named p "a|b")))
+  (rejects #rx"invalid precondition name" (lambda () (smt_named p "a\\b")))
+  (rejects #rx"invalid precondition name" (lambda () (smt_named p "two\nlines")))
+  (rejects #rx"expected a Boolean predicate" (lambda () (smt_named a32 "x")))
+  (rejects #rx"duplicate precondition name \"same\""
+           (lambda () (query sums "sum" (list a32 b32) (smt_eq a32 a32)
+                             (list (smt_named p "same") (smt_named (smt_eq b32 b32) "same"))))))
+
+(test-case "named preconditions that cannot hold together are infeasible, and the core names which"
+  (define r32 (smt_result 32))
+  (define early (smt_named (smt_cmp 'ult a32 (smt_const 10 32)) "event-phases.md:22"))
+  (define late (smt_named (smt_cmp 'ugt a32 (smt_const 20 32)) "event-phases.md:31"))
+  (define aside (smt_named (smt_cmp 'ult b32 (smt_const 100 32)) "another page, line 4"))
+  (define plain (smt_cmp 'uge a32 (smt_const 0 32)))
+  (define value (query sums "sum" (list a32 b32) (smt_eq r32 r32) (list early aside plain late)))
+  (define answer (query_check value z3))
+  (check-eq? (solver_result_status answer) 'infeasible)
+  ;; the two that conflict, and not the third that has nothing to do with it
+  (check-equal? (core-of answer) '("event-phases.md:22" "event-phases.md:31"))
+  ;; the names are in the query's text, and its assumptions say them
+  (check-true (string-contains? (query_smtlib value) ":named |event-phases.md:22|"))
+  (check-equal? (treelist->list (query_assumptions value))
+                '("event-phases.md:22: a <u 0x0000000a:bv32" "another page, line 4: b <u 0x00000064:bv32"
+                  "a >=u 0x00000000:bv32" "event-phases.md:31: a >u 0x00000014:bv32"))
+  ;; run by hand, the feasibility question gives the same answer
+  (check-equal? (by-hand (query_feasibility value)) "unsat\n(|event-phases.md:31| |event-phases.md:22|)")
+  ;; a session and a batch answer as a single check does
+  (define s (make_session z3))
+  (check-equal? (core-of (query_session_check s value)) '("event-phases.md:22" "event-phases.md:31"))
+  ;; and the session's solver is as it was: the next question has its model
+  (define next (query_session_check s (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32))))
+  (check-eq? (solver_result_status next) 'sat)
+  (check-equal? (map car (solver_result_values next)) '("a" "b"))
+  (check-equal? (core-of (query_session_check s value)) '("event-phases.md:22" "event-phases.md:31"))
+  (close_session s)
+  (define batch
+    (make_smt_batch arithmetic sums
+                    (list (make_spec "sum" (list a32 b32) (smt_eq r32 r32) (list early aside plain late))
+                          (make_spec "sum" (list a32 b32) (smt_cmp 'uge r32 a32))
+                          (make_spec "sum" (list a32 b32) (smt_eq r32 r32) (list late early))
+                          (make_spec "sum" (list a32 b32) (smt_cmp 'uge r32 a32)
+                                     (list (smt_named (smt_no_overflow 'add a32 b32 #f) "no wrap"))))))
+  (define answers (treelist->list (batch_check batch z3)))
+  (check-equal? (map solver_result_status answers) '(infeasible sat infeasible unsat))
+  (check-equal? (core-of (first answers)) '("event-phases.md:22" "event-phases.md:31")))
+
+(test-case "named preconditions that can hold together change nothing but the text"
+  (define r32 (smt_result 32))
+  (define guard (smt_named (smt_no_overflow 'add a32 b32 #f) "no wrap"))
+  (define proved (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32) (list guard)))
+  (check-eq? (status proved) 'unsat)
+  (check-equal? (by-hand (query_smtlib proved)) "unsat")
+  (define refuted (query sums "sum" (list a32 b32) (smt_eq r32 a32) (list guard)))
+  (check-eq? (status refuted) 'sat)
+  (check-equal? (by-hand (query_smtlib refuted)) "sat"))
+
+(test-case "preconditions without a name are as before: inconsistent ones prove vacuously"
+  (define r32 (smt_result 32))
+  (define early (smt_cmp 'ult a32 (smt_const 10 32)))
+  (define late (smt_cmp 'ugt a32 (smt_const 20 32)))
+  (define value (query sums "sum" (list a32 b32) (smt_eq r32 a32) (list early late)))
+  (check-false (query_feasibility value))
+  (check-false (string-contains? (query_smtlib value) ":named"))
+  (check-eq? (status value) 'unsat)
+  ;; and where they alone conflict, a named one beside them is not blamed
+  (define beside
+    (query sums "sum" (list a32 b32) (smt_eq r32 a32)
+           (list early late (smt_named (smt_cmp 'ult b32 (smt_const 5 32)) "unrelated"))))
+  (define answer (query_check beside z3))
+  (check-eq? (solver_result_status answer) 'infeasible)
+  (check-equal? (core-of answer) '()))

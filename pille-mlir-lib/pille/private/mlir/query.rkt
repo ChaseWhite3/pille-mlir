@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require json
+         racket/function
          racket/list
          racket/match
          racket/promise
@@ -15,6 +16,7 @@
 
 (provide smt_input smt_result smt_result_at smt_const smt_binary smt_ite
          smt_eq smt_cmp smt_no_overflow smt_not smt_and smt_or
+         smt_named
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -25,6 +27,8 @@
          (rename-out [term? is_term]
                      [term-width term_width]
                      [formula? is_formula]
+                     [named? is_named]
+                     [query-feasibility query_feasibility]
                      [query? is_query]
                      [get-query-module query_module]
                      [query-smtlib query_smtlib]
@@ -61,7 +65,14 @@
 (struct term (tag args width) #:transparent)
 (struct formula (tag args) #:transparent)
 
-(struct query (module smtlib dialect function inputs property preconditions))
+;; A precondition with a name. Only a query's list of preconditions holds
+;; these; a name is no part of a formula.
+(struct named (name formula) #:transparent)
+
+;; `feasibility` is the script that asks whether the named preconditions can
+;; hold together (#f where none is named), and `feasibility-body` its
+;; declarations and assertions alone, for a session.
+(struct query (module smtlib dialect function inputs property preconditions feasibility feasibility-body))
 (struct spec (function inputs property preconditions) #:transparent)
 (struct values-spec (function inputs preconditions) #:transparent)
 (struct batch (module smtlib queries))
@@ -199,6 +210,23 @@
   (for ([operand (in-list operands)]) (check-formula who operand))
   (formula tag operands))
 
+;; A name becomes an SMT-LIB quoted symbol, |name|, which may hold anything but
+;; a bar or a backslash; a line break would break the scripts it is written in.
+(define (smt_named value name)
+  (check-formula 'precondition value)
+  (unless (and (string? name) (non-empty-string? name) (not (regexp-match? #rx"[|\\\\\n\r]" name)))
+    (builder-error 'precondition
+                   "invalid precondition name ~s: use a nonempty string without bars, backslashes or line breaks"
+                   name))
+  (named (string->immutable-string name) value))
+
+(define (assumption-formula value) (if (named? value) (named-formula value) value))
+(define (assumption-name value) (and (named? value) (named-name value)))
+(define (render-assumption value)
+  (if (named? value)
+      (format "~a: ~a" (named-name value) (render-formula (named-formula value)))
+      (render-formula value)))
+
 (define (smt_and values) (connective 'and 'and values))
 (define (smt_or values) (connective 'or 'or values))
 
@@ -305,8 +333,12 @@
   (define duplicate (check-duplicates (map (lambda (input) (car (term-args input))) declared)))
   (when duplicate
     (builder-error 'smt_query "duplicate input name ~a; each argument needs a distinct display name" duplicate))
-  (define assumptions (entries 'smt_query preconditions))
+  (define given (entries 'smt_query preconditions))
+  (define assumptions (map assumption-formula given))
   (for ([assumption (in-list assumptions)]) (check-formula 'smt_query assumption))
+  (define repeated (check-duplicates (filter values (map assumption-name given))))
+  (when repeated
+    (builder-error 'smt_query "duplicate precondition name ~s; a name says which precondition is meant" repeated))
   (values declared assumptions))
 
 ;; Specs retain immutable property descriptors. Batch validation resolves their
@@ -330,8 +362,8 @@
     (if (member name names) (loop (string-append name "_")) name)))
 
 (define (spec-manifest value)
-  (define-values (function declared property assumptions) (spec-fields value))
-  (validate-inputs function declared assumptions)
+  (define-values (function declared property given) (spec-fields value))
+  (define-values (_declared assumptions) (validate-inputs function declared given))
   (when (spec? value) (check-formula 'smt_query property))
   (define references (remove-duplicates (append-map result-widths
                                                    (if property (cons property assumptions) assumptions))))
@@ -398,6 +430,52 @@
   (define-values (text _members) (run-lowering module manifest))
   text)
 
+;; The lowering asserts a query's preconditions first, one assertion each, in
+;; order. Gives the script with each named precondition's assertion named
+;; (the same text where none is), and, where any is named, the script that
+;; asks whether the preconditions can hold together and that script's
+;; declarations and assertions alone.
+(define (named-scripts who script preconditions)
+  (define names (map assumption-name preconditions))
+  (cond
+    [(not (ormap values names)) (values script #f #f)]
+    [else
+     (define whole (open-output-string))
+     (define body (open-output-string))
+     (define previous 0)
+     (define asserted 0)
+     (for ([entry (in-list (smtlib-commands script))])
+       (define end (cdr entry))
+       (define original (substring script previous end))
+       (set! previous end)
+       (match (car entry)
+         [(list "assert" _)
+          (define name (and (< asserted (length names)) (list-ref names asserted)))
+          (define text
+            (cond
+              [name
+               (define trimmed (string-trim original))
+               (define lead (substring original 0 (- (string-length original) (string-length (string-trim original #:right? #f)))))
+               (string-append lead "(assert (! "
+                              (string-trim (substring trimmed 7 (sub1 (string-length trimmed))))
+                              " :named |" name "|))")]
+              [else original]))
+          (display text whole)
+          (when (< asserted (length names)) (display (string-trim text) body) (newline body))
+          (set! asserted (add1 asserted))]
+         [(list (or "declare-const" "declare-fun") _ ...)
+          (display original whole)
+          (display (string-trim original) body) (newline body)]
+         [_ (display original whole)]))
+     (display (substring script previous) whole)
+     (unless (>= asserted (length names))
+       (builder-error who "internal error: the exported SMT-LIB asserts fewer preconditions than the query has"))
+     (define assertions (get-output-string body))
+     (values (string->immutable-string (get-output-string whole))
+             (string->immutable-string
+              (string-append core-options "(set-logic QF_BV)\n" assertions "(check-sat)\n(get-unsat-core)\n"))
+             (string->immutable-string assertions))]))
+
 (define (make_smt_query dialect module function inputs property preconditions)
   (check-context 'smt_query dialect module)
   (define description (make_spec function inputs property preconditions))
@@ -407,11 +485,13 @@
       (hash-set manifest key value)))
   (define-values (lowered _members) (run-lowering module manifest))
   (define verified (parse_stock_module lowered module))
-  (define smtlib (to_smtlib verified))
+  (define-values (smtlib feasibility feasibility-body)
+    (named-scripts 'smt_query (to_smtlib verified) (spec-preconditions description)))
   (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
     (builder-error 'smt_query "internal error: the exported SMT-LIB does not declare exactly the query's inputs:\n~a" smtlib))
   (query verified smtlib (dialect_name dialect) (spec-function description)
-         (spec-inputs description) property (spec-preconditions description)))
+         (spec-inputs description) property (spec-preconditions description)
+         feasibility feasibility-body))
 
 ;; Every smt.solver region exports a self-contained script ending in reset.
 ;; Split on parsed commands, never on text inside strings, comments, or terms.
@@ -470,7 +550,9 @@
         [else
          (unless (equal? declarations expected)
            (builder-error who "spec ~a: exported declarations do not match the inputs" index))
-         (query member-module script (dialect_name dialect) function inputs property assumptions)])))
+         (define-values (named feasibility feasibility-body) (named-scripts who script assumptions))
+         (query member-module named (dialect_name dialect) function inputs property assumptions
+                feasibility feasibility-body)])))
   ((if values? values-batch batch) verified text queries))
 
 (define (make_smt_batch dialect module specs)
@@ -484,7 +566,7 @@
 
 (define (batch-requests value)
   (for/list ([member (in-list (batch-queries value))])
-    (list (query-smtlib member) (expected-inputs (query-inputs member)))))
+    (list (query-smtlib member) (expected-inputs (query-inputs member)) (query-feasibility-body member))))
 
 (define (batch_check value [executable #f] [timeout 10] [arguments '()] [overall-timeout #f])
   (list->treelist (run_solver_batch (batch-requests value) executable timeout arguments overall-timeout)))
@@ -492,7 +574,8 @@
   (list->treelist (session_check_batch session (batch-requests value) timeout overall-timeout)))
 (define (query_session_check session value [timeout 10] [overall-timeout #f])
   (session_check session (query-smtlib value) (expected-inputs (query-inputs value))
-                 (if overall-timeout (min timeout overall-timeout) timeout)))
+                 (if overall-timeout (min timeout overall-timeout) timeout)
+                 (query-feasibility-body value)))
 (define (values_query_check session value limit [timeout 10])
   (session_values session (values-query-smtlib value) (values-query-result-name value)
                   (values-query-result-width value) limit timeout (values-query-defined-name value)))
@@ -500,7 +583,7 @@
   (list->treelist (for/list ([input (in-list (values-query-inputs value))])
                    (treelist (car (term-args input)) (term-width input)))))
 (define (values_query_assumptions value)
-  (list->treelist (map render_formula (values-query-preconditions value))))
+  (list->treelist (map (compose string->immutable-string render-assumption) (values-query-preconditions value))))
 
 (define (query_inputs value)
   (list->treelist
@@ -509,10 +592,19 @@
 
 ;; The assumptions under which an `unsat` answer holds, as readable text.
 (define (query_assumptions value)
-  (list->treelist (map render_formula (query-preconditions value))))
+  (list->treelist (map (compose string->immutable-string render-assumption) (query-preconditions value))))
 
 (define (query_check value [executable #f] [timeout 10] [arguments '()])
   (unless (query? value) (raise-argument-error 'check "query" value))
+  ;; Named preconditions are asked first whether they can hold together; where
+  ;; they cannot, that is the answer, and its names say which.
+  (define core
+    (and (query-feasibility value) (run_solver_core (query-feasibility value) executable timeout arguments)))
+  (if (and core (not (memq (solver_result_status core) '(feasible unknown timeout))))
+      core
+      (run-query value executable timeout arguments)))
+
+(define (run-query value executable timeout arguments)
   (run_solver (query-smtlib value)
               (for/list ([input (in-list (query-inputs value))])
                 (cons (car (term-args input)) (term-width input)))

@@ -158,3 +158,54 @@ check:
   arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
                        ~property: smt.eq(result, y))
   ~throws "refers to input y, which is not among the declared inputs"
+
+//==============================================================================
+// Orderings, choices, overflow guards and named preconditions (Slice A of
+// CLOSER_TIMED_MACHINE_WORK_ORDER.md), as a caller writes them.
+
+// add(x, y) is no less than x, unsigned, where the sum does not wrap
+def guarded:
+  arithmetic.smt_query(program, ~function: "round_trip", ~inputs: [x, y],
+                       ~property: smt.eq(result, x),
+                       ~preconditions: [smt.precondition(smt.no_overflow_add(x, y), ~named: "no wrap")])
+check guarded.check() ~is_a smt.Proved
+check guarded.assumptions ~is ["no wrap: no_overflow(x + y, unsigned)"]
+check guarded.feasibility_smtlib() ~is_a String
+
+check smt.ult(x, y).describe() ~is "x <u y"
+check smt.ite(smt.sge(x, y), x, y).describe() ~is "(x >=s y ? x : y)"
+check smt.result(1, ~width: 32).describe() ~is "result[1]"
+check smt.no_overflow_mul(x, y, ~signed: #true).describe() ~is "no_overflow(x * y, signed)"
+
+// two expectations that cannot both hold, and a third that is not to blame
+def conflicting:
+  arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
+                       ~property: smt.eq(result, x),
+                       ~preconditions: [smt.precondition(smt.ult(x, smt.const(10, ~width: 32)), ~named: "page.md:22"),
+                                        smt.precondition(smt.ugt(x, smt.const(20, ~width: 32)), ~named: "page.md:31"),
+                                        smt.precondition(smt.ult(x, smt.const(100, ~width: 32)), ~named: "page.md:40")])
+match conflicting.check()
+| infeasible :: smt.Infeasible:
+    check infeasible.core.sort() ~is ["page.md:22", "page.md:31"]
+    check infeasible.is_proved ~is #false
+    check infeasible.describe().contains("the named preconditions cannot hold together") ~is #true
+    // what reproduces the answer is the feasibility question
+    check infeasible.smtlib ~is conflicting.feasibility_smtlib()
+    check infeasible.smtlib.contains("(get-unsat-core)") ~is #true
+| other:
+    check other ~is_a smt.Infeasible
+
+// a session gives the same outcome
+block:
+  let session = smt.Session()
+  check session.check(conflicting) ~is_a smt.Infeasible
+  check session.check(guarded) ~is_a smt.Proved
+  session.close()
+
+// without a name, inconsistent preconditions prove vacuously, as before
+def unnamed_conflict:
+  arithmetic.smt_query(program, ~function: "successor", ~inputs: [x],
+                       ~property: smt.eq(result, x),
+                       ~preconditions: [smt.ult(x, smt.const(10, ~width: 32)), smt.ugt(x, smt.const(20, ~width: 32))])
+check unnamed_conflict.check() ~is_a smt.Proved
+check unnamed_conflict.feasibility_smtlib() ~is #false

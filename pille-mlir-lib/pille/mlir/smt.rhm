@@ -9,6 +9,8 @@ import:
 export:
   Term
   Formula
+  Precondition
+  precondition
   Query
   Spec
   Batch
@@ -21,6 +23,7 @@ export:
   Outcome
   Proved
   Counterexample
+  Infeasible
   Unknown
   Timeout
   Failure
@@ -64,6 +67,17 @@ veneer Formula(this :: satisfying(query.is_formula)):
 
   method describe() :: String:
     query.render_formula(this)
+
+// A precondition with a name, for a query's ~preconditions list. Where a
+// query's named preconditions cannot hold together, its outcome is
+// `Infeasible`, naming a set of them that cannot. A name is a nonempty string
+// without bars, backslashes or line breaks ("event-phases.md:22"), and is
+// distinct within a query.
+veneer Precondition(this :: satisfying(query.is_named)):
+  constructor ~error
+
+fun precondition(formula :: Formula, ~named: name :: ReadableString) :: Precondition:
+  query.smt_named(formula, to_string(name))
 
 // A function argument. Its position is its index in a query's ~inputs list;
 // the name is how counterexamples report it.
@@ -179,6 +193,22 @@ class Proved():
     | "proved only under " ++ to_string(assumptions.length()) ++ " assumption(s) ["
         ++ String.join(assumptions, "; ") ++ "]: " ++ subject()
 
+// The query's named preconditions cannot hold together, so there is nothing
+// its property is about. `core` names a set of them whose conjunction no input
+// satisfies, as the solver reported it with core minimization on: none of them
+// can be left out, though a different or smaller set may also be unsatisfiable.
+// Preconditions without a name are part of what was asked but are never
+// named, so `core` may be empty where they alone conflict. `smtlib` is the
+// feasibility question: the preconditions, `(check-sat)` and
+// `(get-unsat-core)`. A query none of whose preconditions is named is never
+// `Infeasible`: inconsistent ones make it `Proved`, vacuously, as before.
+class Infeasible(core :: List.of(String)):
+  extends Outcome
+
+  override method describe() :: String:
+    "the named preconditions cannot hold together [" ++ String.join(core, "; ") ++ "]: nothing to show of "
+      ++ subject()
+
 // The solver answered `sat` and reported a complete model. `values` holds one
 // assignment per function argument, in argument order.
 class Counterexample(values :: List.of(Assignment)):
@@ -242,9 +272,15 @@ veneer Query(this :: satisfying(query.is_query)):
   property assumptions :: List.of(String):
     query.query_assumptions(this)
 
-  // The exact SMT-LIB text given to a solver by `check`.
+  // The exact SMT-LIB text given to a solver by `check`. A named
+  // precondition's assertion carries its name.
   method to_smtlib() :: String:
     query.query_smtlib(this)
+
+  // The question asked first where a precondition is named: whether the
+  // preconditions can hold together. #false where none is named.
+  method feasibility_smtlib() :: maybe(String):
+    query.query_feasibility(this)
 
   // Runs a standalone solver; batch and session APIs amortize process startup.
   method check(~solver: executable :: maybe(Path || ReadableString) = #false,
@@ -252,17 +288,23 @@ veneer Query(this :: satisfying(query.is_query)):
                ~arguments: arguments :: List.of(ReadableString) = []) :: Outcome:
     let answer = query.query_check(this, executable, timeout,
                                    for List (argument in arguments): to_string(argument))
-    solver_outcome(answer, function, dialect, property, assumptions, to_smtlib(), timeout)
+    solver_outcome(answer, function, dialect, property, assumptions, to_smtlib(), timeout,
+                   ~feasibility: feasibility_smtlib())
 
 // Shared result conversion keeps old queries, batches, and sessions aligned.
 fun solver_outcome(answer, function :: String, dialect :: String,
                    property :: String, assumptions :: List.of(String),
-                   script :: String, timeout :: Real) :: Outcome:
+                   script :: String, timeout :: Real,
+                   ~feasibility: feasibility :: maybe(String) = #false) :: Outcome:
   let diagnostics :: String = solver.solver_result_diagnostics(answer)
   let command :: List = solver.solver_result_command_line(answer)
   fun outcome(make, extra, ...) :: Outcome:
     make(function, dialect, property, assumptions, script, diagnostics, command, extra, ...)
   match solver.solver_result_status(answer)
+  | #'infeasible:
+      // what reproduces this answer is the feasibility question, not the query
+      Infeasible(function, dialect, property, assumptions, feasibility || script, diagnostics, command,
+                 solver.solver_result_core(answer))
   | #'unsat: outcome(Proved)
   | #'sat:
       outcome(Counterexample,
@@ -284,7 +326,7 @@ veneer Spec(this :: satisfying(query.is_spec)):
   constructor(~function: function :: ReadableString,
               ~inputs: inputs :: List.of(Term) = [],
               ~property: property :: Formula,
-              ~preconditions: preconditions :: List.of(Formula) = []):
+              ~preconditions: preconditions :: List.of(Formula || Precondition) = []):
     query.make_spec(to_string(function), inputs, property, preconditions)
 
 veneer Batch(this :: satisfying(query.is_batch)):
@@ -318,13 +360,14 @@ fun timeout_bound(timeout :: Real, overall :: maybe(Real)) :: Real:
 fun batch_outcomes(batch :: Batch, answers :: List, timeout :: Real) :: List.of(Outcome):
   for List (member :: Query in batch.queries, answer in answers):
     solver_outcome(answer, member.function, member.dialect, member.property,
-                   member.assumptions, member.to_smtlib(), timeout)
+                   member.assumptions, member.to_smtlib(), timeout,
+                   ~feasibility: member.feasibility_smtlib())
 
 // Values specs have no property: enumeration asks for the result itself.
 veneer ValuesSpec(this :: satisfying(query.is_values_spec)):
   constructor(~function: function :: ReadableString,
               ~inputs: inputs :: List.of(Term) = [],
-              ~preconditions: preconditions :: List.of(Formula) = []):
+              ~preconditions: preconditions :: List.of(Formula || Precondition) = []):
     query.make_values_spec(to_string(function), inputs, preconditions)
 
 veneer ValuesQuery(this :: satisfying(query.is_values_query)):
@@ -373,7 +416,8 @@ veneer Session(this :: satisfying(session.is_session)):
     | single :: Query:
         solver_outcome(query.query_session_check(this, single, timeout, overall_timeout), single.function,
                        single.dialect, single.property, single.assumptions, single.to_smtlib(),
-                       timeout_bound(timeout, overall_timeout))
+                       timeout_bound(timeout, overall_timeout),
+                       ~feasibility: single.feasibility_smtlib())
 
   method values(value :: ValuesQuery,
                 ~limit: limit :: Int,

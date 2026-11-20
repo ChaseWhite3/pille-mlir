@@ -15,12 +15,16 @@
          find-solver
          solver-result
          run_solver
+         run_solver_core
+         core-options
+         parse-core
          (rename-out [solver-result? is_solver_result]
                      [solver-result-status solver_result_status]
                      [solver-result-values solver_result_values]
                      [solver-result-diagnostics solver_result_diagnostics]
                      [solver-result-command solver_result_command]
                      [result-assignments solver_result_assignments]
+                     [result-core solver_result_core]
                      [result-command-line solver_result_command_line]
                      [solver-result-seconds solver_result_seconds]))
 
@@ -29,11 +33,19 @@
 ;;   'timeout                        the requested bound elapsed; child killed
 ;;   'missing-executable 'nonzero-exit 'malformed-response 'bad-model
 ;;                                   operational failures
+;;   'infeasible                     named preconditions cannot hold together;
+;;                                   values is then the names of an unsatisfiable
+;;                                   set of them, as the solver reported it
+;;   'feasible                       a feasibility check found them satisfiable
+;;                                   (internal: never a query's answer)
 ;; values is a list of (name width value) and is only non-empty for 'sat.
 ;; Only 'unsat means that no counterexample exists.
 (struct solver-result (status values diagnostics command seconds) #:transparent)
 
 ;; Immutable views for Rhombus callers.
+(define (result-core value)
+  (for/treelist ([name (in-list (solver-result-values value))]) (string->immutable-string name)))
+
 (define (result-assignments value)
   (for/treelist ([assignment (in-list (solver-result-values value))])
     (treelist (string->immutable-string (car assignment)) (cadr assignment) (caddr assignment))))
@@ -310,4 +322,62 @@
                    (result 'bad-model '()
                            (format "the solver answered sat, but ~a" reason)
                            (transcript model-stdout model-stderr)))])]))
+       (lambda () (delete-directory/files directory #:must-exist? #f)))]))
+
+;; What a solver needs before its first assertion to report which named
+;; assertions cannot hold together, and to report a set none of which can be
+;; left out (minimal as the solver minimizes it, not necessarily smallest).
+(define core-options
+  "(set-option :produce-unsat-cores true)\n(set-option :smt.core.minimize true)\n")
+
+;; The names in a get-unsat-core response, or #f. A name is printed bare or
+;; between bars.
+(define (parse-core datum)
+  (and (list? datum)
+       (andmap string? datum)
+       (for/list ([name (in-list datum)])
+         (if (regexp-match? #rx"^[|].*[|]$" name)
+             (substring name 1 (sub1 (string-length name)))
+             name))))
+
+;; Runs a feasibility script: named assertions, (check-sat), (get-unsat-core).
+;; Status 'infeasible carries the core's names; 'feasible means the assertions
+;; can hold together (the core request then fails, which is not an error here).
+(define (run_solver_core smtlib [executable #f] [timeout 10] [arguments '()])
+  (unless (string? smtlib) (raise-argument-error 'run_solver_core "string?" smtlib))
+  (define extra (text-list 'run_solver_core arguments))
+  (define started (current-inexact-milliseconds))
+  (define deadline (+ started (* 1000.0 timeout)))
+  (define-values (solver missing) (find-solver executable))
+  (define command
+    (append (list (if solver (path->string solver) (or (and executable (format "~a" executable)) "z3")))
+            extra (list "<feasibility.smt2>")))
+  (define (result status values . notes)
+    (solver-result status values
+                   (string->immutable-string (string-join (filter non-empty-string? notes) "\n"))
+                   command
+                   (/ (- (current-inexact-milliseconds) started) 1000.0)))
+  (cond
+    [(not solver) (result 'missing-executable '() missing)]
+    [else
+     (define directory (make-work-directory "pille-smt-~a"))
+     (dynamic-wind
+       void
+       (lambda ()
+         (define-values (state code stdout stderr)
+           (run-script solver extra directory "feasibility" smtlib deadline))
+         (define forms
+           (with-handlers ([exn:fail? (lambda (_error) #f)]) (map car (smtlib-commands stdout))))
+         (cond
+           [(eq? state 'failed) (result 'missing-executable '() (format "cannot run the solver: ~a" stderr))]
+           [(eq? state 'timeout)
+            (result 'timeout '() (format "the solver did not answer within ~a seconds and was terminated" timeout))]
+           [(not (and forms (pair? forms)))
+            (result 'malformed-response '() "expected sat, unsat, or unknown from the feasibility check" stdout stderr)]
+           [(equal? (car forms) "sat") (result 'feasible '())]
+           [(equal? (car forms) "unknown") (result 'unknown '())]
+           [(and (equal? (car forms) "unsat") (pair? (cdr forms)) (parse-core (cadr forms)))
+            => (lambda (names) (result 'infeasible names))]
+           [else
+            (result 'malformed-response '() "the solver answered unsat, but its unsat core was malformed" stdout stderr)]))
        (lambda () (delete-directory/files directory #:must-exist? #f)))]))

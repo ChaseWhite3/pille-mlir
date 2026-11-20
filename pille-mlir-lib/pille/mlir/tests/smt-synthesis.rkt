@@ -12,7 +12,8 @@
          "../../private/mlir/schema.rkt"
          "../../private/mlir/session.rkt"
          "../../private/mlir/solver.rkt"
-         "../../private/mlir/tools.rkt")
+         "../../private/mlir/tools.rkt"
+         "machine-fixture.rkt")
 
 ;; What a query needs to ask about a small machine whose step is comparisons
 ;; and choices (CLOSER_TIMED_MACHINE_WORK_ORDER.md, Slice A): orderings,
@@ -392,115 +393,12 @@
 ;;==============================================================================
 ;; Acceptance for Slice A: a small timed machine
 ;;
-;; The fixture is the test's, not the library's: nothing above knows of phases.
-;; A machine over (phase, level, since, clock), each an i32. Its durations are
-;; inputs: `initial` and `escalation`, then a `repeat` between re-escalations.
-;; Each message is a kind and an amount:
-;;
-;;   0 on          idle -> initial, since := clock
-;;   1 off         -> idle
-;;   2 disconnect  -> idle
-;;   3 respond     initial, escalation or re-escalation -> responded
-;;   4 time        clock := clock + amount
-;;   other         nothing
-;;
-;; and after every message a timed phase is what the time since `since` makes
-;; it: initial before `initial`, escalation before `initial + escalation`, then
-;; re-escalation at level 1, 2, 3 as each further `repeat` passes, and 4 after.
+;; The fixture is the tests', not the library's (machine-fixture.rkt): nothing
+;; above knows of phases. Its step is written out in one function's body, once
+;; for each of six messages.
 
-(define-values (idle initial escalation re-escalation responded) (values 0 1 2 3 5))
-(define-values (on off disconnect respond time nothing) (values 0 1 2 3 4 9))
 (define messages 6)
-
-;; The machine, written on numbers.
-(define (machine-step state durations kind amount)
-  (define-values (phase level since clock) (apply values state))
-  (define-values (I E R) (apply values durations))
-  (define start? (and (= kind on) (= phase idle)))
-  (define clock* (if (= kind time) (wrap32 (+ clock amount)) clock))
-  (define since* (if start? clock since))
-  (define phase1
-    (let* ([p (if start? initial phase)]
-           [p (if (or (= kind off) (= kind disconnect)) idle p)])
-      (if (and (= kind respond) (memv p (list initial escalation re-escalation))) responded p)))
-  (cond
-    [(memv phase1 (list initial escalation re-escalation))
-     (define elapsed (wrap32 (- clock* since*)))
-     (define-values (l0 l1 l2 l3)
-       (values (wrap32 (+ I E)) (wrap32 (+ I E R)) (wrap32 (+ I E R R)) (wrap32 (+ I E R R R))))
-     (list (cond [(< elapsed I) initial] [(< elapsed l0) escalation] [else re-escalation])
-           (cond [(< elapsed l0) 0] [(< elapsed l1) 1] [(< elapsed l2) 2] [(< elapsed l3) 3] [else 4])
-           since* clock*)]
-    [else (list phase1 0 since* clock*)]))
-(define (wrap32 value) (modulo value (expt 2 32)))
-(define (machine-run durations kinds amounts)
-  (for/fold ([state (list idle 0 0 0)]) ([kind (in-list kinds)] [amount (in-list amounts)])
-    (machine-step state durations kind amount)))
-
-;; The same machine as one function, its step written out once for each message.
-(define machine-text
-  (let ([out (open-output-string)])
-    (define (line format-string . arguments) (fprintf out "    ~a\n" (apply format format-string arguments)))
-    (define (constant name value) (line "%~a = arith.constant ~a : i32" name value))
-    (define (op name operation lhs rhs) (line "%~a = \"arithmetic.~a\"(%~a, %~a) : (i32, i32) -> i32" name operation lhs rhs))
-    (define (compare name predicate lhs rhs) (line "%~a = arith.cmpi ~a, %~a, %~a : i32" name predicate lhs rhs))
-    (define (choose name test chosen otherwise type) (line "%~a = arith.select %~a, %~a, %~a : ~a" name test chosen otherwise type))
-    (fprintf out "  func.func @machine(%I: i32, %E: i32, %R: i32~a) -> (i32, i32, i32, i32) {\n"
-             (apply string-append (for/list ([k (in-range messages)]) (format ", %m~a: i32, %d~a: i32" k k))))
-    (for ([value '(0 1 2 3 4 5)]) (constant (format "c~a" value) value))
-    (line "%no = arith.constant false")
-    (line "%yes = arith.constant true")
-    (op "l0" "add" "I" "E")
-    (op "l1" "add" "l0" "R")
-    (op "l2" "add" "l1" "R")
-    (op "l3" "add" "l2" "R")
-    (define-values (phase level since clock)
-      (for/fold ([phase "c0"] [level "c0"] [since "c0"] [clock "c0"]) ([k (in-range messages)])
-        (define (n name) (format "~a_~a" name k))
-        (define-values (m d) (values (format "m~a" k) (format "d~a" k)))
-        (compare (n "is_on") "eq" m "c0")
-        (compare (n "is_off") "eq" m "c1")
-        (compare (n "is_dis") "eq" m "c2")
-        (compare (n "is_resp") "eq" m "c3")
-        (compare (n "is_time") "eq" m "c4")
-        (compare (n "was_idle") "eq" phase "c0")
-        (choose (n "start") (n "is_on") (n "was_idle") "no" "i1")
-        (op (n "later") "add" clock d)
-        (choose (n "clock") (n "is_time") (n "later") clock "i32")
-        (choose (n "since") (n "start") clock since "i32")
-        (choose (n "p_on") (n "start") "c1" phase "i32")
-        (choose (n "p_off") (n "is_off") "c0" (n "p_on") "i32")
-        (choose (n "p_dis") (n "is_dis") "c0" (n "p_off") "i32")
-        ;; timed: the phase so far is initial, escalation or re-escalation
-        (define (timed name of)
-          (compare (format "~a_1" name) "eq" of "c1")
-          (compare (format "~a_2" name) "eq" of "c2")
-          (compare (format "~a_3" name) "eq" of "c3")
-          (choose (format "~a_23" name) (format "~a_2" name) "yes" (format "~a_3" name) "i1")
-          (choose name (format "~a_1" name) "yes" (format "~a_23" name) "i1"))
-        (timed (n "can_respond") (n "p_dis"))
-        (choose (n "responds") (n "is_resp") (n "can_respond") "no" "i1")
-        (choose (n "p_resp") (n "responds") "c5" (n "p_dis") "i32")
-        (timed (n "timed") (n "p_resp"))
-        (op (n "elapsed") "sub" (n "clock") (n "since"))
-        (compare (n "lt_i") "ult" (n "elapsed") "I")
-        (compare (n "lt_0") "ult" (n "elapsed") "l0")
-        (compare (n "lt_1") "ult" (n "elapsed") "l1")
-        (compare (n "lt_2") "ult" (n "elapsed") "l2")
-        (compare (n "lt_3") "ult" (n "elapsed") "l3")
-        (choose (n "tp_e") (n "lt_0") "c2" "c3" "i32")
-        (choose (n "tp") (n "lt_i") "c1" (n "tp_e") "i32")
-        (choose (n "tl_3") (n "lt_3") "c3" "c4" "i32")
-        (choose (n "tl_2") (n "lt_2") "c2" (n "tl_3") "i32")
-        (choose (n "tl_1") (n "lt_1") "c1" (n "tl_2") "i32")
-        (choose (n "tl") (n "lt_0") "c0" (n "tl_1") "i32")
-        (choose (n "phase") (n "timed") (n "tp") (n "p_resp") "i32")
-        (choose (n "level") (n "timed") (n "tl") "c0" "i32")
-        (values (n "phase") (n "level") (n "since") (n "clock"))))
-    (fprintf out "    return %~a, %~a, %~a, %~a : i32, i32, i32, i32\n  }\n" phase level since clock)
-    (get-output-string out)))
-
-(define machine (program machine-text))
+(define machine (program (unrolled-machine-text messages)))
 
 (define-values (I E R) (values (smt_input "I" 32) (smt_input "E" 32) (smt_input "R" 32)))
 (define kinds (for/list ([k (in-range messages)]) (smt_input (format "m~a" k) 32)))

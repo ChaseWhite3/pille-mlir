@@ -596,7 +596,8 @@
   (rejects #rx"operation 'arithmetic.add' carries attribute 'rounding'; attribute-dependent semantics are unsupported and attributes are rejected rather than ignored"
            arithmetic module "attributed" inputs trivial)
   (rejects #rx"unsupported operation 'memref.alloca'" arithmetic module "effect" inputs trivial)
-  (rejects #rx"unsupported operation 'func.call'" arithmetic module "caller" inputs trivial)
+  ;; A call is inlined (smt-bounded.rkt), so this is refused for what its callee does.
+  (rejects #rx"operation 'arithmetic.opaque' has no declared SMT semantics" arithmetic module "caller" inputs trivial)
   ;; Even an unused value outside the fragment is rejected, not dropped.
   (rejects #rx"unsupported constant of type 'f32'" arithmetic module "dead_float" inputs trivial)
   (rejects #rx"unsupported type 'i7' of argument 0" arithmetic module "odd_width" inputs trivial)

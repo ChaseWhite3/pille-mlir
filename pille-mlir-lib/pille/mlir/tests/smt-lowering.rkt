@@ -70,7 +70,9 @@
   ;; The differences are these and no others: two readers' own words for malformed
   ;; JSON and for an operation with memory effects (three requests, from the port),
   ;; and nine refusals reworded when the fragment grew on 2026-11-20 (arith.cmpi,
-  ;; arith.select and several results; the same things are refused).
+  ;; arith.select, several results and inlined calls). Every one is still a
+  ;; refusal: eight of the same thing in other words, and one, a call to a
+  ;; function whose operation has no model, now of what that function does.
   (check-equal? (sort (remove-duplicates
                        (for/list ([request (in-list requests)]
                                   #:when (hash-has-key? request 'lowering))

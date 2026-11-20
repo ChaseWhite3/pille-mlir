@@ -39,6 +39,14 @@ export:
 // and arith.select (an i1 condition `== 1` choosing between two values of one
 // width). A function may return several scalars.
 //
+// A func.call to a function of the same module is inlined: the callee's block
+// is lowered where the call stands, its arguments the call's operands and the
+// call's results what it returns. A callee is held to what a selected function
+// is (one straight-line block, supported scalar types, neutral attributes), and
+// a function that would call itself, directly or through another, is refused.
+// (MLIR's own inline pass is no use here: an operation registered through IRDL
+// has no inliner interface, so a callee that uses one is left uninlined.)
+//
 // The module is read from the generic form the toolchain printed
 // (`generic.rhm`). Two things a native pass could ask MLIR and this cannot:
 // whether an operation is a terminator, taken here as having successors or
@@ -155,8 +163,11 @@ class Query(context :: Context,
             index :: maybe(Int),
             mutable lines :: List.of(String),
             mutable next :: Int,
-            values :: MutableMap,
-            mutable obligations :: List.of(String)):
+            // the lowered value of each SSA name in the block being lowered
+            mutable values :: MutableMap,
+            mutable obligations :: List.of(String),
+            // the functions being lowered, the selected one first: a call's way in
+            mutable calls :: List.of(String) = []):
   method prefix() :: String:
     match index
     | position :: Int: "SMT batch spec " +& position +& ": "
@@ -775,6 +786,63 @@ fun lower_select(q :: Query, op :: generic.Op):
   | q.error(loc, "SMT query: unsupported arith.select; an i1 condition choosing between two scalars of one supported width is needed")
   q.values[op.results[0]] := bv_ite(q, bit_bool(q, operands[0], loc), operands[1], operands[2], loc)
 
+// func.call: the callee's block, lowered here with its own names.
+fun lower_call(q :: Query, op :: generic.Op):
+  let loc = op.loc
+  for (attribute in op.attribute_names()):
+    unless attribute == "callee"
+    | q.error(loc, "SMT query: unsupported attribute '" ++ attribute ++ "' on func.call")
+  let name :: String:
+    match op.property("callee")
+    | text :: String:
+        match rkt.#{regexp-match}(#{#px"^@([A-Za-z_.$][A-Za-z0-9_.$-]*)$"}, text)
+        | PairList[_, symbol]: to_string(symbol)
+        | ~else: q.error(loc, "SMT query: func.call has an unsupported callee " ++ text)
+    | ~else: q.error(loc, "SMT query: func.call has no callee")
+  let way = String.join(for List (caller in q.calls): "@" ++ caller, " calls ")
+  when name in q.calls
+  | q.error(loc, "SMT query: recursive call to @" ++ name ++ " (" ++ way ++ " calls @" ++ name
+                   ++ "); a call is inlined, so recursion is unsupported")
+  let callee :: generic.Op:
+    match q.context.module.function(name)
+    | found :: generic.Op: found
+    | ~else: q.error(loc, "SMT query: call to @" ++ name ++ ", which the module does not define as a func.func")
+  let blocks :: List.of(generic.Block):
+    match callee.regions
+    | [region]: region.blocks
+    | ~else: q.error(loc, "SMT query: call to @" ++ name ++ ", which is not a func.func with one body region")
+  when blocks.length() == 0
+  | q.error(loc, "SMT query: call to @" ++ name ++ ", which is a declaration without a body; a call is inlined")
+  for (attribute in callee.attribute_names()):
+    unless is_neutral_function_attribute(attribute)
+    | q.error(loc, "SMT query: call to @" ++ name ++ ", which carries the unsupported attribute '" ++ attribute
+                     ++ "'; attributes are rejected rather than ignored")
+  unless blocks.length() == 1
+  | q.error(loc, "SMT query: unsupported control flow: called function @" ++ name ++ " has " +& blocks.length()
+                   +& " blocks, but only straight-line single-block bodies are supported")
+  let operands = standard_operands(q, op)
+  let block = blocks[0]
+  unless block.args.length() == operands.length()
+  | q.error(loc, "SMT query: call to @" ++ name ++ " passes " +& operands.length() +& " values to a function of "
+                   +& block.args.length() +& " arguments")
+  let caller_values = q.values
+  let caller_calls = q.calls
+  q.values := MutableMap()
+  q.calls := caller_calls.add(name)
+  for (argument in block.args, operand in operands):
+    q.values[argument.name] := operand
+  let returned = lower_block(q, name, block, callee.loc)
+  q.values := caller_values
+  q.calls := caller_calls
+  unless returned.length() == op.results.length()
+  | q.error(loc, "SMT query: call to @" ++ name ++ " takes " +& op.results.length() +& " results of a function that returns "
+                   +& returned.length())
+  for (result in op.results, type in op.result_types, value in returned):
+    unless supported_width(type) == value.width
+    | q.error(loc, "SMT query: call to @" ++ name ++ " takes a result of type '" ++ type ++ "' where the function returns a "
+                     +& value.width +& "-bit value")
+    q.values[result] := value
+
 fun lower_modeled(q :: Query, op :: generic.Op, model :: Model, is_last :: Boolean):
   let loc = op.loc
   let name = op.name
@@ -834,6 +902,12 @@ fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of
       let declared = declare_fun(q, input.name, input.width, function.op.loc)
       q.values[argument.name] := declared
       declared
+  q.calls := [spec.function]
+  values(inputs, lower_block(q, spec.function, block, function.op.loc))
+
+// The operations of one function's block, in order: what it returns. The
+// block's arguments are already in `q.values`.
+fun lower_block(q :: Query, function_name :: String, block :: generic.Block, function_loc :: String) :: List.of(Bv):
   let count = block.ops.length()
   let models :: Map = q.context.models || {}
   let returned :: maybe(List):
@@ -849,13 +923,16 @@ fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of
       | name == "arith.select":
           lower_select(q, op)
           returned
+      | name == "func.call":
+          lower_call(q, op)
+          returned
       | name == "func.return":
           unless op.operands.length() >= 1 && op.attribute_names().length() == 0
-          | q.error(op.loc, "SMT query: unsupported return in function @" ++ spec.function)
+          | q.error(op.loc, "SMT query: unsupported return in function @" ++ function_name)
           for List (operand in op.operands):
             match q.values.get(operand, #false)
             | value :: Bv: value
-            | ~else: q.error(op.loc, "SMT query: function @" ++ spec.function ++ " does not return a supported value")
+            | ~else: q.error(op.loc, "SMT query: function @" ++ function_name ++ " does not return a supported value")
       | models.has_key(name):
           lower_modeled(q, op, models[name], position == count - 1)
           returned
@@ -864,10 +941,10 @@ fun lower_body(q :: Query, spec :: Spec, function :: Function) :: values(List.of
                             ++ "' has no declared SMT semantics; add an smt clause to its declaration")
       | ~else:
           q.error(op.loc, "SMT query: unsupported operation '" ++ name
-                            ++ "'; only arith.constant, arith.cmpi, arith.select, func.return, and operations with declared SMT semantics are supported")
+                            ++ "'; only arith.constant, arith.cmpi, arith.select, func.call, func.return, and operations with declared SMT semantics are supported")
   match returned
-  | results :: List.of(Bv): values(inputs, results)
-  | ~else: q.error(function.op.loc, "SMT query: function @" ++ spec.function ++ " does not return a supported value")
+  | results :: List.of(Bv): results
+  | ~else: q.error(function_loc, "SMT query: function @" ++ function_name ++ " does not return a supported value")
 
 //==============================================================================
 // 4. One question, as one solver

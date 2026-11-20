@@ -13,9 +13,10 @@ Amended on review, 2026-11-20. The amendments are marked **Amended** where they 
 
 **Amended.** The target is the Pille checkout (`C:/GitProj/pille-mlir` on Windows), branch **`main`**. The `mlir`
 branch this order first named was merged into `main` and deleted on 2026-11-20; a checkout still on it switches
-with `git fetch chase --prune` and `git switch main`, which loses nothing, since `main` holds everything `mlir`
-had. Commit on `main` and push to the `chase` remote (`ChaseWhite3/pille-mlir`); make no feature branch, and never
-push to `origin`. Start from commit `7659c9e` or later: it changed `pille-mlir-lib/pille/private/mlir/tools.rkt`
+with `git fetch --prune` of the fork's remote and `git switch main`, which loses nothing, since `main` holds everything `mlir`
+had. Commit on `main` and push to the fork, `ChaseWhite3/pille-mlir`; make no feature branch, and never push to
+`distractedlambda/pille`. The fork's remote is named `chase` on the Mac checkout and `origin` on the Windows one: go by
+the URL (`git remote -v`), not the name. Start from commit `7659c9e` or later: it changed `pille-mlir-lib/pille/private/mlir/tools.rkt`
 (the MLIR tools are found without `PILLE_MLIR_PREFIX`) and the integration tests' tool lookup.
 
 Read `CLAUDE.md` first. Closer's checkout (`C:/GitProj/anote`) uses this one as `PILLE_HOME` and snapshots it for
@@ -138,11 +139,13 @@ body for six messages. Then:
 so a step function is written once and an unrolled function calls it K times. Reject recursion and calls to unknown
 symbols with a diagnostic.
 
-> **Amended.** Do not write an inliner. Run MLIR's own `inline` pass over the module before lowering
-> (`run_passes("builtin.module(inline)")`; checked on LLVM 23.1.5, it inlines a `func.call` to a private function
-> of the module). A call it cannot inline (recursion, a declaration with no body) is left in place, and the
-> lowering then rejects it by name as it rejects any unsupported operation today. Add a fixture for each of those
-> two, checking the diagnostic names the call and its location.
+> **Amended, then corrected (2026-11-20).** The first amendment said to run MLIR's own `inline` pass before
+> lowering. That is wrong for every real query: checked on LLVM 23.1.5, the pass inlines a callee made of `arith`
+> operations alone, and leaves in place a call to a function that uses an operation registered through IRDL, since
+> such an operation has no inliner interface. Inline in the lowering, as this step first said: on a `func.call`,
+> lower the callee's block with its arguments bound to the call's operands. Refuse recursion, a call to a symbol
+> the module does not define as a `func.func` with a body, and a callee outside the fragment, each naming the call
+> and its location.
 
 **B2. Incremental scopes.** A public scope on `Session`: `push()`, `assert(formula)`, `check()`, `pop()`, sharing
 inputs declared once, so Closer can deepen K from 1 upward and ask one question per claim without re-lowering or
@@ -181,10 +184,11 @@ belongs in Pille.
 
 ## Deliverables
 
-- **Amended.** The primitives above, described in `pille/mlir/smt.rhm`'s comments and in a dated note under
-  `claude-changes/`. Do not edit `pille-mlir-lib/README.md`, the repository README, or anything under
-  `pille/pille/scribblings/`: `CLAUDE.md` keeps the documentation human-written. Instead, name in the note and in
-  the report each binding added or changed and what the README's "Verifying properties" section should say of it.
+- **Amended, then decided by the owner (2026-11-20).** The primitives above, described in `pille/mlir/smt.rhm`'s
+  comments, in a dated note under `claude-changes/`, and, with Slice B, in `pille-mlir-lib/README.md`: its
+  "Verifying properties" section and its API table. That README is the package's own and is written with the
+  work. The repository's root `README.md` and everything under `pille/pille/scribblings/` stay human-written
+  (`CLAUDE.md`): do not edit those, and report what they should say.
 - Tests under `pille-mlir-lib/pille/mlir/tests/`: builder tests, lowering fixtures for `cmpi`, `select`, several
   results and `call`, and the Slice A and B acceptance fixtures as integration tests against Z3.
 - A short note in `SMT_WORK_ORDER.md`'s "First supported fragment" saying what is now supported.
@@ -196,14 +200,21 @@ belongs in Pille.
 ## Amendments of 2026-11-20
 
 1. The branch is `main`, not `mlir`; no feature branches; start from `7659c9e` or later.
-2. Documentation is comments and a `claude-changes` note; READMEs and the manual are not edited.
+2. Documentation is comments, a `claude-changes` note and, from Slice B, `pille-mlir-lib/README.md`; the root README
+   and the manual are not edited.
 3. A4: widen with `concat`, `extract` and `repeat`, the dialect having no extend; multiplication at twice the width.
 4. A5: `produce-unsat-cores` at session start; `smt.core.minimize` on.
 5. A6: a signed objective needs its sign bit flipped; the core first, then the objective.
 6. Slice A's last acceptance point: what the exported SMT-LIB must carry.
-7. B1: MLIR's `inline` pass before lowering, not a new inliner.
+7. B1: inline in the lowering. (An earlier amendment said MLIR's `inline` pass; it does not inline a callee that
+   uses an IRDL-registered operation.)
 8. Slice C: locate the failure first; count active lanes only.
 9. "Passing" means on a Racket snapshot; the callback checks cannot pass on 9.3.
+
+Decided on the Slice A review (2026-11-20): the nine refusals reworded in the plugin record stay as recorded; a
+counterexample reports inputs only, since Closer replays them; objectives on a `Session` come with Slice B's scopes.
+The review ran on Windows, where `z3.exe` ends its lines with `\r\n`: a test that compares a solver's printed text
+normalizes line endings first.
 
 This file was written into the repository from photographs of the order as it stood on the Windows checkout, where
 it had not been committed. If the two differ beyond the amendments, the wording there is the original.

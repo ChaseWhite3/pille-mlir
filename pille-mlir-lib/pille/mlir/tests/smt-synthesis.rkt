@@ -253,7 +253,9 @@
     void
     (lambda ()
       (display-to-file script file #:exists 'truncate)
-      (string-trim (with-output-to-string (lambda () (system* z3 (path->string file))))))
+      ;; (z3 on Windows ends its lines with a carriage return and a newline)
+      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (system* z3 (path->string file))))
+                                    "\n")))
     (lambda () (delete-file file))))
 
 (define (core-of answer) (sort (treelist->list (solver_result_core answer)) string<?))

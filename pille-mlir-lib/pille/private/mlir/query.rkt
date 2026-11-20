@@ -14,7 +14,7 @@
          "lower.rhm")
 
 (provide smt_input smt_result smt_result_at smt_const smt_binary smt_ite
-         smt_eq smt_cmp smt_not smt_and smt_or
+         smt_eq smt_cmp smt_no_overflow smt_not smt_and smt_or
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -57,6 +57,7 @@
 ;;   (term 'ite (f a b) width)    a where f holds, else b
 ;;   (formula 'eq (a b)) (formula 'not (f)) (formula 'and fs) (formula 'or fs)
 ;;   (formula 'cmp (predicate a b))   predicate one of comparison-predicates
+;;   (formula 'no_overflow (operation signed? a b))   operation add, sub or mul
 (struct term (tag args width) #:transparent)
 (struct formula (tag args) #:transparent)
 
@@ -164,6 +165,18 @@
     (builder-error who "expected a Boolean predicate, received ~a; Boolean predicates and bitvectors are distinct sorts"
                    (describe-sort value))))
 
+;; That `lhs op rhs`, read as unsigned or as signed numbers, is not changed by
+;; the wrapping of `op`. The arithmetic builders keep their wrapping meaning;
+;; this says of one use that it did not wrap.
+(define (smt_no_overflow operation lhs rhs signed?)
+  (define symbol (if (string? operation) (string->symbol operation) operation))
+  (unless (memq symbol '(add sub mul))
+    (raise-argument-error 'smt_no_overflow "'add, 'sub, or 'mul (symbol or string)" operation))
+  (unless (boolean? signed?)
+    (raise-argument-error 'smt_no_overflow "boolean?" signed?))
+  (check-terms (string->symbol (format "no_overflow_~a" symbol)) lhs rhs)
+  (formula 'no_overflow (list symbol signed? lhs rhs)))
+
 (define (smt_not value)
   (check-formula 'not value)
   (formula 'not (list value)))
@@ -224,6 +237,10 @@
                [(ult) "<u"] [(ule) "<=u"] [(ugt) ">u"] [(uge) ">=u"]
                [(slt) "<s"] [(sle) "<=s"] [(sgt) ">s"] [(sge) ">=s"])
              (render-term rhs))]
+    [(formula 'no_overflow (list operation signed? lhs rhs))
+     (format "no_overflow(~a ~a ~a, ~a)" (render-term lhs)
+             (case operation [(add) "+"] [(sub) "-"] [(mul) "*"])
+             (render-term rhs) (if signed? "signed" "unsigned"))]
     [(formula 'not (list operand)) (format "!(~a)" (render-formula operand))]
     [(formula tag operands)
      (define joined
@@ -261,6 +278,9 @@
      (list "eq" (term->manifest lhs inputs) (term->manifest rhs inputs))]
     [(formula 'cmp (list predicate lhs rhs))
      (list "cmp" (symbol->string predicate) (term->manifest lhs inputs) (term->manifest rhs inputs))]
+    [(formula 'no_overflow (list operation signed? lhs rhs))
+     (list "no_overflow" (symbol->string operation) signed?
+           (term->manifest lhs inputs) (term->manifest rhs inputs))]
     [(formula tag operands)
      (cons (symbol->string tag)
            (for/list ([operand (in-list operands)]) (formula->manifest operand inputs)))]))

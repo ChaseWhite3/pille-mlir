@@ -43,6 +43,9 @@ export:
   sgt
   sge
   ite
+  no_overflow_add
+  no_overflow_sub
+  no_overflow_mul
 
 // A bitvector-sorted value with an exact width. Terms and Boolean predicates
 // are separate sorts: a one-bit term is never usable as a predicate.
@@ -106,6 +109,17 @@ fun slt(lhs, rhs) :: Formula: query.smt_cmp(#'slt, lhs, rhs)
 fun sle(lhs, rhs) :: Formula: query.smt_cmp(#'sle, lhs, rhs)
 fun sgt(lhs, rhs) :: Formula: query.smt_cmp(#'sgt, lhs, rhs)
 fun sge(lhs, rhs) :: Formula: query.smt_cmp(#'sge, lhs, rhs)
+
+// That `lhs + rhs` (or `-`, or `*`) is the number it would be with room to
+// spare: reading both terms as unsigned numbers, or with `~signed: #true` as
+// two's complement ones, the operation does not wrap. `add`, `sub` and `mul`
+// still wrap; a guard is how a query excludes the inputs for which one did.
+fun no_overflow_add(lhs, rhs, ~signed: signed :: Boolean = #false) :: Formula:
+  query.smt_no_overflow(#'add, lhs, rhs, signed)
+fun no_overflow_sub(lhs, rhs, ~signed: signed :: Boolean = #false) :: Formula:
+  query.smt_no_overflow(#'sub, lhs, rhs, signed)
+fun no_overflow_mul(lhs, rhs, ~signed: signed :: Boolean = #false) :: Formula:
+  query.smt_no_overflow(#'mul, lhs, rhs, signed)
 
 // `chosen` where `test` holds, else `otherwise`: two terms of equal width.
 fun ite(test, chosen, otherwise) :: Term:

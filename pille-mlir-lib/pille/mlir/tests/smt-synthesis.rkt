@@ -178,3 +178,63 @@
   ;; possible values are enumerated of one result
   (rejects #rx"function @both returns 3 values; possible values are enumerated of a one-result function"
            (lambda () (make_smt_values_query arithmetic several "both" inputs '()))))
+
+;;==============================================================================
+;; A4. Overflow guards
+
+;; Whether lhs op rhs, on the numbers the residues stand for, stays in range.
+(define (fits? operation signed? lhs rhs width)
+  (define-values (l r) (if signed? (values (signed lhs width) (signed rhs width)) (values lhs rhs)))
+  (define exact (case operation [(add) (+ l r)] [(sub) (- l r)] [(mul) (* l r)]))
+  (if signed?
+      (<= (- (expt 2 (sub1 width))) exact (sub1 (expt 2 (sub1 width))))
+      (<= 0 exact (sub1 (expt 2 width)))))
+
+(define sums
+  (program
+   "  func.func @sum(%a0: i32, %a1: i32) -> i32 {\n    %r = \"arithmetic.add\"(%a0, %a1) : (i32, i32) -> i32\n    return %r : i32\n  }\n"))
+
+(test-case "a guard holds exactly where the operation, done on numbers, stays in range"
+  (rejects #rx"width mismatch" (lambda () (smt_no_overflow 'add a8 a32 #f)))
+  (check-equal? (render_formula (smt_no_overflow 'mul a8 b8 #t)) "no_overflow(a * b, signed)")
+  ;; every pair of these, for each operation, unsigned and signed
+  (define edges '(0 1 2 3 15 16 17 127 128 129 254 255))
+  (define specs
+    (for*/list ([operation '(add sub mul)] [signed? '(#f #t)] [lhs (in-list edges)] [rhs (in-list edges)])
+      (define guard (smt_no_overflow operation a8 b8 signed?))
+      (make_spec "cmp_eq" (list a8 b8)
+                 (if (fits? operation signed? lhs rhs 8) guard (smt_not guard))
+                 (list (smt_eq a8 (smt_const lhs 8)) (smt_eq b8 (smt_const rhs 8))))))
+  (define answers (treelist->list (batch_check (make_smt_batch arithmetic comparisons specs) z3 10 '() 600)))
+  (check-equal? (length specs) 864)
+  (check-equal? (remove-duplicates (map solver_result_status answers)) '(unsat))
+  ;; and for every input, the well-known tests: an unsigned sum did not wrap
+  ;; exactly where it is no less than a term, a difference where a >= b
+  (define (iff p q) (smt_or (list (smt_and (list p q)) (smt_and (list (smt_not p) (smt_not q))))))
+  (check-eq? (status (query comparisons "cmp_eq" (list a8 b8)
+                            (iff (smt_no_overflow 'add a8 b8 #f) (smt_cmp 'uge (smt_binary 'add a8 b8) a8))))
+             'unsat)
+  (check-eq? (status (query comparisons "cmp_eq" (list a8 b8)
+                            (iff (smt_no_overflow 'sub a8 b8 #f) (smt_cmp 'uge a8 b8))))
+             'unsat)
+  ;; the widening is all in the formula: the terms keep their width
+  (define ir (module_ir (query_module (query comparisons "cmp_eq" (list a8 b8) (smt_no_overflow 'mul a8 b8 #t)))))
+  (check-regexp-match #rx"smt.bv.concat" ir)
+  (check-regexp-match #rx"!smt.bv<16>" ir))
+
+(test-case "a sum that holds only by wrapping is found without the guard and excluded with it"
+  (define r32 (smt_result 32))
+  ;; "the sum is no less than a": false where the addition wraps
+  (define without (query_check (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32)) z3))
+  (check-eq? (solver_result_status without) 'sat)
+  ;; the counterexample is a wrapping pair
+  (define found (for/hash ([entry (in-list (solver_result_values without))]) (values (car entry) (caddr entry))))
+  (check-true (>= (+ (hash-ref found "a") (hash-ref found "b")) (expt 2 32)))
+  (check-eq? (status (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32)
+                            (list (smt_no_overflow 'add a32 b32 #f))))
+             'unsat)
+  ;; and the other way: asked for a wrapped sum, the guard leaves none
+  (check-eq? (status (query sums "sum" (list a32 b32) (smt_not (smt_cmp 'ult r32 a32)))) 'sat)
+  (check-eq? (status (query sums "sum" (list a32 b32) (smt_not (smt_cmp 'ult r32 a32))
+                            (list (smt_no_overflow 'add a32 b32 #f))))
+             'unsat))

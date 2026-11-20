@@ -29,8 +29,9 @@ export:
 //
 // Operations are written in MLIR's generic form, and only these are ever
 // written: smt.solver, smt.set_logic, smt.declare_fun, smt.bv.constant,
-// smt.bv.add, smt.bv.mul, smt.bv.neg, smt.bv.cmp, smt.eq, smt.ite, smt.not,
-// smt.and, smt.or, smt.assert, smt.check and smt.yield.
+// smt.bv.add, smt.bv.mul, smt.bv.neg, smt.bv.cmp, smt.bv.concat,
+// smt.bv.extract, smt.bv.repeat, smt.eq, smt.ite, smt.not, smt.and, smt.or,
+// smt.assert, smt.check and smt.yield.
 //
 // Beside a dialect's modeled operations, a body may hold three of MLIR's own
 // whose meaning is fixed: arith.constant, arith.cmpi (each predicate as the
@@ -240,6 +241,55 @@ fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) ::
   emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " +& predicate +& " : i64}> : ("
             ++ type ++ ", " ++ type ++ ") -> !smt.bool", loc)
   name
+
+// The dialect has no extend operation. A value is widened by `extra` bits with
+// concat: zeros in front where it is unsigned, copies of its sign bit where it
+// is signed. These are the only values whose width is not one of the
+// supported ones, and they never leave the formula that makes them.
+fun bv_concat(q :: Query, high :: Bv, low :: Bv, loc :: String) :: Bv:
+  let name = fresh(q)
+  let width = high.width + low.width
+  emit(q, name ++ " = \"smt.bv.concat\"(" ++ high.name ++ ", " ++ low.name ++ ") : (" ++ bv_type(high.width) ++ ", "
+            ++ bv_type(low.width) ++ ") -> " ++ bv_type(width), loc)
+  Bv(name, width)
+
+fun bv_extract(q :: Query, input :: Bv, low_bit :: Int, width :: Int, loc :: String) :: Bv:
+  let name = fresh(q)
+  emit(q, name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " +& low_bit +& " : i32}> : ("
+            ++ bv_type(input.width) ++ ") -> " ++ bv_type(width), loc)
+  Bv(name, width)
+
+fun bv_repeat(q :: Query, input :: Bv, count :: Int, loc :: String) :: Bv:
+  let name = fresh(q)
+  let width = input.width * count
+  emit(q, name ++ " = \"smt.bv.repeat\"(" ++ input.name ++ ") : (" ++ bv_type(input.width) ++ ") -> "
+            ++ bv_type(width), loc)
+  Bv(name, width)
+
+fun widened(q :: Query, value :: Bv, extra :: Int, signed :: Boolean, loc :: String) :: Bv:
+  let front :: Bv:
+    cond
+    | !signed: bv_constant(q, 0, extra, loc)
+    | ~else:
+        let sign = bv_extract(q, value, value.width - 1, 1, loc)
+        if extra == 1 | sign | bv_repeat(q, sign, extra, loc)
+  bv_concat(q, front, value, loc)
+
+// Whether `lhs op rhs` is the same number at the terms' width as it is with
+// room to spare: one more bit for a sum or a difference, twice the width for
+// a product. The operation is done at the wider width, and its low bits,
+// widened again, are compared with it.
+fun no_overflow(q :: Query, operation :: String, signed :: Boolean, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
+  let extra = if operation == "mul" | lhs.width | 1
+  let wide_lhs = widened(q, lhs, extra, signed, loc)
+  let wide_rhs = widened(q, rhs, extra, signed, loc)
+  let wide :: Bv:
+    cond
+    | operation == "add": bv_binary(q, "smt.bv.add", wide_lhs, wide_rhs, loc)
+    | operation == "mul": bv_binary(q, "smt.bv.mul", wide_lhs, wide_rhs, loc)
+    | ~else: bv_binary(q, "smt.bv.add", wide_lhs, bv_neg(q, wide_rhs, loc), loc)
+  let narrow = bv_extract(q, wide, 0, lhs.width, loc)
+  bv_eq(q, wide, widened(q, narrow, extra, signed, loc), loc)
 
 // A Boolean as the one-bit value an i1 is, and an i1 as a Boolean. The two
 // sorts stay distinct: each crossing is one of these, written out.
@@ -604,6 +654,15 @@ fun lower_formula(q :: Query, expression, scope :: Scope, loc :: String) :: Stri
           | q.error(loc, "SMT query: comparison " ++ (predicate :~ String) ++ " in " ++ scope.description
                            ++ " compares a " +& lhs.width +& "-bit value with a " +& rhs.width +& "-bit value")
           bv_cmp(q, cmp_predicates[predicate], lhs, rhs, loc)
+      | tag == "no_overflow" && node.length() == 5:
+          let operation = as_string(node[1])
+          unless operation && is_arithmetic(operation) && node[2] is_a Boolean
+          | q.malformed("invalid overflow guard in " ++ scope.description)
+          let lhs = lower_term(q, node[3], scope, loc)
+          let rhs = lower_term(q, node[4], scope, loc)
+          unless lhs.width == rhs.width
+          | q.error(loc, mixed_widths(operation, scope, lhs.width, rhs.width))
+          no_overflow(q, operation, node[2], lhs, rhs, loc)
       | tag == "not" && node.length() == 2:
           bool_not(q, lower_formula(q, node[1], scope, loc), loc)
       | (tag == "and" || tag == "or") && node.length() >= 2:

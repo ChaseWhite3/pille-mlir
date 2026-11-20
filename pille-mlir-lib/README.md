@@ -47,20 +47,19 @@ the tested `llvm@23` installation includes these tools. No native MLIR C API
 shared library is required. Importing `pille/mlir` does not invoke any tools.
 Constructing a toolchain requires `mlir-opt`; other tools are required when used.
 
-SMT verification has two further, optional requirements. Neither is needed to
-import any module, expand declarations, or obtain IRDL:
-
-| Requirement | Used for |
-| --- | --- |
-| The `PilleSmtQuery` plugin, built with CMake and a C++17 compiler against the same installation | `dialect.smt_query(...)` |
-| Z3 (tested with 5.3.3) | `query.check(...)` |
+SMT verification has one further, optional requirement: Z3 (tested with 5.3.3),
+which answers a `check` or a session's question. It is not needed to import any
+module, expand declarations, obtain IRDL, or build and export a query. Nothing
+is compiled: the lowering to the SMT dialect is written in Rhombus.
 
 Tool selection follows this order:
 
 1. An explicit `mlir.Toolchain(~prefix: path)`.
 2. `PILLE_MLIR_PREFIX`.
 3. `PILLE_LLVM_PREFIX`.
-4. `mlir-opt` on `PATH`.
+4. The usual places an LLVM installation is put (Homebrew's `llvm@23` and
+   `llvm`, `/usr/lib/llvm-23`, and the like), where one of them has `mlir-opt`.
+5. `mlir-opt` on `PATH`.
 
 An explicit or environment prefix must work; it does not silently fall back.
 The selected `bin` directory is captured, and all tools are resolved there so
@@ -179,7 +178,7 @@ handles only the example operation; a language must supply its own semantics.
 | `module.to_bitcode()` | LLVM bitcode as `ImmutableBytes`; input must already be lowered |
 | `module.to_smtlib()` | SMT-LIB text from exportable SMT operations |
 
-The SMT verification API is listed [above](#queries).
+The SMT verification API is listed [below](#api-summary).
 
 There are no native handles to dispose. Each operation uses a private temporary
 directory, invokes executables directly without a shell, and removes the
@@ -216,7 +215,7 @@ exports; it never runs a solver.
 ## Verifying properties with declared SMT semantics
 
 A dialect author can declare an operation's structure and its SMT meaning in
-one place, and then check properties of ordinary programs that use it:
+one place, and then ask questions of ordinary programs that use it:
 
 ```text
 Rhombus operation declaration with an smt: clause
@@ -272,6 +271,21 @@ It contains no handwritten SMT MLIR or SMT-LIB. The `smt:` clause and its
 expression forms are described in the
 [declaration guide](DECLARATIONS.md#smt-semantics).
 
+The lowering is written in Rhombus (`pille/private/mlir/lower.rhm`) and is
+driven by a manifest generated from the `Dialect` value. It names no custom
+operation: a new or renamed operation, another namespace, or a different model
+needs no change to it. Nothing is built, and the only tools are `mlir-opt`,
+`mlir-translate` and, to answer a question, Z3.
+
+There are four kinds of question, each over one function of a module:
+
+| Question | Built with | Answer |
+| --- | --- | --- |
+| Does a property hold for every input that satisfies the preconditions? | `dialect.smt_query` | `Proved`, `Counterexample`, or `Infeasible` where named preconditions conflict |
+| Which values can the result take? | `dialect.smt_values_query` | `Values` |
+| What is the least or greatest value of a term? | `dialect.smt_objective` | `Optimum`, or `Infeasible` |
+| Many claims under assumptions that are kept | `dialect.smt_scope` | `Proved` or `Counterexample`, one a claim |
+
 ### What a proof means
 
 IRDL verification is structural: it checks that each instance has the declared
@@ -283,10 +297,9 @@ selected function, under the stated preconditions.
 Attaching semantics declares the operation pure, deterministic, and total. IRDL
 cannot establish this, and a dynamically registered operation has no MLIR effect
 interfaces, so the declaration is trusted: an operation is not rejected for
-lacking those interfaces, an operation without a model is never assumed pure,
-and an operation that reports memory effects is rejected. A proof also does not
-establish that an independent lowering, such as the example `rhombus.add` to
-`arith.addi` pass, implements the same model.
+lacking those interfaces, and an operation without a model is never assumed
+pure. A proof also does not establish that an independent lowering, such as the
+example `rhombus.add` to `arith.addi` pass, implements the same model.
 
 ### Supported fragment
 
@@ -297,8 +310,9 @@ establish that an independent lowering, such as the example `rhombus.add` to
 | Modeled operations | Fixed arity, exactly one result, no attributes, regions, or successors |
 | Requirements | `requires a == b \|\| ...` in a model; each use's requirement is proved along with the property, so a counterexample may be a use outside what an operation's model covers. Ask the property `smt.eq(result, result)` to check the requirements alone |
 | Semantic expressions | Operand and local references, literals, wrapping `bv.add`, `bv.sub`, `bv.mul`, and the choice `bv.if(a == b, then, else)` |
-| Functions | `func.func` with one block, typed arguments, `arith.constant`, modeled operations, and `return` of one value |
-| Properties | Inputs, the result, typed literals, `add`/`sub`/`mul`, and `eq`, `not`, `and`, `or` |
+| Functions | `func.func` with one block and typed arguments, returning one scalar or several |
+| Operations in a body | Modeled operations; `arith.constant`; `arith.cmpi` with every predicate; `arith.select`; `func.call` to a function of the same module |
+| Properties and preconditions | Inputs, results, typed literals, `add`/`sub`/`mul`, `ite`; `eq`, the orderings, the overflow guards, `not`, `and`, `or` |
 | Logic | `QF_BV` |
 
 A declaration may accept several widths; its model is instantiated at each
@@ -306,58 +320,81 @@ instance's actual types. Widths are never converted, and are never assumed
 equal: an instance that mixes widths where the model needs equal ones is
 rejected while lowering. `bv.sub(a, b)` is emitted as `a + (-b)`, which is
 exactly wrapping subtraction (the SMT dialect has no subtraction operation).
-`bv.if(a == b, then, else)` is emitted as `smt.ite` over `smt.eq`. A comparison
-is written only there, as the test of a choice; it is not a value of the
-meaning language.
 
 `i1` is a one-bit bitvector. Predicates are SMT Booleans (`!smt.bool`), a
-separate sort produced only by `smt.eq`; a one-bit term cannot be used as a
-predicate, and predicates cannot be compared with `smt.eq`. There are no signed
-or unsigned comparisons, no unbounded integers, and no overflow flags.
+separate sort; a one-bit term cannot be used as a predicate, and a predicate is
+not a term. Each crossing is explicit: `arith.cmpi` gives the one-bit value 1
+where its comparison holds and 0 where it does not, and `arith.select` chooses
+its first value where its `i1` condition `== 1`. There are no unbounded
+integers.
+
+Signedness is never inferred. A term has none; an ordering says which it means
+(`ult` or `slt`), as `arith.cmpi`'s predicate does, and an overflow guard or an
+objective is unsigned unless given `~signed: #true`.
+
+A `func.call` is inlined: the callee's block is lowered where the call stands.
+The callee is held to the same fragment as a selected function. A function that
+would call itself, directly or through another, and a call to a declaration
+with no body are refused, since there is nothing to inline. (MLIR's own
+`inline` pass is not used: an operation registered through IRDL has no inliner
+interface, so the pass leaves a callee that uses one in place.)
 
 A literal for width *w* must lie in [-2^(w-1), 2^w - 1], the range MLIR accepts
 for an `iN` constant. A negative literal denotes its two's complement residue,
 so `-1` and `0xffffffff` are the same 32-bit value. Anything outside the range
 is an error; nothing is truncated.
 
-Everything else fails with a diagnostic, before any solver runs: other
-operations (including standard ones such as `arith.addi`), operations without a
-model, other types (`index`, floats, other widths, custom types), control flow,
-calls, memory operations, regions, multiple results, declarations without a
-body, and unused values outside the fragment. Attributes are rejected rather
-than ignored, because the model cannot observe them: any attribute on a modeled
-operation instance, any attribute on `arith.constant` other than `value`, and
+Everything else fails with a diagnostic that names the operation or function
+and its place, before any solver runs: other operations (including standard
+ones such as `arith.addi`), operations without a model, other types (`index`,
+floats, other widths, custom types), control flow, memory operations, regions,
+and unused values outside the fragment. Attributes are rejected rather than
+ignored, because the model cannot observe them: any attribute on a modeled
+operation instance, any attribute on `arith.constant` other than `value`, on
+`arith.cmpi` other than `predicate`, or on `func.call` other than `callee`, and
 any function attribute other than `sym_name`, `function_type`, and
 `sym_visibility`. Declaring `attributes(...)` together with `smt:` is an
-expansion error for the same reason. Functions other than the selected one are
-not part of the query and are not inspected.
+expansion error for the same reason. A function that is neither selected nor
+called is not part of the question and is not inspected.
 
-### Building the query plugin
+### Terms and formulas
 
-Lowering is done by one native pass that reads a declarative manifest generated
-from the `Dialect` value. It contains no operation names: a new or renamed
-operation, another namespace, or a different model needs no native changes and
-no rebuild. Build it once, with the same installation that supplies `mlir-opt`:
+A `smt.Term` is a bitvector of an exact width. A `smt.Formula` is an SMT
+Boolean. Builders check sorts and widths, so a mistake names both operands.
 
-```sh
-cmake -S pille-mlir-lib/pille/mlir/native -B /tmp/pille-smt-query \
-  -DMLIR_DIR="$PILLE_MLIR_PREFIX/lib/cmake/mlir" -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/pille-smt-query
-export PILLE_MLIR_SMT_PLUGIN=/tmp/pille-smt-query/PilleSmtQuery.so
-```
+| Form | Result |
+| --- | --- |
+| `smt.input(name, ~width: n)` | A function argument. Its position in `~inputs` is its identity; the name is how it is reported |
+| `smt.result(~width: n)` | The value a one-result function returns |
+| `smt.result(index, ~width: n)` | One of the values a function with several returns, from 0 |
+| `smt.const(value, ~width: n)` | A typed literal |
+| `smt.add(a, b)`, `smt.sub(a, b)`, `smt.mul(a, b)` | Wrapping arithmetic on terms of equal width |
+| `smt.ite(formula, then, else)` | A term: `then` where the formula holds, else `else` |
+| `smt.eq(a, b)` | Equality of two terms of equal width |
+| `smt.ult`, `ule`, `ugt`, `uge` `(a, b)` | Unsigned orderings |
+| `smt.slt`, `sle`, `sgt`, `sge` `(a, b)` | Signed (two's complement) orderings |
+| `smt.no_overflow_add(a, b, ~signed: #false)`, `no_overflow_sub`, `no_overflow_mul` | That the operation, on the numbers the terms stand for, does not wrap |
+| `smt.not(p)`, `smt.and(p, ...)`, `smt.or(p, ...)` | Formulas over formulas |
+| `smt.precondition(formula, ~named: name)` | A named precondition, for a `~preconditions` list |
+| `term.width`, `term.describe()`, `formula.describe()` | The width, and the text an outcome shows |
 
-This requires CMake 3.20 or later, a C++17 compiler, and the MLIR/LLVM shared
-development libraries (`libMLIR`, `libLLVM`), as for the example plugin above.
-`smt.build_plugin(directory, ~toolchain: chain)` runs the same two commands
-against the toolchain's own installation and returns the plugin's path. The
-plugin is never built or searched for implicitly. `smt_query` uses, in order,
-its `~plugin:` argument and then `PILLE_MLIR_SMT_PLUGIN`; a selection that does
-not exist is an error.
+`add`, `sub` and `mul` wrap, as the machine's do. An overflow guard says of one
+use that it did not: with `no_overflow_add(a, b)` among a query's
+preconditions, an answer that holds only because `a + b` wrapped is excluded.
+The SMT dialect has no extend operation, so a guard does the operation one bit
+wider (twice as wide for a product), built from `concat`, `extract` and
+`repeat`, and compares it with its own low bits widened again.
+
+Input names become SMT-LIB symbols verbatim, so they must be identifiers
+(`[A-Za-z_][A-Za-z0-9_]*`) that are not reserved by SMT-LIB or its bitvector
+theory. A precondition's name becomes a quoted symbol: any nonempty string
+without bars, backslashes or line breaks, distinct within a query.
 
 ### Queries
 
 `dialect.smt_query(module, ~function: name, ~inputs: [...], ~property: formula,
-~preconditions: [...], ~plugin: path)` returns an immutable `smt.Query`.
+~preconditions: [...])` returns an immutable `smt.Query`. Constructing one
+lowers, verifies and exports; it never runs a solver.
 
 - The module must have been verified against this dialect's generated IRDL, as
   `dialect.module(...)` does. A module holds only MLIR and IRDL text, so the
@@ -366,72 +403,232 @@ not exist is an error.
   names: two dialect values with the same namespace and operation names are
   independent.
 - The function is selected by symbol name. `~inputs` lists one `smt.input` per
-  argument, in argument order; position is the identity, and the name is only
-  how counterexamples are reported. Printed SSA names are never consulted.
-  `smt.result` denotes the returned value. Widths are checked against the
-  function's actual types.
-- Input names become SMT-LIB symbols verbatim, so they must be identifiers
-  (`[A-Za-z_][A-Za-z0-9_]*`) that are not reserved by SMT-LIB or its bitvector
-  theory.
-- The query asserts each precondition and the negation of the property, then
-  checks satisfiability. No other assumption is added.
+  argument, in argument order. Printed SSA names are never consulted. Widths
+  are checked against the function's actual types.
+- The query asserts each precondition and the negation of the property (with
+  every modeled operation's requirements), then checks satisfiability. No other
+  assumption is added.
 
 | Form | Result |
 | --- | --- |
-| `smt.input(name, ~width: n)`, `smt.result(~width: n)`, `smt.const(value, ~width: n)` | A bitvector `smt.Term` |
-| `smt.add(a, b)`, `smt.sub(a, b)`, `smt.mul(a, b)` | Wrapping arithmetic on terms of equal width |
-| `smt.eq(a, b)` | An `smt.Formula`: equality of two terms of equal width |
-| `smt.not(p)`, `smt.and(p, ...)`, `smt.or(p, ...)` | Formulas over formulas |
 | `query.module` | The verified SMT dialect `mlir.Module`; it contains no custom operations |
-| `query.to_smtlib()` | The SMT-LIB text, from the existing exporter; no solver runs |
+| `query.to_smtlib()` | The SMT-LIB text; no solver runs |
+| `query.feasibility_smtlib()` | The question asked first where a precondition is named, else `#false` |
 | `query.function`, `.dialect`, `.inputs`, `.property`, `.assumptions` | What the query asks, as data and text |
-| `query.check(~solver: path = #false, ~timeout: seconds = 10, ~arguments: [])` | An `smt.Outcome` from running the solver |
-| `smt.build_plugin(directory, ~toolchain: chain)` | Path of a freshly built plugin |
+| `query.check(~solver: path = #false, ~timeout: seconds = 10, ~arguments: [])` | An `smt.Outcome` from running a standalone solver |
 
-The SMT module is produced by the pass and then verified again by stock
+The SMT module is produced by the lowering and then verified by stock
 `mlir-opt` with no IRDL definitions and no plugins, which is exactly what
 `mlir-translate` accepts. A residual custom operation would fail there.
 
+**Named preconditions.** A proof with preconditions is an implication. If the
+preconditions are inconsistent, no input satisfies them, the solver answers
+`unsat`, and the implication holds vacuously whatever the property says. Naming
+preconditions is how to be told instead: where any precondition of a query is
+named, `check` first asks whether the preconditions can hold together, and
+where they cannot the outcome is `smt.Infeasible`, whose `.core` names a set of
+them that conflict.
+
+```rhombus
+def outcome:
+  arithmetic.smt_query(program, ~function: "round_trip", ~inputs: [x, y],
+                       ~property: smt.eq(result, x),
+                       ~preconditions: [
+                         smt.precondition(smt.ult(x, smt.const(10, ~width: 32)), ~named: "page.md:22"),
+                         smt.precondition(smt.ugt(x, smt.const(20, ~width: 32)), ~named: "page.md:31"),
+                       ]).check()
+// smt.Infeasible, with outcome.core holding "page.md:22" and "page.md:31"
+```
+
+The solver is given `produce-unsat-cores` and `smt.core.minimize`, so a core
+holds no name that could be left out; it is minimal as Z3 minimizes it, and a
+different or smaller conflicting set may exist. Preconditions without a name
+are asserted but never named, so a core may be empty where they alone conflict.
+A query none of whose preconditions is named is unchanged: it has no
+feasibility question, and inconsistent preconditions make it `Proved`. `Proved`
+carries its assumptions either way: `.is_unconditional` is true only when there
+were none.
+
+### Objectives
+
+`dialect.smt_objective(module, ~function: name, ~inputs: [...], ~minimize: term,
+~preconditions: [...])`, or `~maximize: term`, returns an `smt.ObjectiveQuery`:
+the least or greatest value of one term over the inputs that satisfy the
+preconditions and keep every operation within its model's requirements. The
+term is read as an unsigned number, or with `~signed: #true` as a two's
+complement one. Its `check` gives `smt.Optimum`, whose `.value` is that number
+and whose `.values` are inputs that reach it, or `smt.Infeasible` where no input
+satisfies the preconditions.
+
+```rhombus
+// the greatest x for which x + y does not wrap, with y at least 5
+arithmetic.smt_objective(program, ~function: "round_trip", ~inputs: [x, y], ~maximize: x,
+                         ~preconditions: [smt.no_overflow_add(x, y),
+                                          smt.uge(y, smt.const(5, ~width: 32))]).check()
+```
+
+MLIR's SMT dialect has no objective. The term is bound to a fresh symbol in the
+verified SMT module, and Z3's `(minimize s)` or `(maximize s)` is written into
+the exported SMT-LIB before its `(check-sat)`; `to_smtlib()` is that text. Z3
+orders bitvectors as unsigned numbers, so a signed objective's symbol is the
+term with its sign bit flipped, which keeps the signed order, and `.value` is
+flipped back. A bitvector objective always has a bound, so there is no outcome
+for an unbounded one. Without an overflow guard an optimum may be a value that
+only wrapping arithmetic reaches; that is what the function computes, and a
+guard among the preconditions excludes it.
+
+`objective.function`, `.dialect`, `.inputs`, `.assumptions`, `.direction`,
+`.is_signed`, `.describe()`, `.to_smtlib()` and `.feasibility_smtlib()` say what
+is asked.
+
+### Batches and sessions
+
+Starting a solver is most of what a small question costs. Two forms avoid it.
+
+`dialect.smt_batch(module, [smt.Spec(~function:, ~inputs:, ~property:,
+~preconditions:), ...])` lowers and exports every question once and returns an
+`smt.Batch`; `batch.check(~solver:, ~timeout:, ~arguments:, ~overall_timeout:)`
+answers them with one solver process and gives one outcome a spec, in order.
+`batch.queries` are the questions as `smt.Query` values. A diagnostic says
+which spec it is about, by its index from 0.
+
+`smt.Session(~solver:, ~arguments:)` keeps one solver process for as long as it
+is wanted. `session.check(value, ~timeout:, ~overall_timeout:)` takes a
+`Query`, a `Batch` or an `ObjectiveQuery` and gives what its own `check` gives.
+The process starts with the first question, is restarted after a timeout, and
+ends with `session.close()` or its custodian. A session serializes concurrent
+callers.
+
+### Scopes
+
+A scope keeps assumptions in a session's solver from one question to the next,
+for many claims about one function: checking a bounded number of steps, then one
+more.
+
+```rhombus
+def session = smt.Session()
+def scope = arithmetic.smt_scope(session, program, ~function: "round_trip", ~inputs: [x, y])
+scope.assert(smt.ult(x, smt.const(10, ~width: 32)))   // for every question from here
+scope.check(smt.ult(result, smt.const(10, ~width: 32)))   // smt.Proved
+scope.push()
+scope.assert(smt.eq(y, smt.const(0, ~width: 32)))     // for this frame only
+scope.check(smt.eq(result, x))
+scope.pop()
+scope.close()
+session.close()
+```
+
+| Form | Meaning |
+| --- | --- |
+| `dialect.smt_scope(session, module, ~function: name, ~inputs: [...])` | Opens a scope: the function's inputs are declared once in the session's solver |
+| `scope.assert(formula)` | An assumption, for every question until its frame is popped |
+| `scope.push()`, `scope.pop()` | A new frame of assumptions, and its end |
+| `scope.check(property, ~timeout: seconds = 10)` | `Proved` where the property holds for every input satisfying what is assumed, `Counterexample` with inputs for which it does not |
+| `scope.assumptions`, `.inputs`, `.function`, `.dialect`, `.is_open` | What the scope holds |
+| `scope.close()` | Ends it; the session takes other questions again |
+
+Each question is asked in a frame of its own that is popped again, so it leaves
+the scope as it found it. Each lowers its formula over the function anew; what
+is saved is the solver's process and what it has learned of the assertions it
+holds. To deepen a bounded check, select a function that returns what each step
+gives (a step function called once for each step), assert what holds
+throughout, and check one claim for each depth.
+
+While a scope is open the session's `check` and `values` are refused: they
+would be answered under the scope's assumptions, or would reset the solver. A
+timeout or a solver failure ends the solver process and the scope with it. An
+outcome's `.smtlib` is the question as one script, what the solver held and the
+goal, and gives the same answer run by itself. Assumptions that cannot hold
+together make every claim `Proved`, as a query's do; a scope's assertions are
+not named.
+
+### Possible values
+
+`dialect.smt_values_query(module, ~function: name, ~inputs: [...],
+~preconditions: [...])` returns an `smt.ValuesQuery` over a one-result function,
+and `session.values(query, ~limit: n, ~timeout: seconds = 10)` enumerates the
+values its result can take: an `smt.Values` whose `.values` are unsigned
+residues in order and whose `.complete` says whether the limit was reached
+first. An empty complete set means the preconditions are inconsistent
+(`.is_inconsistent`), never a proof. Where some admitted input uses an operation
+outside what its model requires, the answer is a `Failure` of kind
+`#'requirements_not_satisfied`, so enumeration cannot hide a partial function.
+`dialect.smt_values_batch(module, [smt.ValuesSpec(...), ...])` builds several at
+once.
+
 ### Running a solver
 
-`query.check()` is the only operation that starts a solver. The solver is the
-`~solver:` argument if given, else `PILLE_Z3`, else `z3` on `PATH`; an explicit
-or environment selection that does not exist is a failure, not a fallback. It
-is run directly, without a shell, as `solver [arguments...] query.smt2` in a
-private temporary directory that is removed afterwards. `~timeout:` is a
-required finite bound in seconds, 10 by default. When it elapses the solver's
-process group is terminated, as it is if the calling thread is interrupted.
+Nothing but a `check` or `values` starts a solver. The solver is the `~solver:`
+argument if given, else `PILLE_Z3`, else `z3` on `PATH`; an explicit or
+environment selection that does not exist is a failure, not a fallback. A
+standalone check runs it directly, without a shell, as
+`solver [arguments...] query.smt2` in a private temporary directory that is
+removed afterwards. `~timeout:` is a finite bound in seconds, 10 by default.
+When it elapses the solver's process group is terminated, as it is if the
+calling thread is interrupted.
 
-The exported text is run unchanged. If the answer is `sat`, the solver is run
-once more on the same commands through `(check-sat)` followed by the standard
-`(get-value (...))` for the inputs, because the exported script ends with
-`(reset)` and `get-value` is only legal after `sat`. Both runs share the bound.
+A query's exported text is run unchanged. If the answer is `sat`, the solver is
+run once more on the same commands through `(check-sat)` followed by the
+standard `(get-value (...))` for the inputs, because the exported script ends
+with `(reset)` and `get-value` is only legal after `sat`. Both runs share the
+bound.
 
 | Outcome | Solver result | Meaning |
 | --- | --- | --- |
 | `smt.Proved` | `unsat` | No input satisfies the preconditions and violates the property, under the declared model |
-| `smt.Counterexample` | `sat` with a complete model | A violating input exists; `.values` holds an `Assignment(name, width, value)` per argument |
+| `smt.Counterexample` | `sat` with a complete model | A violating input exists; `.values` holds an `Assignment(name, width, value)` per argument, in argument order |
+| `smt.Infeasible` | `unsat` for the preconditions alone | The named preconditions cannot hold together; `.core` names a conflicting set. For an objective: no input satisfies the preconditions |
+| `smt.Optimum` | `sat` with the objective's value | `.value` is the least or greatest value asked for; `.values` are inputs that reach it |
 | `smt.Unknown` | `unknown` | The solver could not decide |
 | `smt.Timeout` | none in time | The bound elapsed and the solver was terminated |
-| `smt.Failure` | none usable | `.kind` is `#'missing_executable`, `#'nonzero_exit`, `#'malformed_response`, or `#'bad_model` |
+| `smt.Failure` | none usable | `.kind` is `#'missing_executable`, `#'nonzero_exit`, `#'malformed_response`, `#'bad_model`, `#'closed_session`, or `#'requirements_not_satisfied` |
 
-Only `unsat` produces `Proved`, and `outcome.is_proved` is true for nothing
-else. A `sat` answer without a complete, well-formed model of the right widths
-is a `Failure`, never a counterexample and never a success. Every outcome keeps
-`.smtlib` (the exact query text), `.command`, `.diagnostics`, `.assumptions`,
-and a `.describe()` summary, which is enough to reproduce a failure by hand.
+Only `unsat` for the whole question produces `Proved`, and `outcome.is_proved`
+is true for nothing else. A `sat` answer without a complete, well-formed model
+of the right widths is a `Failure`, never a counterexample and never a success.
+A counterexample reports inputs only; a function's results are whatever those
+inputs give.
 
-A proof with preconditions is an implication. If the preconditions are
-inconsistent, no input satisfies them, the solver answers `unsat`, and the
-implication holds vacuously whatever the property says. `Proved` therefore
-carries its assumptions: `.is_unconditional` is true only when there were none,
-and `.describe()` reads "proved only under N assumption(s) [...]" otherwise. To
-detect vacuity, check that the preconditions alone are satisfiable, for example
-by querying the property `smt.not(smt.eq(result, result))` under them and
-expecting a counterexample.
+Every outcome keeps `.smtlib`, `.command`, `.diagnostics`, `.assumptions`, and a
+`.describe()` summary. `.smtlib` is the text that reproduces the answer when it
+is run through `z3` by hand: the query for most outcomes, the feasibility
+question (the preconditions, `(check-sat)` and `(get-unsat-core)`) for
+`Infeasible`, and the script with its objective for `Optimum`.
 
 Diagnostics from lowering name the operation or function at fault. Their
 `<stdin>` line numbers refer to the module text that was originally parsed.
+
+### API summary
+
+On a `Dialect` value:
+
+| Form | Result |
+| --- | --- |
+| `dialect.smt_query(module, ~function:, ~inputs:, ~property:, ~preconditions:)` | `smt.Query` |
+| `dialect.smt_objective(module, ~function:, ~inputs:, ~minimize:` or `~maximize:, ~signed:, ~preconditions:)` | `smt.ObjectiveQuery` |
+| `dialect.smt_batch(module, [smt.Spec(...), ...])` | `smt.Batch` |
+| `dialect.smt_scope(session, module, ~function:, ~inputs:)` | `smt.Scope` |
+| `dialect.smt_values_query(module, ~function:, ~inputs:, ~preconditions:)` | `smt.ValuesQuery` |
+| `dialect.smt_values_batch(module, [smt.ValuesSpec(...), ...])` | `smt.ValuesBatch` |
+
+In `pille/mlir/smt`:
+
+| Binding | What it is |
+| --- | --- |
+| `Term`, `Formula`, `Precondition` | A bitvector, an SMT Boolean, a named precondition |
+| `input`, `result`, `const` | Terms for an argument, a returned value, a literal |
+| `add`, `sub`, `mul`, `ite` | Terms from terms |
+| `eq`, `ult`, `ule`, `ugt`, `uge`, `slt`, `sle`, `sgt`, `sge` | Comparisons |
+| `no_overflow_add`, `no_overflow_sub`, `no_overflow_mul` | Overflow guards |
+| `not`, `and`, `or` | Formulas from formulas |
+| `precondition(formula, ~named:)` | Names a precondition |
+| `Query`, `ObjectiveQuery`, `ValuesQuery` | One question; `to_smtlib()`, and `check(...)` on the first two |
+| `Spec`, `Batch`, `ValuesSpec`, `ValuesBatch` | Several questions lowered together |
+| `Session` | One solver process: `check`, `values`, `close` |
+| `Scope` | Kept assumptions in a session: `assert`, `push`, `pop`, `check`, `close` |
+| `Outcome` | What every answer is: `Proved`, `Counterexample`, `Infeasible`, `Optimum`, `Unknown`, `Timeout`, `Failure` |
+| `Assignment(name, width, value)` | One input of a counterexample or an optimum |
+| `Values(values, complete)` | A result's possible values |
 
 ## Checks and examples
 
@@ -447,9 +644,7 @@ racket pille-mlir-lib/pille/mlir/examples/add.rhm
 racket pille-mlir-lib/pille/mlir/examples/irdl.rhm
 racket pille-mlir-lib/pille/mlir/examples/declarations.rhm
 racket pille-mlir-lib/pille/mlir/examples/smt.rhm | z3 -in
-# After building the query plugin as described above:
-PILLE_MLIR_SMT_PLUGIN=/tmp/pille-smt-query/PilleSmtQuery.so \
-  racket pille-mlir-lib/pille/mlir/examples/verify.rhm
+racket pille-mlir-lib/pille/mlir/examples/verify.rhm   # needs Z3
 # Requires the existing Pille LLVM dependencies and PILLE_LLVM_PREFIX too:
 raco test pille/pille/tests/mlir.rhm
 ```
@@ -463,28 +658,36 @@ skip. What each file needs:
 
 | Tests | Requirements |
 | --- | --- |
-| `schema.rkt`, `semantics.rkt`, `smt-declarations.rkt`, `solver.rkt`, `toolchain.rkt` | None. They also assert that descriptors, expansion, and IRDL generation work with MLIR and Z3 absent |
-| `api.rhm`, `declarations.rkt`, `integration.rkt` | MLIR |
-| `smt-integration.rkt`, `smt-api.rhm` | MLIR, Z3, and the query plugin |
+| `schema.rkt`, `schema-api.rhm`, `semantics.rkt`, `smt-declarations.rkt`, `solver.rkt`, `sessions.rkt`, `toolchain.rkt` | None. They also assert that descriptors, expansion, and IRDL generation work with MLIR and Z3 absent |
+| `api.rhm`, `declarations.rkt`, `integration.rkt`, `smt-lowering.rkt` | MLIR |
+| `smt-integration.rkt`, `smt-synthesis.rkt`, `smt-bounded.rkt`, `smt-api.rhm`, `smt-batch.rhm` | MLIR and Z3 |
 
-The SMT tests use `PILLE_MLIR_SMT_PLUGIN` if it is set. Otherwise they build the
-plugin from this package's sources against the toolchain under test, into a
-temporary directory removed at exit, which needs CMake and a C++ compiler and
-takes a few seconds. They find Z3 through `PILLE_Z3` or `PATH`, and
-`smt-integration.rkt` stops with "these tests require Z3" when there is none.
-To run only the solver-backed tests:
+The tests find the tools as the library does. They find Z3 through `PILLE_Z3`
+or `PATH`, and the `.rkt` files that need it stop with "these tests require Z3"
+when there is none. To run only the solver-backed tests:
 
 ```sh
 raco test pille-mlir-lib/pille/mlir/tests/smt-integration.rkt \
-  pille-mlir-lib/pille/mlir/tests/smt-api.rhm
+  pille-mlir-lib/pille/mlir/tests/smt-synthesis.rkt \
+  pille-mlir-lib/pille/mlir/tests/smt-bounded.rkt \
+  pille-mlir-lib/pille/mlir/tests/smt-api.rhm \
+  pille-mlir-lib/pille/mlir/tests/smt-batch.rhm
 ```
 
-`solver.rkt` covers the solver protocol with deterministic fake executables:
-every outcome, malformed and incomplete models, termination on timeout and
-interruption, cleanup, and paths containing spaces. `smt-integration.rkt`
-repeats the semantic outcomes with real Z3, including a real `unknown` (under a
-resource limit) and a real timeout, and compares lowered expressions with an
-independent evaluator.
+`solver.rkt` and `sessions.rkt` cover the solver protocol with deterministic
+fake executables: every outcome, malformed and incomplete models, termination
+on timeout and interruption, cleanup, and paths containing spaces.
+`smt-integration.rkt` repeats the semantic outcomes with real Z3, including a
+real `unknown` (under a resource limit) and a real timeout, and compares lowered
+expressions with an independent evaluator. `smt-lowering.rkt` holds the lowering
+to a frozen record of 774 requests, with each difference from it written down
+and explained. `smt-synthesis.rkt` checks comparisons, selection, overflow
+guards, named preconditions and objectives against answers worked out by hand.
+`smt-bounded.rkt` checks calls, scopes and a timed machine: a function that
+steps a small state machine through twelve symbolic messages is proved to keep
+its property, an altered one gives a counterexample that an evaluator replays,
+and deepening a check one step at a time in a scope agrees with asking each
+depth afresh.
 
 Upstream references: [IRDL](https://mlir.llvm.org/docs/Dialects/IRDL/),
 [mlir-opt](https://mlir.llvm.org/docs/Tutorials/MlirOpt/),

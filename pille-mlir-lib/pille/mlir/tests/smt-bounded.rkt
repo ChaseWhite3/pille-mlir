@@ -1,7 +1,10 @@
 #lang racket/base
 
 (require rackunit
+         racket/file
          racket/list
+         racket/port
+         racket/system
          racket/runtime-path
          racket/string
          racket/treelist
@@ -92,3 +95,207 @@
   ;; and the refusal says where: the place of the call or of the operation
   (check-regexp-match #rx"<stdin>:[0-9]+:[0-9]+"
                       (with-handlers ([exn:fail? exn-message]) (query calls "outside" (list a32) trivial))))
+
+;;==============================================================================
+;; B2. A scope on a session, and objectives asked of one
+
+;; What `z3` prints for a script, run by hand.
+(define (by-hand script)
+  (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
+  (dynamic-wind
+    void
+    (lambda ()
+      (display-to-file script file #:exists 'truncate)
+      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (system* z3 (path->string file))))
+                                    "\n")))
+    (lambda () (delete-file file))))
+
+(define (scope-status scope property) (solver_result_status (scope_check scope property)))
+(define (lt term value) (smt_cmp 'ult term (smt_const value 32)))
+
+(test-case "a scope keeps its assumptions from one question to the next, and each question leaves it as it was"
+  (define s (make_session z3))
+  (define scope (make_smt_scope s arithmetic calls "thrice" (list a32)))
+  (check-true (scope_is_open scope))
+  ;; nothing assumed: a + 3 < 13 does not hold for every a
+  (check-eq? (scope-status scope (lt r32 13)) 'sat)
+  (scope_assert scope (lt a32 10))
+  (check-eq? (scope-status scope (lt r32 13)) 'unsat)
+  (check-eq? (scope-status scope (lt r32 12)) 'sat)
+  ;; a question's own assertion is gone when it has been answered
+  (check-eq? (scope-status scope (lt r32 13)) 'unsat)
+  ;; a frame of further assumptions, and its end
+  (scope_push scope)
+  (scope_assert scope (is a32 5))
+  (check-equal? (treelist->list (scope_assumptions scope)) '("a <u 0x0000000a:bv32" "a == 0x00000005:bv32"))
+  (check-eq? (scope-status scope (is r32 8)) 'unsat)
+  (define refuted (scope_check scope (is r32 9)))
+  (check-eq? (solver_result_status refuted) 'sat)
+  (check-equal? (solver_result_values refuted) '(("a" 32 5)))
+  (scope_pop scope)
+  (check-equal? (treelist->list (scope_assumptions scope)) '("a <u 0x0000000a:bv32"))
+  (check-eq? (scope-status scope (is r32 8)) 'sat)
+  ;; assumptions that cannot hold together prove anything, as a query's do
+  (scope_push scope)
+  (scope_assert scope (smt_cmp 'ugt a32 (smt_const 20 32)))
+  (check-eq? (scope-status scope (is r32 0)) 'unsat)
+  ;; the question as one script gives the same answer run by hand
+  (check-equal? (by-hand (scope_goal_script scope (is r32 0))) "unsat")
+  (scope_pop scope)
+  (check-equal? (by-hand (scope_goal_script scope (lt r32 13))) "unsat")
+  (check-equal? (by-hand (scope_goal_script scope (lt r32 12))) "sat")
+  ;; only what was pushed can be popped
+  (rejects #rx"nothing was pushed on this scope" (lambda () (scope_pop scope)))
+  ;; while it is open the session takes nothing else, nor a second scope
+  (define plain (query calls "thrice" (list a32) (lt r32 13)))
+  (rejects #rx"a scope is open on this session" (lambda () (query_session_check s plain)))
+  (rejects #rx"a scope is open on this session" (lambda () (make_smt_scope s arithmetic calls "thrice" (list a32))))
+  (scope_close scope)
+  (check-false (scope_is_open scope))
+  (rejects #rx"the scope is closed" (lambda () (scope_check scope (lt r32 13))))
+  ;; and then it does: nothing of the scope is left in the solver
+  (check-eq? (solver_result_status (query_session_check s plain)) 'sat)
+  (define again (make_smt_scope s arithmetic calls "thrice" (list a32)))
+  (check-eq? (scope-status again (lt r32 13)) 'sat)
+  (scope_close again)
+  (close_session s))
+
+(test-case "an objective asked of a session is the standalone one's answer"
+  (define s (make_session z3))
+  (define (both value)
+    (define alone (objective_check value z3))
+    (define within (objective_session_check s value))
+    (check-eq? (solver_result_status within) (solver_result_status alone))
+    (and (eq? (solver_result_status within) 'optimum)
+         (check-equal? (objective_value value (caddr (car (solver_result_values within))))
+                       (objective_value value (caddr (car (solver_result_values alone)))))
+         (objective_value value (caddr (car (solver_result_values within))))))
+  (define three (smt_const 3 32))
+  (check-equal? (both (make_smt_objective arithmetic calls "thrice" (list a32) a32 'maximize #f
+                                          (list (smt_no_overflow 'add a32 three #f))))
+                (- (expt 2 32) 4))
+  ;; the least signed a + 3 with a >= -7: the least number there is, where the sum may wrap,
+  ;; and -4 where it may not
+  (check-equal? (both (make_smt_objective arithmetic calls "thrice" (list a32) r32 'minimize #t
+                                          (list (smt_cmp 'sge a32 (smt_const -7 32)))))
+                (- (expt 2 31)))
+  (check-equal? (both (make_smt_objective arithmetic calls "thrice" (list a32) r32 'minimize #t
+                                          (list (smt_cmp 'sge a32 (smt_const -7 32))
+                                                (smt_no_overflow 'add a32 three #t))))
+                -4)
+  ;; named preconditions that cannot hold together: the core, from the session too
+  (define conflict
+    (make_smt_objective arithmetic calls "thrice" (list a32) a32 'minimize #f
+                        (list (smt_named (lt a32 3) "low") (smt_named (smt_cmp 'ugt a32 (smt_const 9 32)) "high"))))
+  (define refused (objective_session_check s conflict))
+  (check-eq? (solver_result_status refused) 'infeasible)
+  (check-equal? (sort (treelist->list (solver_result_core refused)) string<?) '("high" "low"))
+  ;; and the session's solver is as it was for the next question
+  (define next (query_session_check s (query calls "thrice" (list a32) (lt r32 13))))
+  (check-eq? (solver_result_status next) 'sat)
+  (close_session s))
+
+;;==============================================================================
+;; B3. A counterexample of many inputs
+
+(test-case "200 inputs, of 8 and of 32 bits, are reported in argument order with the values asked"
+  ;; (the fragment's widths are 1, 8, 16, 32 and 64: 8 stands for a small field)
+  (define count 200)
+  (define widths (for/list ([index (in-range count)]) (if (even? index) 8 32)))
+  (define inputs (for/list ([index (in-range count)] [width (in-list widths)]) (smt_input (format "x~a" index) width)))
+  (define wanted
+    (for/list ([index (in-range count)] [width (in-list widths)]) (modulo (+ 7 (* index index 2654435761)) (expt 2 width))))
+  (define wide
+    (program (format "  func.func @wide(~a) -> i8 {\n    return %a0 : i8\n  }\n"
+                     (string-join (for/list ([index (in-range count)] [width (in-list widths)]) (format "%a~a: i~a" index width)) ", "))))
+  ;; "some input is not the value asked": refuted only by exactly those values
+  (define property
+    (smt_not (smt_and (for/list ([input (in-list inputs)] [value (in-list wanted)] [width (in-list widths)])
+                        (smt_eq input (smt_const value width))))))
+  (define expected (for/list ([index (in-range count)] [width (in-list widths)] [value (in-list wanted)])
+                     (list (format "x~a" index) width value)))
+  (define value (query wide "wide" inputs property))
+  (define alone (query_check value z3 10))
+  (check-eq? (solver_result_status alone) 'sat)
+  (check-equal? (solver_result_values alone) expected)
+  (check-true (< (solver_result_seconds alone) 10))
+  (define s (make_session z3))
+  (check-equal? (solver_result_values (query_session_check s value 10)) expected)
+  (define scope (make_smt_scope s arithmetic wide "wide" inputs))
+  (check-equal? (solver_result_values (scope_check scope property 10)) expected)
+  (scope_close scope)
+  (close_session s))
+
+;;==============================================================================
+;; Acceptance for Slice B: the fixture's step, written once and called for each
+;; of twelve messages (machine-fixture.rkt)
+
+(define depth 12)
+(define sound (program (stepped-machine-text depth)))
+(define faulty (program (stepped-machine-text depth #:altered? #t)))
+
+(define-values (I E R) (values (smt_input "I" 32) (smt_input "E" 32) (smt_input "R" 32)))
+(define kinds (for/list ([k (in-range depth)]) (smt_input (format "m~a" k) 32)))
+(define amounts (for/list ([k (in-range depth)]) (smt_input (format "d~a" k) 32)))
+(define run-inputs (append (list I E R) (append* (map list kinds amounts))))
+;; the phase after each of the first `count` messages is not auto-disconnect
+(define (never count)
+  (smt_and (for/list ([k (in-range count)]) (smt_not (is (smt_result_at k 32) auto-disconnect)))))
+
+(test-case "the called step is the machine written on numbers, sound and faulty, on random message sequences"
+  (define generator (make-pseudo-random-generator))
+  (parameterize ([current-pseudo-random-generator generator])
+    (random-seed 20261121)
+    (for ([module (list sound faulty)] [altered? '(#f #t)])
+      (define specs
+        (for/list ([_ (in-range 40)])
+          (define durations (list (random 1 20) (random 1 40) (random 1 30)))
+          (define said-kinds (for/list ([_ (in-range depth)]) (list-ref (list on off disconnect respond time time time nothing) (random 8))))
+          (define said-amounts (for/list ([_ (in-range depth)]) (random 0 60)))
+          (define phases
+            (for/list ([count (in-range 1 (add1 depth))])
+              (first (machine-run durations (take said-kinds count) (take said-amounts count) #:altered? altered?))))
+          (make_spec "run" run-inputs
+                     (smt_and (for/list ([phase (in-list phases)] [k (in-naturals)]) (is (smt_result_at k 32) phase)))
+                     (append (list (is I (first durations)) (is E (second durations)) (is R (third durations)))
+                             (append* (for/list ([kind (in-list kinds)] [amount (in-list amounts)]
+                                                 [said-kind (in-list said-kinds)] [said-amount (in-list said-amounts)])
+                                        (list (is kind said-kind) (is amount said-amount))))))))
+      (define answers (treelist->list (batch_check (make_smt_batch arithmetic module specs) z3 20 '() 600)))
+      (check-equal? (remove-duplicates (map solver_result_status answers)) '(unsat)))))
+
+(test-case "acceptance: twelve symbolic messages never reach auto-disconnect, and the faulty step does"
+  (check-eq? (status (query sound "run" run-inputs (never depth))) 'unsat)
+  (define broken (query_check (query faulty "run" run-inputs (never depth)) z3 60))
+  (check-eq? (solver_result_status broken) 'sat)
+  ;; the counterexample's messages hold a disconnect after an on
+  (define found (for/hash ([entry (in-list (solver_result_values broken))]) (values (car entry) (caddr entry))))
+  (define said-kinds (for/list ([k (in-range depth)]) (hash-ref found (format "m~a" k))))
+  (define said-amounts (for/list ([k (in-range depth)]) (hash-ref found (format "d~a" k))))
+  (check-true (for*/or ([i (in-range depth)] [j (in-range (add1 i) depth)])
+                (and (= (list-ref said-kinds i) on) (= (list-ref said-kinds j) disconnect))))
+  ;; replayed on numbers, it reaches auto-disconnect in the faulty machine and not in the sound one
+  (define durations (list (hash-ref found "I") (hash-ref found "E") (hash-ref found "R")))
+  (define (phases altered?)
+    (for/list ([count (in-range 1 (add1 depth))])
+      (first (machine-run durations (take said-kinds count) (take said-amounts count) #:altered? altered?))))
+  (check-true (and (memv auto-disconnect (phases #t)) #t))
+  (check-false (memv auto-disconnect (phases #f))))
+
+(test-case "acceptance: deepening from 1 to 12 in one session gives what fresh queries give"
+  (for ([module (list sound faulty)]
+        ;; one message cannot be an on and then a disconnect
+        [expected (list (make-list depth 'unsat) (cons 'unsat (make-list (sub1 depth) 'sat)))])
+    (define fresh (for/list ([count (in-range 1 (add1 depth))]) (status (query module "run" run-inputs (never count)))))
+    (check-equal? fresh expected)
+    (define s (make_session z3))
+    (define scope (make_smt_scope s arithmetic module "run" run-inputs))
+    (define deepened
+      (for/list ([count (in-range 1 (add1 depth))]) (solver_result_status (scope_check scope (never count) 60))))
+    (check-equal? deepened fresh)
+    ;; under an assumption kept in the scope: with no disconnect said, the faulty machine is sound too
+    (scope_assert scope (smt_and (for/list ([kind (in-list kinds)]) (smt_not (is kind disconnect)))))
+    (check-equal? (for/list ([count (in-range 1 (add1 depth))]) (solver_result_status (scope_check scope (never count) 60)))
+                  (make-list depth 'unsat))
+    (scope_close scope)
+    (close_session s)))

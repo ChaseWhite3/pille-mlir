@@ -244,3 +244,43 @@ check:
 check:
   arithmetic.smt_objective(program, ~function: "successor", ~inputs: [x], ~minimize: x, ~maximize: x)
   ~throws "give exactly one of ~minimize and ~maximize"
+
+//==============================================================================
+// A scope on a session, and an objective asked of one (Slice B).
+
+block:
+  let session = smt.Session()
+  let scope = arithmetic.smt_scope(session, program, ~function: "successor", ~inputs: [x])
+  check scope.is_open ~is #true
+  check scope.function ~is "successor"
+  check scope.inputs ~is [["x", 32]]
+  scope.assert(smt.ult(x, smt.const(10, ~width: 32)))
+  check scope.assumptions ~is ["x <u 0x0000000a:bv32"]
+  // x < 10, so x + 1 < 11, and not always < 10
+  check scope.check(smt.ult(result, smt.const(11, ~width: 32))) ~is_a smt.Proved
+  match scope.check(smt.ult(result, smt.const(10, ~width: 32)))
+  | refuted :: smt.Counterexample:
+      check (for List (a in refuted.values): [a.name, a.value]) ~is [["x", 9]]
+      check refuted.assumptions ~is ["x <u 0x0000000a:bv32"]
+      check refuted.smtlib.contains("(check-sat)") ~is #true
+  | other:
+      check other ~is_a smt.Counterexample
+  // a frame of further assumptions
+  scope.push()
+  scope.assert(smt.eq(x, smt.const(3, ~width: 32)))
+  check scope.check(smt.eq(result, smt.const(4, ~width: 32))) ~is_a smt.Proved
+  scope.pop()
+  check scope.check(smt.eq(result, smt.const(4, ~width: 32))) ~is_a smt.Counterexample
+  check scope.pop() ~throws "nothing was pushed on this scope"
+  // the session takes nothing else while the scope is open
+  check session.check(guarded) ~throws "a scope is open on this session"
+  scope.close()
+  check scope.is_open ~is #false
+  check scope.check(smt.eq(result, result)) ~throws "the scope is closed"
+  // and then it does, an objective among them
+  check session.check(guarded) ~is_a smt.Proved
+  match session.check(greatest)
+  | optimum :: smt.Optimum: check optimum.value ~is 2 ** 32 - 2
+  | other: check other ~is_a smt.Optimum
+  check session.check(least_signed) ~is_a smt.Optimum
+  session.close()

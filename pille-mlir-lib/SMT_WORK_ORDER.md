@@ -115,9 +115,24 @@ the policy above is unchanged, and so is everything a query could say before):
   `~signed`, with the outcome `Optimum(value, values)`. MLIR's SMT dialect has
   no objective; Z3's `minimize`/`maximize` is written into the exported
   SMT-LIB. A bitvector objective always has a bound, so there is no
-  `Unbounded`. Objectives run a standalone solver, not a `Session`.
+  `Unbounded`.
 
-Still unsupported: control flow, calls, regions, memory, floating point,
+Slice B of the same order added, also on 2026-11-20:
+
+- `func.call` to a function of the same module, inlined in the lowering: the
+  callee's block is lowered with its arguments bound to the call's operands.
+  The callee is held to the fragment a selected function is. Recursion, a
+  call to a declaration without a body, and an attribute other than `callee`
+  are refused, naming the call and its place. MLIR's `inline` pass is not
+  used; it leaves a callee that uses an IRDL-registered operation in place.
+- `Dialect.smt_scope(session, module, ~function:, ~inputs:)` and `Scope`:
+  `assert`, `push`, `pop`, `check(property)`, `close`. The inputs are declared
+  once and assumptions stay in the session's solver between questions. A
+  `Query` or `Batch` on a session is isolated as before, and is refused while
+  a scope is open.
+- `Session.check` takes an `ObjectiveQuery`.
+
+Still unsupported: control flow, recursion, regions, memory, floating point,
 `index`, quantifiers and attribute-dependent semantics.
 
 ## Declaration and descriptor changes

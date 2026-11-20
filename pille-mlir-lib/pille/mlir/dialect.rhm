@@ -140,6 +140,15 @@ export veneer Dialect(this :: satisfying(schema.is_dialect)):
     query.make_smt_objective(this, module, to_string(function), inputs, least || greatest,
                              if least | #'minimize | #'maximize, signed, preconditions)
 
+  // Opens a scope on a session: `function`'s inputs declared once in its
+  // solver, for assumptions that are kept and questions asked one after
+  // another (smt.Scope).
+  method smt_scope(session :: smt.Session,
+                   module :: mlir.Module,
+                   ~function: function :: ReadableString,
+                   ~inputs: inputs :: List.of(smt.Term) = []) :: smt.Scope:
+    query.make_smt_scope(session, this, module, to_string(function), inputs)
+
   // One manifest and one lowering/export for all questions. Specs are checked
   // in order; diagnostics identify their zero-based index.
   method smt_batch(module :: mlir.Module, specs :: List.of(smt.Spec)) :: smt.Batch:

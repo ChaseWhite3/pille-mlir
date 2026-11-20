@@ -21,6 +21,7 @@ export:
   ValuesBatch
   Values
   Session
+  Scope
   Assignment
   Outcome
   Proved
@@ -396,18 +397,21 @@ veneer ObjectiveQuery(this :: satisfying(query.is_objective)):
   method check(~solver: executable :: maybe(Path || ReadableString) = #false,
                ~timeout: timeout :: PosReal = 10,
                ~arguments: arguments :: List.of(ReadableString) = []) :: Outcome:
-    let answer = query.objective_check(this, executable, timeout,
-                                       for List (argument in arguments): to_string(argument))
-    match solver.solver_result_status(answer)
-    | #'optimum:
-        let [[_, _, residue], [name, width, value], ...] = solver.solver_result_assignments(answer)
-        Optimum(function, dialect, describe(), assumptions, to_smtlib(),
-                solver.solver_result_diagnostics(answer), solver.solver_result_command_line(answer),
-                query.objective_value(this, residue),
-                [Assignment(name, width, value), ...])
-    | ~else:
-        solver_outcome(answer, function, dialect, describe(), assumptions, to_smtlib(), timeout,
-                       ~feasibility: feasibility_smtlib())
+    objective_outcome(this, query.objective_check(this, executable, timeout,
+                                                  for List (argument in arguments): to_string(argument)),
+                      timeout)
+
+fun objective_outcome(asked :: ObjectiveQuery, answer, timeout :: Real) :: Outcome:
+  match solver.solver_result_status(answer)
+  | #'optimum:
+      let [[_, _, residue], [name, width, value], ...] = solver.solver_result_assignments(answer)
+      Optimum(asked.function, asked.dialect, asked.describe(), asked.assumptions, asked.to_smtlib(),
+              solver.solver_result_diagnostics(answer), solver.solver_result_command_line(answer),
+              query.objective_value(asked, residue),
+              [Assignment(name, width, value), ...])
+  | ~else:
+      solver_outcome(answer, asked.function, asked.dialect, asked.describe(), asked.assumptions, asked.to_smtlib(),
+                     timeout, ~feasibility: asked.feasibility_smtlib())
 
 // A spec holds the same arguments as Dialect.smt_query. Semantic validation
 // happens in the batch so errors can identify the zero-based spec index.
@@ -495,10 +499,15 @@ veneer Session(this :: satisfying(session.is_session)):
 
   method close(): session.close_session(this)
 
-  method check(value :: Query || Batch,
+  // A query, a batch or an objective, asked of this session's solver. Refused
+  // while a scope is open on the session.
+  method check(value :: Query || Batch || ObjectiveQuery,
                ~timeout: timeout :: PosReal = 10,
                ~overall_timeout: overall_timeout :: maybe(PosReal) = #false) :: Outcome || List.of(Outcome):
     match value
+    | asked :: ObjectiveQuery:
+        let bound = timeout_bound(timeout, overall_timeout)
+        objective_outcome(asked, query.objective_session_check(this, asked, bound), bound)
     | batch :: Batch:
         let answers :: List = query.batch_session_check(this, batch, timeout, overall_timeout)
         batch_outcomes(batch, answers, timeout_bound(timeout, overall_timeout))
@@ -516,3 +525,51 @@ veneer Session(this :: satisfying(session.is_session)):
     | Values(session.enumeration_values(answer), session.enumeration_complete(answer))
     | solver_outcome(answer, value.function, value.dialect, "possible result values",
                      value.assumptions, value.to_smtlib(), timeout)
+
+// Assertions kept in a session's solver over one function's inputs, so that
+// many questions are asked without restarting it: Dialect.smt_scope. The
+// inputs are declared once, when the scope opens.
+//
+//   scope.assert(formula)   an assumption, for every question until its frame
+//                           is popped
+//   scope.push()            a new frame of assumptions
+//   scope.pop()             drops the innermost frame and what it assumed
+//   scope.check(property)   one question: `Proved` where the property holds
+//                           for every input that satisfies what is assumed
+//                           (vacuously, where nothing does), `Counterexample`
+//                           with inputs for which it does not
+//   scope.close()           ends the scope; the session takes other questions
+//                           again
+//
+// A question is asked in a frame of its own that is popped again, so it leaves
+// the scope as it found it. To deepen a bounded check, select a function that
+// returns what each step gives, assert what holds throughout, and check one
+// claim for each depth. Each question lowers its formula over the function
+// anew; the solver keeps what it has learned of the assertions it holds.
+//
+// While a scope is open the session's `check` and `values` are refused: they
+// would be asked under the scope's assumptions, or reset the solver. A timeout
+// or a solver failure ends the solver process and the scope with it; `is_open`
+// says whether it is still there. An outcome's `smtlib` is the question as one
+// script, what the solver held and the goal, which gives the same answer run
+// by itself.
+veneer Scope(this :: satisfying(query.is_scope)):
+  constructor ~error
+
+  property function :: String: query.scope_function(this)
+  property dialect :: String: query.scope_dialect(this)
+  // [[name, width], ...] in argument order.
+  property inputs :: List: query.scope_inputs(this)
+  // What is assumed now, as text, outermost and earliest first.
+  property assumptions :: List.of(String): query.scope_assumptions(this)
+  property is_open :: Boolean: query.scope_is_open(this)
+
+  method assert(assumption :: Formula): query.scope_assert(this, assumption)
+  method push(): query.scope_push(this)
+  method pop(): query.scope_pop(this)
+  method close(): query.scope_close(this)
+
+  method check(property :: Formula, ~timeout: timeout :: PosReal = 10) :: Outcome:
+    let script = query.scope_goal_script(this, property)
+    solver_outcome(query.scope_check(this, property, timeout), function, dialect, property.describe(),
+                   assumptions, script, timeout)

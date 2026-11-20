@@ -9,7 +9,9 @@
          "solver.rkt")
 
 (provide make_session close_session session_check session_check_batch run_solver_batch
-         session_values
+         session_values session_objective
+         session_scope_open session_scope_assert session_scope_push session_scope_pop
+         session_scope_check session_scope_close session_scope_depth
          (rename-out [session? is_session]
                      [enumeration? is_enumeration]
                      [enumeration-complete enumeration_complete])
@@ -23,7 +25,9 @@
                             [input #:mutable] [output #:mutable]
                             [writer #:mutable]
                             [errors #:mutable] [command #:mutable]
-                            [counter #:mutable] [closed? #:mutable]))
+                            [counter #:mutable] [closed? #:mutable]
+                            ;; the depth of an open scope's solver stack, or #f
+                            [scope #:mutable]))
 (struct enumeration (values complete) #:transparent)
 (struct prepared (body declarations) #:transparent)
 
@@ -58,7 +62,7 @@
   (session (and executable (path->complete-path executable))
            (map string->immutable-string extra) owner
            (make-custodian-box owner #t) (make-semaphore 1) (make-weak-hasheq)
-           #f #f #f #f #f #f '() 0 #f))
+           #f #f #f #f #f #f '() 0 #f #f))
 
 (define (check-session who value)
   (unless (session? value) (raise-argument-error who "Session" value)))
@@ -71,6 +75,8 @@
     (with-handlers ([exn:fail? void])
       (when (eq? (subprocess-status child) 'running) (subprocess-kill child #t))
       (subprocess-wait child)))
+  ;; an open scope's assertions were the solver's: they are gone with it
+  (set-session-scope! s #f)
   (set-session-custodian! s #f)
   (set-session-process! s #f)
   (set-session-input! s #f)
@@ -335,6 +341,7 @@
   (positive-seconds 'check timeout)
   (call-with-semaphore (session-lock s)
     (lambda ()
+      (no-scope 'check s)
       (define core (and feasibility-body (core/internal s feasibility-body timeout +inf.0)))
       (if (and core (not (memq (solver_result_status core) '(feasible unknown timeout))))
           core
@@ -400,7 +407,133 @@
   (check-session 'check s)
   (define-values (inputs overall) (validated-batch requests timeout overall-timeout))
   (call-with-semaphore (session-lock s)
-    (lambda () (batch/internal s inputs timeout overall #f))))
+    (lambda () (no-scope 'check s) (batch/internal s inputs timeout overall #f))))
+
+;;==============================================================================
+;; A scope: assertions kept in the solver from one question to the next
+;;
+;; A scope declares its inputs once and holds assertions on the solver's stack.
+;; Each question is asked in a frame of its own, which is popped again, so a
+;; question leaves the scope as it found it. While a scope is open the
+;; session's other questions are refused: a check would be asked under the
+;; scope's assertions, and a feasibility question or an objective resets the
+;; solver. A timeout or a protocol failure ends the solver process, and the
+;; scope with it.
+
+(define (no-scope who s)
+  (when (session-scope s)
+    (raise-user-error who "a scope is open on this session; close it before asking the session anything else")))
+
+(define (in-scope who s)
+  (unless (session-scope s)
+    (raise-user-error who "the scope is closed: it was closed, or its solver ended on a timeout or a failure")))
+
+;; Sends `script`, which must print nothing; gives 'ok or the failure's result.
+(define (scope-command who s script)
+  (check-session who s)
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (in-scope who s)
+      (run-protected s 10 +inf.0
+                     (lambda (deadline result) (expect-empty s script deadline) (result 'ok))))))
+
+(define (session_scope_open s declarations)
+  (check-session 'smt_scope s)
+  (unless (string? declarations) (raise-argument-error 'smt_scope "string?" declarations))
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (no-scope 'smt_scope s)
+      (run-protected s 10 +inf.0
+                     (lambda (deadline result)
+                       (expect-empty s (string-append "(push 1)\n" declarations) deadline)
+                       (set-session-scope! s 1)
+                       (result 'ok))))))
+
+(define (session_scope_depth s) (session-scope s))
+
+(define (session_scope_assert s assertions) (scope-command 'assert s assertions))
+
+(define (session_scope_push s)
+  (define answer (scope-command 'push s "(push 1)"))
+  (when (and (eq? (solver_result_status answer) 'ok) (session-scope s))
+    (set-session-scope! s (add1 (session-scope s))))
+  answer)
+
+(define (session_scope_pop s)
+  (check-session 'pop s)
+  (when (and (session-scope s) (<= (session-scope s) 1))
+    (raise-user-error 'pop "nothing was pushed on this scope; close it to end it"))
+  (define answer (scope-command 'pop s "(pop 1)"))
+  (when (and (eq? (solver_result_status answer) 'ok) (session-scope s))
+    (set-session-scope! s (sub1 (session-scope s))))
+  answer)
+
+(define (session_scope_close s)
+  (check-session 'close s)
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (define depth (session-scope s))
+      (when depth
+        (set-session-scope! s #f)
+        (run-protected s 10 +inf.0
+                       (lambda (deadline result)
+                         (expect-empty s (format "(pop ~a)" depth) deadline)
+                         (result 'ok))))
+      (void))))
+
+;; One question under the scope's assertions: `goal` is asserted in a frame of
+;; its own and the frame popped. 'unsat, 'sat with `expected`'s values, or as
+;; any check's.
+(define (session_scope_check s goal expected [timeout 10])
+  (check-session 'check s)
+  (positive-seconds 'check timeout)
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (in-scope 'check s)
+      (run-protected
+       s timeout +inf.0
+       (lambda (deadline result)
+         (define status
+           (answer s (string-append "(push 1)\n" (timeout-option timeout) goal "\n(check-sat)") deadline))
+         (define values (if (eq? status 'sat) (assignments s expected deadline) '()))
+         (finish-scope s deadline)
+         (define outcome (result status values
+                                 (case status [(unknown) "solver answered unknown"]
+                                       [(timeout) "solver reported its per-question timeout"]
+                                       [else ""])))
+         (when (eq? status 'timeout) (stop! s))
+         outcome)))))
+
+;;==============================================================================
+;; An objective, asked of a session's solver
+
+;; `body` is declarations and assertions; `expected` the objective's symbol
+;; and then each input, as (name . width). The solver is reset before and
+;; after, as for a feasibility question. 'optimum with the values, 'infeasible
+;; (with a core where `feasibility-body` is given and its named assertions
+;; cannot hold together), or as any check's.
+(define (session_objective s body direction symbol expected [timeout 10] [feasibility-body #f])
+  (check-session 'check s)
+  (positive-seconds 'check timeout)
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (no-scope 'check s)
+      (define core (and feasibility-body (core/internal s feasibility-body timeout +inf.0)))
+      (if (and core (not (memq (solver_result_status core) '(feasible unknown timeout))))
+          core
+          (run-protected
+           s timeout +inf.0
+           (lambda (deadline result)
+             (define status
+               (answer s (string-append "(reset)\n" session-options "\n" (timeout-option timeout) body
+                                        (format "\n(~a ~a)\n(check-sat)" direction symbol))
+                       deadline))
+             (define values (if (eq? status 'sat) (assignments s expected deadline) '()))
+             (expect-empty s (string-append "(reset)\n" session-options) deadline)
+             (case status
+               [(sat) (result 'optimum values)]
+               [(unsat) (result 'infeasible '())]
+               [else (result status '() "the solver did not find the objective's best value")])))))))
 
 (define (run_solver_batch requests [executable #f] [timeout 10] [arguments '()] [overall-timeout #f])
   (define-values (inputs overall) (validated-batch requests timeout overall-timeout))
@@ -449,6 +582,7 @@
   (call-with-semaphore
    (session-lock s)
    (lambda ()
+     (no-scope 'values s)
      (run-protected
       s timeout +inf.0
       (lambda (deadline result)

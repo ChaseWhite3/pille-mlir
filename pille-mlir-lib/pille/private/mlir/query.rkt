@@ -18,6 +18,9 @@
          smt_eq smt_cmp smt_no_overflow smt_not smt_and smt_or
          smt_named
          make_smt_objective objective_check objective_inputs objective_assumptions objective_value
+         objective_session_check
+         make_smt_scope scope_assert scope_push scope_pop scope_check scope_close scope_is_open
+         scope_inputs scope_assumptions scope_goal_script
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -32,6 +35,9 @@
                      [query-feasibility query_feasibility]
                      [query? is_query]
                      [objective? is_objective]
+                     [scope? is_scope]
+                     [scope-function scope_function]
+                     [scope-dialect-name scope_dialect]
                      [get-objective-module objective_module]
                      [objective-smtlib objective_smtlib]
                      [objective-feasibility objective_feasibility]
@@ -92,7 +98,13 @@
 ;; The least or greatest value of `term` over the inputs that satisfy the
 ;; preconditions. `symbol` is the SMT-LIB constant the term is bound to.
 (struct objective (module smtlib dialect function inputs preconditions term direction signed? symbol
-                          feasibility))
+                          feasibility body feasibility-body))
+
+;; Assertions kept in a session's solver over one function's inputs. `frames`
+;; is what is asserted now, the innermost frame first: each a list of
+;; (formula . SMT-LIB assertions), the latest first.
+(struct scope (session dialect module function inputs declarations [frames #:mutable]))
+(define (scope-dialect-name value) (dialect_name (scope-dialect value)))
 
 (define (get-objective-module value) (objective-module value))
 (define (get-query-module value) (force (query-module value)))
@@ -599,7 +611,7 @@
       (hash-set manifest key value)))
   (define-values (lowered _members) (run-lowering module manifest))
   (define verified (parse_stock_module lowered module))
-  (define-values (exported feasibility _body)
+  (define-values (exported feasibility feasibility-body)
     (named-scripts 'smt_objective (to_smtlib verified) (values-spec-preconditions description)))
   (define expected (append (expected-inputs declared) (list (cons symbol (term-width term)))))
   (unless (equal? (smtlib-declarations exported) expected)
@@ -616,7 +628,121 @@
                     (format "(~a ~a)\n(check-sat)\n(get-value (~a))\n" direction symbol
                             (string-join (cons symbol (map car (expected-inputs declared))) " ")))))
   (objective verified script (dialect_name dialect) (values-spec-function description) declared
-             (values-spec-preconditions description) term direction signed? symbol feasibility))
+             (values-spec-preconditions description) term direction signed? symbol feasibility
+             (string-append (declarations-of exported) (assertions-of exported)) feasibility-body))
+
+;; A script's declarations, and its assertions, each as the commands' own text.
+(define (commands-of script wanted?)
+  (define out (open-output-string))
+  (define previous 0)
+  (for ([entry (in-list (smtlib-commands script))])
+    (define original (substring script previous (cdr entry)))
+    (set! previous (cdr entry))
+    (when (and (pair? (car entry)) (wanted? (caar entry)))
+      (display (string-trim original) out) (newline out)))
+  (string->immutable-string (get-output-string out)))
+(define (declarations-of script) (commands-of script (lambda (head) (member head '("declare-const" "declare-fun")))))
+(define (assertions-of script) (commands-of script (lambda (head) (equal? head "assert"))))
+
+;; The objective, asked of a session's solver in place of a standalone one.
+(define (objective_session_check session value [timeout 10])
+  (unless (objective? value) (raise-argument-error 'check "objective query" value))
+  (session_objective session (objective-body value) (objective-direction value) (objective-symbol value)
+                     (cons (cons (objective-symbol value) (term-width (objective-term value)))
+                           (expected-inputs (objective-inputs value)))
+                     timeout (objective-feasibility-body value)))
+
+;;==============================================================================
+;; Scopes
+
+;; The assertions the lowering makes of `preconditions` alone, over one
+;; function: its exported SMT-LIB.
+(define (assumed dialect module function inputs preconditions)
+  (define manifest
+    (for/fold ([manifest (context-manifest dialect 1)])
+              ([(key value) (in-hash (hash-set (hash-remove (hash-remove (spec-manifest (make_values_spec function inputs preconditions))
+                                                                        'result_symbol)
+                                                           'defined_symbol)
+                                              'mode "assume"))])
+      (hash-set manifest key value)))
+  (define-values (lowered _members) (run-lowering module manifest))
+  (to_smtlib (parse_stock_module lowered module)))
+
+;; Opens a scope on `session`: the function's inputs are declared in its
+;; solver, once, and stay declared until the scope is closed.
+(define (make_smt_scope session dialect module function inputs)
+  (check-context 'smt_scope dialect module)
+  (define description (make_values_spec function inputs '()))
+  (define declared (values-spec-inputs description))
+  (define script (assumed dialect module (values-spec-function description) declared '()))
+  (unless (equal? (smtlib-declarations script) (expected-inputs declared))
+    (builder-error 'smt_scope "internal error: the exported SMT-LIB does not declare exactly the scope's inputs:\n~a" script))
+  (define declarations (declarations-of script))
+  (define opened (session_scope_open session declarations))
+  (unless (eq? (solver_result_status opened) 'ok)
+    (builder-error 'smt_scope "cannot open a scope: ~a (~a)" (solver_result_status opened) (solver_result_diagnostics opened)))
+  (scope session dialect module (values-spec-function description) declared declarations (list '())))
+
+(define (scope-result who answer)
+  (unless (eq? (solver_result_status answer) 'ok)
+    (builder-error who "the scope's solver failed: ~a (~a)" (solver_result_status answer) (solver_result_diagnostics answer))))
+
+(define (scope_is_open value) (and (session_scope_depth (scope-session value)) #t))
+
+;; Adds an assumption: it holds for every question asked until the frame it is
+;; in is popped.
+(define (scope_assert value assumption)
+  (check-formula 'assert assumption)
+  (define script (assumed (scope-dialect value) (scope-module value) (scope-function value) (scope-inputs value)
+                          (list assumption)))
+  (define assertions (assertions-of script))
+  (scope-result 'assert (session_scope_assert (scope-session value) assertions))
+  (define frames (scope-frames value))
+  (set-scope-frames! value (cons (cons (cons assumption assertions) (car frames)) (cdr frames))))
+
+(define (scope_push value)
+  (scope-result 'push (session_scope_push (scope-session value)))
+  (set-scope-frames! value (cons '() (scope-frames value))))
+
+(define (scope_pop value)
+  (scope-result 'pop (session_scope_pop (scope-session value)))
+  (set-scope-frames! value (cdr (scope-frames value))))
+
+(define (scope_close value)
+  (session_scope_close (scope-session value))
+  (set-scope-frames! value (list '())))
+
+;; What is assumed now, outermost and earliest first.
+(define (scope-assumed value)
+  (append* (reverse (map reverse (scope-frames value)))))
+
+;; The goal's assertion: the negation of the property and of every
+;; operation's requirements, as a query's is.
+(define (scope-goal value property)
+  (check-formula 'check property)
+  (assertions-of (query-smtlib (make_smt_query (scope-dialect value) (scope-module value) (scope-function value)
+                                               (scope-inputs value) property '()))))
+
+;; The question as one script: what the solver holds, and the goal. Run by
+;; itself it gives the answer the scope gives.
+(define (scope_goal_script value property)
+  (string->immutable-string
+   (string-append "(set-logic QF_BV)\n" (scope-declarations value)
+                  (apply string-append (map cdr (scope-assumed value)))
+                  (scope-goal value property) "(check-sat)\n")))
+
+;; Whether `property` holds for every input that satisfies what the scope
+;; assumes: 'unsat where it does, 'sat with a counterexample's inputs.
+(define (scope_check value property [timeout 10])
+  (session_scope_check (scope-session value) (scope-goal value property)
+                       (expected-inputs (scope-inputs value)) timeout))
+
+(define (scope_inputs value)
+  (list->treelist (for/list ([input (in-list (scope-inputs value))])
+                   (treelist (car (term-args input)) (term-width input)))))
+(define (scope_assumptions value)
+  (list->treelist (for/list ([entry (in-list (scope-assumed value))])
+                   (string->immutable-string (render-formula (car entry))))))
 
 ;; 'optimum with the symbol's value first, then the inputs'; 'infeasible with a
 ;; core where named preconditions cannot hold together, or with none where no

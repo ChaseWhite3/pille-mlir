@@ -143,7 +143,9 @@ class Spec(function :: String,
            // query), the symbol it is bound to, and whether it is read as signed
            objective,
            objective_symbol :: String,
-           objective_signed :: Boolean)
+           objective_signed :: Boolean,
+           // only the preconditions are asserted: nothing is asked
+           assume :: Boolean)
 
 class Function(op :: generic.Op, block :: generic.Block)
 
@@ -384,10 +386,11 @@ fun read_spec(q :: Query) :: Spec:
   let mode = as_string(get(specification, #'mode))
   let enumerate_values = mode == "values"
   let optimize = mode == "objective"
-  when mode && mode != "values" && mode != "proof" && mode != "objective"
+  let assume = mode == "assume"
+  when mode && mode != "values" && mode != "proof" && mode != "objective" && mode != "assume"
   | q.malformed("unknown query mode")
   unless name && input_list && operations && unmodeled_list && preconditions
-           && (has_property || enumerate_values || optimize)
+           && (has_property || enumerate_values || optimize || assume)
   | q.malformed("missing a required field")
   let inputs :: List.of(Bv):
     for List (entry in input_list :~ PairList):
@@ -449,7 +452,7 @@ fun read_spec(q :: Query) :: Spec:
     | ~else: values(#false, "", #false)
   Spec(name, inputs, expected_result_width, expected_result_widths, preconditions,
        get(specification, #'property), enumerate_values, result_symbol, defined_symbol,
-       objective, objective_symbol, objective_signed)
+       objective, objective_symbol, objective_signed, assume)
 
 // Function-level attributes that cannot change the value computed by a
 // straight-line body. Anything else is rejected rather than ignored.
@@ -1009,6 +1012,10 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
             bv_ite(q, condition, one, zero, loc)
       let defined = declare_fun(q, spec.defined_symbol, 1, loc)
       assert(q, bv_eq(q, defined, defined_value, loc), loc)
+  | spec.assume:
+      // The preconditions are the whole of it: assertions for a scope that
+      // another question, with its own goal, is asked in.
+      #void
   | spec.objective_symbol != "":
       // The optimum is over the inputs for which every operation is used
       // within what its model requires. The solver orders bitvectors as

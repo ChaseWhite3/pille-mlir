@@ -45,3 +45,26 @@ check passes unchanged.
 
 `pille-mlir-lib/README.md` says this under "How the SMT-LIB is made" and lists `check_all`. The Scribble manual
 has nothing on `pille/mlir`.
+
+## Addendum, 2026-11-21: the lowering itself
+
+With the tools out of the way, a profile of a function of some size (the fixture's stepped machine, 12 and 48
+steps, cache off) showed the lowering's own costs. Three were removed; no text it writes changed.
+
+- `Query.lines`, `obligations` and `calls` were declared `:: List.of(String)`. Rhombus checks such a field's whole
+  value at every assignment, so appending one line re-checked every line: quadratic, and two thirds of the time.
+  They are `:~` now, which keeps the static information and checks nothing.
+- The MLIR text of the lowered module, and of each solver as a module of its own, was built for every query and
+  used only where the module is asked for or the tools export it. `lower` now returns functions that give it.
+- Numbers were written with `+&`, which goes by the printer; an assertion's commands were matched as lists; and
+  `commands-of` trimmed each command with `string-trim`. Each has a plain replacement.
+
+| stepped machine | 12 steps, before | after | 48 steps, before | after |
+| --- | --- | --- | --- | --- |
+| build a query | 11.7 ms | 6.3 ms | 104 ms | 13 ms |
+| deepen 1 to depth with `check_all` (solving included) | 63 ms | 30 ms | 1,262 ms | 454 ms |
+
+What is left is spread out: writing each claim's SMT-LIB, reading it back for its declarations and assertions,
+and the solver. The next step of that kind would change what is sent: in a scope, each claim's text holds the
+whole function body again. Sending the body to the solver once and each claim's own formula after it would make
+deepening cost what the claims cost, but the text would no longer be the exporter's, so it is not done here.

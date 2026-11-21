@@ -165,16 +165,18 @@ class Scope(description :: String,
 class Query(context :: Context,
             specification :: Map,
             index :: maybe(Int),
-            mutable lines :: List.of(String),
+            // `:~` on the lists that grow: `::` would check every element again
+            // at each assignment, which is quadratic in what is lowered
+            mutable lines :~ List.of(String),
             mutable next :: Int,
             // the lowered value of each SSA name in the block being lowered
             mutable values :: MutableMap,
-            mutable obligations :: List.of(String),
+            mutable obligations :~ List.of(String),
             // the functions being lowered, the selected one first: a call's way in
-            mutable calls :: List.of(String) = [],
+            mutable calls :~ List.of(String) = [],
             // The same question as SMT-LIB, kept beside the operations written
             // into `lines`. `defs`: each operation's value, its name to
-            // [head, operand name, ...]. `leaves`: each constant's and each
+            // a `Def`. `leaves`: each constant's and each
             // declared symbol's name to its SMT-LIB text. `commands`: the
             // declarations and assertions, in order.
             mutable defs :: Map = {},
@@ -194,8 +196,13 @@ class Query(context :: Context,
 //==============================================================================
 // Writing SMT operations
 
+// A number's digits. `+&` goes by the printer, and these are written for
+// every operation lowered.
+fun digits(number :: Int) :~ String:
+  rkt.#{string->immutable-string}(rkt.#{number->string}(number))
+
 fun bv_type(width :: Int) :: String:
-  "!smt.bv<" +& width +& ">"
+  "!smt.bv<" ++ digits(width) ++ ">"
 
 // A string attribute. Anything but plain printable characters is written as
 // the two hex digits of each of its bytes, which MLIR's lexer reads back.
@@ -213,16 +220,21 @@ fun emit(q :: Query, text :: String, loc :: String):
   q.lines := q.lines.add("    " ++ text ++ suffix)
 
 fun fresh(q :: Query) :: String:
-  let name = "%" +& q.next
+  let name = "%" ++ digits(q.next)
   q.next := q.next + 1
   name
 
-fun define(q :: Query, name :: String, head :: String, operands :: List.of(String)):
-  q.defs := q.defs ++ {name: [head] ++ operands}
+// An operation's value as SMT-LIB writes it, and the two commands.
+class Def(head :: String, operands :: List)
+class Declared(display :: String, width :: Int)
+class Asserted(root :: String)
+
+fun define(q :: Query, name :: String, head :: String, operands :: List):
+  q.defs := q.defs ++ {name: Def(head, operands)}
 
 fun declared(q :: Query, name :: String, display :: String, width :: Int):
   q.leaves := q.leaves ++ {name: display}
-  q.commands := q.commands.add(["declare", display, width])
+  q.commands := q.commands.add(Declared(display, width))
 
 // A constant as the exporter writes it: hexadecimal where the width is a
 // whole number of hexadecimal digits, binary otherwise.
@@ -249,7 +261,7 @@ fun declare_fun(q :: Query, display :: String, width :: Int, loc :: String) :: B
 fun bv_constant(q :: Query, value :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(width)
-  emit(q, name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" +& value +& "> : " ++ type ++ "}> : () -> " ++ type, loc)
+  emit(q, name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" ++ digits(value) ++ "> : " ++ type ++ "}> : () -> " ++ type, loc)
   q.leaves := q.leaves ++ {name: literal(value, width)}
   Bv(name, width)
 
@@ -292,7 +304,7 @@ def cmp_heads :: List.of(String) = ["bvslt", "bvsle", "bvsgt", "bvsge", "bvult",
 fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
   let name = fresh(q)
   let type = bv_type(lhs.width)
-  emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " +& predicate +& " : i64}> : ("
+  emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " ++ digits(predicate) ++ " : i64}> : ("
             ++ type ++ ", " ++ type ++ ") -> !smt.bool", loc)
   define(q, name, cmp_heads[predicate], [lhs.name, rhs.name])
   name
@@ -311,7 +323,7 @@ fun bv_concat(q :: Query, high :: Bv, low :: Bv, loc :: String) :: Bv:
 
 fun bv_extract(q :: Query, input :: Bv, low_bit :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
-  emit(q, name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " +& low_bit +& " : i32}> : ("
+  emit(q, name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " ++ digits(low_bit) ++ " : i32}> : ("
             ++ bv_type(input.width) ++ ") -> " ++ bv_type(width), loc)
   define(q, name, "(_ extract " +& (low_bit + width - 1) +& " " +& low_bit +& ")", [input.name])
   Bv(name, width)
@@ -376,7 +388,7 @@ fun bool_connective(q :: Query, operation :: String, operands :: List.of(String)
 
 fun assert(q :: Query, input :: String, loc :: String):
   emit(q, "\"smt.assert\"(" ++ input ++ ") : (!smt.bool) -> ()", loc)
-  q.commands := q.commands.add(["assert", input])
+  q.commands := q.commands.add(Asserted(input))
 
 //==============================================================================
 // The question as SMT-LIB
@@ -391,27 +403,27 @@ fun assert(q :: Query, input :: String, loc :: String):
 // and declared symbols are written where they are used.
 fun smtlib_of(q :: Query, index :: Int) :: String:
   let out = rkt.#{open-output-string}()
-  fun put(text :: String): rkt.display(text, out)
+  fun put(text :~ String): rkt.#{write-string}(text, out)
   put("; solver scope " +& index +& "\n(set-logic QF_BV)\n")
   let taken :: Set:
-    for Set (command :: List in q.commands):
-      keep_when command[0] == "declare"
-      command[1]
+    for Set (command in q.commands):
+      keep_when command is_a Declared
+      (command :~ Declared).display
   let mutable bound = 0
   fun next_name() :: String:
-    let name = if bound == 0 | "tmp" | "tmp_" +& (bound - 1)
+    let name = if bound == 0 | "tmp" | "tmp_" ++ digits(bound - 1)
     bound := bound + 1
     if name in taken | next_name() | name
-  for (command :: List in q.commands):
+  for (command in q.commands):
     match command
-    | ["declare", display :: String, width :: Int]:
+    | Declared(display, width):
         put("(declare-const " ++ display ++ " (_ BitVec " +& width +& "))\n")
-    | ["assert", root :: String]:
+    | Asserted(root):
         let names = MutableMap()
         let expanded = MutableSet()
         fun written(name :: String) :: String:
           if q.leaves.has_key(name) | q.leaves[name] | names[name]
-        let mutable stack :: List.of(String) = [root]
+        let mutable stack :~ List.of(String) = [root]
         let mutable bindings = 0
         put("(assert ")
         while stack.length() > 0:
@@ -420,19 +432,23 @@ fun smtlib_of(q :: Query, index :: Int) :: String:
           | names.has_key(top) || q.leaves.has_key(top):
               stack := stack.drop_last(1)
           | expanded.contains(top):
-              let [head :: String, operand :: String, ...] = q.defs[top]
+              let def :~ Def = q.defs[top]
               let name = next_name()
-              put((if bindings == 0 | "" | "        ") ++ "(let ((" ++ name ++ " (" ++ head)
-              for (each in [operand, ...]):
-                put(" " ++ written(each))
+              put(if bindings == 0 | "(let ((" | "        (let ((")
+              put(name)
+              put(" (")
+              put(def.head)
+              for (each :~ String in def.operands):
+                put(" ")
+                put(written(each))
               put(")))\n")
               bindings := bindings + 1
               names[top] := name
               stack := stack.drop_last(1)
           | ~else:
               expanded.add(top)
-              let [_, operand :: String, ...] = q.defs[top]
-              for (each in [operand, ...]):
+              let def :~ Def = q.defs[top]
+              for (each :~ String in def.operands):
                 unless names.has_key(each) || q.leaves.has_key(each)
                 | stack := stack.add(each)
         put((if bindings == 0 | "" | "        ") ++ written(root) ++ String.make(bindings, Char")") ++ ")\n")
@@ -1059,7 +1075,7 @@ fun lower_block(q :: Query, function_name :: String, block :: generic.Block, fun
 
 def yield_line = "\"smt.yield\"() : () -> ()"
 
-fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :: values(String, String):
+fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :: values(List, String):
   let q = Query(context, specification, index, [], 0, MutableMap(), [])
   let spec = read_spec(q)
   let function = check_function(q, spec)
@@ -1158,7 +1174,8 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
      "    }) : () -> ()" ++ suffix,
      "    " ++ yield_line,
      "  }) : () -> ()" ++ suffix]
-  values(String.join(["  \"smt.solver\"() ({"] ++ q.lines ++ check, "\n"),
+  // the solver's lines: its text is made only where the module is wanted
+  values(["  \"smt.solver\"() ({"] ++ q.lines ++ check,
          smtlib_of(q, index || 0))
 
 fun module_of(solvers :: List.of(String), loc :: String) :: String:
@@ -1180,9 +1197,10 @@ fun module_read(text :: String) :: generic.Module:
 // Lowers every query of a manifest (version 1: the manifest is the one query;
 // version 2: its `queries`) over the module whose generic form is `text`.
 // Returns the module holding one solver per query, in order, each solver as a
-// module of its own, and the SMT-LIB the exporter writes for the first of
-// those. The source operations are in none of them.
-fun lower(text :: String, manifest) :: values(String, List.of(String), String):
+// module of its own, and the SMT-LIB the exporter writes for each solver. The
+// modules are functions that give their text: a caller that uses the SMT-LIB
+// alone never pays for it. The source operations are in none of them.
+fun lower(text :: String, manifest) :: values(Any, List, List):
   let module = module_read(text)
   fun malformed(message :: String):
     fail(module.loc, "malformed SMT query manifest: " ++ message)
@@ -1209,13 +1227,14 @@ fun lower(text :: String, manifest) :: values(String, List.of(String), String):
                   [solver, smtlib]
               | ~else: fail(module.loc, "SMT batch spec " +& index +& ": expected a query object")
         | ~else: malformed("missing queries array")
-  let solvers :: List.of(String) = for List (entry :: List in built): entry[0]
-  values(module_of(solvers, module.loc),
-         for List (solver in solvers): module_of([solver], module.loc),
-         String.append(& for List (entry :: List in built): entry[1]))
+  fun solver(entry :~ List) :: String: String.join(entry[0], "\n")
+  let loc = module.loc
+  values(fun (): module_of(for List (entry in built): solver(entry), loc),
+         for List (entry in built): fun (): module_of([solver(entry)], loc),
+         for List (entry :~ List in built): entry[1])
 
 // The same, from the manifest's JSON text.
-fun lower_text(text :: String, manifest :: ReadableString) :: values(String, List.of(String), String):
+fun lower_text(text :: String, manifest :: ReadableString) :: values(Any, List, List):
   let document:
     try:
       rjson.#{string->jsexpr}(to_string(manifest))

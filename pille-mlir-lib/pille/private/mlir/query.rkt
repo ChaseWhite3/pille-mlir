@@ -445,13 +445,16 @@
     (cons (car (term-args input)) (term-width input))))
 
 ;; The lowering is `lower.rhm`, over the module's generic form. It returns the
-;; module of solvers and each solver as a module of its own.
+;; module of solvers and each solver as a module of its own, each a promise of
+;; its text, and the SMT-LIB of each solver as the exporter writes it.
 (define (run-lowering module manifest)
   (define-values (text members smtlib)
     (if (string? manifest)
         (lower_text (module_generic module) manifest)
         (lower (module_generic module) manifest)))
-  (values text (treelist->list members) (string->immutable-string smtlib)))
+  (values (delay/sync (text))
+          (for/list ([member (in-treelist members)]) (delay/sync (member)))
+          (treelist->list smtlib)))
 
 ;; How a lowered question becomes SMT-LIB.
 ;;   'direct  the lowering's own text. No tool runs; the lowered module is
@@ -474,17 +477,23 @@
         ["both" 'both]
         [other (builder-error 'smt_query "PILLE_MLIR_SMT_EXPORT is ~s; expected direct, tools or both" other)])))
 
-;; The verified SMT module, as a promise, and the SMT-LIB.
-(define (export-smtlib who lowered smtlib module)
+;; The verified SMT module, as a promise; the SMT-LIB; and, where the lowering
+;; wrote it, each solver's part of it (#f where the tools did: split it).
+(define (export-smtlib who lowered scripts module)
+  (define smtlib (string->immutable-string (apply string-append scripts)))
   (case (export-mode)
-    [(direct) (values (delay/sync (parse_stock_module lowered module)) smtlib)]
+    [(direct)
+     ;; as `split-queries` gives them: a solver after the first begins on a new line
+     (values (delay/sync (parse_stock_module (force lowered) module)) smtlib
+             (for/list ([script (in-list scripts)] [index (in-naturals)])
+               (string->immutable-string (if (zero? index) script (string-append "\n" script)))))]
     [else
-     (define verified (parse_stock_module lowered module))
+     (define verified (parse_stock_module (force lowered) module))
      (define text (to_smtlib verified))
      (when (and (eq? (export-mode) 'both) (not (equal? text smtlib)))
        (builder-error who "internal error: the lowering's SMT-LIB is not what mlir-translate exports\n--- lowering\n~a--- mlir-translate\n~a"
                       smtlib text))
-     (values (delay/sync verified) text)]))
+     (values (delay/sync verified) text #f)]))
 
 ;; Lowers a manifest given as JSON text, bypassing the manifest this module
 ;; derives from a dialect: for tests of what the lowering itself checks.
@@ -492,14 +501,14 @@
   (unless (is_module module) (raise-argument-error 'smt_lower_text "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_text "string?" manifest))
   (define-values (text _members _smtlib) (run-lowering module manifest))
-  text)
+  (force text))
 
 ;; The same, giving the SMT-LIB the lowering itself writes: no tool runs.
 (define (smt_lower_smtlib module manifest)
   (unless (is_module module) (raise-argument-error 'smt_lower_smtlib "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_smtlib "string?" manifest))
   (define-values (_text _members smtlib) (run-lowering module manifest))
-  smtlib)
+  (string->immutable-string (apply string-append smtlib)))
 
 ;; The lowering asserts a query's preconditions first, one assertion each, in
 ;; order. Gives the script with each named precondition's assertion named
@@ -555,7 +564,7 @@
               ([(key value) (in-hash (spec-manifest description))])
       (hash-set manifest key value)))
   (define-values (lowered _members direct) (run-lowering module manifest))
-  (define-values (verified text) (export-smtlib 'smt_query lowered direct module))
+  (define-values (verified text _scripts) (export-smtlib 'smt_query lowered direct module))
   (define-values (smtlib feasibility feasibility-body)
     (named-scripts 'smt_query text (spec-preconditions description)))
   (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
@@ -593,8 +602,8 @@
         (spec-manifest value))))
   (define manifest (hash-set (context-manifest dialect 2) 'queries descriptions))
   (define-values (lowered standalone direct) (run-lowering module manifest))
-  (define-values (verified text) (export-smtlib who lowered direct module))
-  (define chunks (split-queries text))
+  (define-values (verified text scripts) (export-smtlib who lowered direct module))
+  (define chunks (or scripts (split-queries text)))
   (unless (and (= (length specs) (length chunks)) (= (length specs) (length standalone)))
     (builder-error who "internal error: lowered/exported query count does not match the specs"))
   (define queries
@@ -606,7 +615,7 @@
       ;; Construction checks the whole batch once. Accessing a member's module
       ;; verifies the lowering's isolated module lazily, without adding
       ;; processes to ordinary batch construction or solver execution.
-      (define member-module (delay (parse_stock_module ir module)))
+      (define member-module (delay (parse_stock_module (force ir) module)))
       (cond
         [values?
          (define result-name (hash-ref description 'result_symbol))
@@ -650,7 +659,7 @@
                                                'signed signed?))])
       (hash-set manifest key value)))
   (define-values (lowered _members direct) (run-lowering module manifest))
-  (define-values (verified text) (export-smtlib 'smt_objective lowered direct module))
+  (define-values (verified text _scripts) (export-smtlib 'smt_objective lowered direct module))
   (define-values (exported feasibility feasibility-body)
     (named-scripts 'smt_objective text (values-spec-preconditions description)))
   (define expected (append (expected-inputs declared) (list (cons symbol (term-width term)))))
@@ -676,10 +685,14 @@
   (define out (open-output-string))
   (define previous 0)
   (for ([entry (in-list (smtlib-commands script))])
-    (define original (substring script previous (cdr entry)))
-    (set! previous (cdr entry))
+    (define end (cdr entry))
     (when (and (pair? (car entry)) (wanted? (caar entry)))
-      (display (string-trim original) out) (newline out)))
+      ;; the command without the space before it: it ends where its form does
+      (define start
+        (let loop ([position previous])
+          (if (and (< position end) (char-whitespace? (string-ref script position))) (loop (add1 position)) position)))
+      (write-string script out start end) (newline out))
+    (set! previous end))
   (string->immutable-string (get-output-string out)))
 (define (declarations-of script) (commands-of script (lambda (head) (member head '("declare-const" "declare-fun")))))
 (define (assertions-of script) (commands-of script (lambda (head) (equal? head "assert"))))
@@ -706,7 +719,7 @@
                                               'mode "assume"))])
       (hash-set manifest key value)))
   (define-values (lowered _members direct) (run-lowering module manifest))
-  (define-values (_verified text) (export-smtlib 'smt_scope lowered direct module))
+  (define-values (_verified text _scripts) (export-smtlib 'smt_scope lowered direct module))
   text)
 
 ;; Opens a scope on `session`: the function's inputs are declared in its

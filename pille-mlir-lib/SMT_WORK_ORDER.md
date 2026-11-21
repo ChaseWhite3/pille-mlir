@@ -137,7 +137,9 @@ Since 2026-11-20 the lowering also writes the SMT-LIB itself, the text
 `mlir-translate --export-smtlib` gives for the module it lowers to, so a query
 is built without starting a tool. `PILLE_MLIR_SMT_EXPORT=tools` restores the
 verified and exported route, and `both` compares the two; the tests run in
-`both`.
+`both`. A scope sends its function's body to the solver once, as
+definitions, and each question's own formula after it (2026-11-21); that text
+is the lowering's alone.
 
 Still unsupported: control flow, recursion, regions, memory, floating point,
 `index`, quantifiers and attribute-dependent semantics.

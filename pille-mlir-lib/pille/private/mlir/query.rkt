@@ -104,7 +104,9 @@
 ;; Assertions kept in a session's solver over one function's inputs. `frames`
 ;; is what is asserted now, the innermost frame first: each a list of
 ;; (formula . SMT-LIB assertions), the latest first.
-(struct scope (session dialect module function inputs declarations [frames #:mutable]))
+;; `context`: the lowering's, holding the function's body as the solver was
+;; given it; #f where the tools export each question whole.
+(struct scope (session dialect module function inputs declarations context [frames #:mutable]))
 (define (scope-dialect-name value) (dialect_name (scope-dialect value)))
 
 (define (get-objective-module value) (force (objective-module value)))
@@ -710,32 +712,55 @@
 
 ;; The assertions the lowering makes of `preconditions` alone, over one
 ;; function: its exported SMT-LIB.
+(define (assume-manifest dialect description)
+  (for/fold ([manifest (context-manifest dialect 1)])
+            ([(key value) (in-hash (hash-set (hash-remove (hash-remove (spec-manifest description) 'result_symbol)
+                                                         'defined_symbol)
+                                            'mode "assume"))])
+    (hash-set manifest key value)))
+
 (define (assumed dialect module function inputs preconditions)
-  (define manifest
-    (for/fold ([manifest (context-manifest dialect 1)])
-              ([(key value) (in-hash (hash-set (hash-remove (hash-remove (spec-manifest (make_values_spec function inputs preconditions))
-                                                                        'result_symbol)
-                                                           'defined_symbol)
-                                              'mode "assume"))])
-      (hash-set manifest key value)))
+  (define manifest (assume-manifest dialect (make_values_spec function inputs preconditions)))
   (define-values (lowered _members direct) (run-lowering module manifest))
   (define-values (_verified text _scripts) (export-smtlib 'smt_scope lowered direct module))
   text)
 
 ;; Opens a scope on `session`: the function's inputs are declared in its
-;; solver, once, and stay declared until the scope is closed.
+;; solver and its body defined there, once, and both stay until the scope is
+;; closed. A question then sends its own formula, written over the body's
+;; definitions (lower.rhm `scope_begin`). That text is the lowering's, not the
+;; exporter's, which writes a question whole; where the tools are to export
+;; (`smt_export_mode` 'tools), a scope sends each question whole, as exported.
 (define (make_smt_scope session dialect module function inputs)
   (check-context 'smt_scope dialect module)
   (define description (make_values_spec function inputs '()))
   (define declared (values-spec-inputs description))
-  (define script (assumed dialect module (values-spec-function description) declared '()))
+  (define-values (context script definitions)
+    (cond
+      [(eq? (export-mode) 'tools)
+       (values #f (assumed dialect module (values-spec-function description) declared '()) "")]
+      [else
+       (define-values (context script definitions)
+         (scope_begin (module_generic module) (assume-manifest dialect description)))
+       (values context script definitions)]))
   (unless (equal? (smtlib-declarations script) (expected-inputs declared))
     (builder-error 'smt_scope "internal error: the exported SMT-LIB does not declare exactly the scope's inputs:\n~a" script))
-  (define declarations (declarations-of script))
+  (define declarations (string->immutable-string (string-append (declarations-of script) definitions)))
   (define opened (session_scope_open session declarations))
   (unless (eq? (solver_result_status opened) 'ok)
     (builder-error 'smt_scope "cannot open a scope: ~a (~a)" (solver_result_status opened) (solver_result_diagnostics opened)))
-  (scope session dialect module (values-spec-function description) declared declarations (list '())))
+  (scope session dialect module (values-spec-function description) declared declarations context (list '())))
+
+;; The assertions of one question in a scope: `description` is a spec (a
+;; property, negated with the requirements) or a values spec (preconditions
+;; alone).
+(define (scope-assertions value description)
+  (define manifest
+    (if (spec? description)
+        (spec-manifest description)
+        (hash-set (hash-remove (hash-remove (spec-manifest description) 'result_symbol) 'defined_symbol)
+                  'mode "assume")))
+  (assertions-of (scope_lower (scope-context value) manifest)))
 
 (define (scope-result who answer)
   (unless (eq? (solver_result_status answer) 'ok)
@@ -747,9 +772,11 @@
 ;; in is popped.
 (define (scope_assert value assumption)
   (check-formula 'assert assumption)
-  (define script (assumed (scope-dialect value) (scope-module value) (scope-function value) (scope-inputs value)
-                          (list assumption)))
-  (define assertions (assertions-of script))
+  (define assertions
+    (if (scope-context value)
+        (scope-assertions value (make_values_spec (scope-function value) (scope-inputs value) (list assumption)))
+        (assertions-of (assumed (scope-dialect value) (scope-module value) (scope-function value) (scope-inputs value)
+                                (list assumption)))))
   (scope-result 'assert (session_scope_assert (scope-session value) assertions))
   (define frames (scope-frames value))
   (set-scope-frames! value (cons (cons (cons assumption assertions) (car frames)) (cdr frames))))
@@ -774,8 +801,10 @@
 ;; operation's requirements, as a query's is.
 (define (scope-goal value property)
   (check-formula 'check property)
-  (assertions-of (query-smtlib (make_smt_query (scope-dialect value) (scope-module value) (scope-function value)
-                                               (scope-inputs value) property '()))))
+  (if (scope-context value)
+      (scope-assertions value (make_spec (scope-function value) (scope-inputs value) property '()))
+      (assertions-of (query-smtlib (make_smt_query (scope-dialect value) (scope-module value) (scope-function value)
+                                                   (scope-inputs value) property '())))))
 
 ;; The question as one script: what the solver holds, and the goal. Run by
 ;; itself it gives the answer the scope gives.
@@ -800,14 +829,16 @@
   (define claims (entries 'check_all properties))
   (for ([claim (in-list claims)]) (check-formula 'check_all claim))
   (define goals
-    (if (null? claims)
-        '()
+    (cond
+      [(null? claims) '()]
+      [(scope-context value) (for/list ([claim (in-list claims)]) (scope-goal value claim))]
+      [else
         (for/list ([member (in-list (batch-queries
                                      (make-batch (scope-dialect value) (scope-module value)
                                                  (for/list ([claim (in-list claims)])
                                                    (make_spec (scope-function value) (scope-inputs value) claim '()))
                                                  #f)))])
-          (assertions-of (query-smtlib member)))))
+          (assertions-of (query-smtlib member)))]))
   (define held
     (string-append "(set-logic QF_BV)\n" (scope-declarations value)
                    (apply string-append (map cdr (scope-assumed value)))))

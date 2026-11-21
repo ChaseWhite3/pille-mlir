@@ -554,8 +554,11 @@ veneer Session(this :: satisfying(session.is_session)):
 // A question is asked in a frame of its own that is popped again, so it leaves
 // the scope as it found it. To deepen a bounded check, select a function that
 // returns what each step gives, assert what holds throughout, and check one
-// claim for each depth. Each question lowers its formula over the function
-// anew; the solver keeps what it has learned of the assertions it holds.
+// claim for each depth. The function's body is sent to the solver once, when
+// the scope is opened, as definitions; an assumption or a claim sends its own
+// formula over them, so its cost does not grow with the function. (That text
+// is the lowering's, not MLIR's exporter's; with PILLE_MLIR_SMT_EXPORT=tools
+// each question is sent whole, as exported.)
 //
 // While a scope is open the session's `check` and `values` are refused: they
 // would be asked under the scope's assumptions, or reset the solver. A timeout

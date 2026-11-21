@@ -543,7 +543,7 @@ session.close()
 
 | Form | Meaning |
 | --- | --- |
-| `dialect.smt_scope(session, module, ~function: name, ~inputs: [...])` | Opens a scope: the function's inputs are declared once in the session's solver |
+| `dialect.smt_scope(session, module, ~function: name, ~inputs: [...])` | Opens a scope: the function's inputs are declared and its body defined, once, in the session's solver |
 | `scope.assert(formula)` | An assumption, for every question until its frame is popped |
 | `scope.push()`, `scope.pop()` | A new frame of assumptions, and its end |
 | `scope.check(property, ~timeout: seconds = 10)` | `Proved` where the property holds for every input satisfying what is assumed, `Counterexample` with inputs for which it does not |
@@ -552,12 +552,21 @@ session.close()
 | `scope.close()` | Ends it; the session takes other questions again |
 
 Each question is asked in a frame of its own that is popped again, so it leaves
-the scope as it found it. Each lowers its formula over the function anew, and
-the solver keeps its process and what it has learned of the assertions it
-holds. `check_all` lowers several claims together, which matters where the
-tools export them (`PILLE_MLIR_SMT_EXPORT=tools`): one pass for all of them. A
-timeout or failure ends the scope, and the claims after it are a `Failure` of
-kind `#'closed_session`. To deepen a bounded check, select a function that returns what each step
+the scope as it found it. `check_all` asks several, in order; a timeout or
+failure ends the scope, and the claims after it are a `Failure` of kind
+`#'closed_session`.
+
+The function's body goes to the solver once, when the scope is opened: each of
+its operations as a definition (`define-fun`). An assumption or a claim then
+sends its own formula, written over those definitions, so what a claim costs
+does not grow with the function. Deepening a check of a 48-step machine one
+step at a time, 48 claims, takes about 80 ms, solving included, where sending
+each claim whole took about 450. This text is the lowering's own and not the
+exporter's, which writes a question whole; the tests hold a scope's answers to
+those of whole questions, and each outcome's `.smtlib` to its answer. With
+`PILLE_MLIR_SMT_EXPORT=tools` a scope sends each question whole, as exported.
+
+To deepen a bounded check, select a function that returns what each step
 gives (a step function called once for each step), assert what holds
 throughout, and check one claim for each depth.
 

@@ -338,3 +338,78 @@
                   (make-list depth 'unsat))
     (scope_close scope)
     (close_session s)))
+
+;;==============================================================================
+;; A scope's solver holds the function's body
+
+;; The same questions of a scope that sends the body once and of one that
+;; sends each question whole, as the tools export it.
+(define (asked-both-ways module function inputs assumptions claims)
+  (for/list ([mode '(direct tools)])
+    (parameterize ([smt_export_mode mode])
+      (define s (make_session z3))
+      (define scope (make_smt_scope s arithmetic module function inputs))
+      (for ([assumption (in-list assumptions)]) (scope_assert scope assumption))
+      (define answers
+        (for/list ([entry (in-treelist (scope_check_all scope claims 60))])
+          (define answer (treelist-ref entry 1))
+          ;; a counterexample is one of perhaps many: what is compared is that there is one, and each
+          ;; question's script, run by hand, says the same
+          (check-equal? (by-hand (treelist-ref entry 0)) (symbol->string (solver_result_status answer)))
+          (solver_result_status answer)))
+      (define script (scope_goal_script scope (car claims)))
+      (scope_close scope)
+      (close_session s)
+      (list answers (regexp-match? #rx"define-fun" script)))))
+
+(test-case "a scope that sends the body once answers as one that sends every question whole"
+  (for ([module (list sound faulty)])
+    (define claims (for/list ([count (in-range 1 (add1 depth))]) (never count)))
+    (define plain (asked-both-ways module "run" run-inputs '() claims))
+    ;; the first defines the body, the second does not, and the answers are the same
+    (check-equal? (map cadr plain) '(#t #f))
+    (check-equal? (car (car plain)) (car (cadr plain)))
+    (define assuming
+      (asked-both-ways module "run" run-inputs
+                       (list (smt_cmp 'ult I (smt_const 9 32))
+                             (smt_and (for/list ([kind (in-list (cdr kinds))]) (smt_not (is kind disconnect)))))
+                       claims))
+    (check-equal? (car (car assuming)) (car (cadr assuming))))
+  ;; a claim's own text is its formula: it does not grow with the body
+  (define s (make_session z3))
+  (define scope (make_smt_scope s arithmetic sound "run" run-inputs))
+  (define held (string-length (scope_goal_script scope (never 1))))
+  (check-true (< (- (string-length (scope_goal_script scope (never 2))) held) 400))
+  (scope_close scope)
+  (close_session s))
+
+(test-case "the body's definitions keep clear of the inputs' names, and its requirements are still to be shown"
+  ;; inputs named as the definitions would be
+  (define first (smt_input "pille_v0" 32))
+  (define second (smt_input "pille_v_1" 32))
+  (define sum (smt_binary 'add (smt_binary 'add first (smt_const 2 32)) second))
+  (define s (make_session z3))
+  (define scope (make_smt_scope s arithmetic calls "nested" (list first second)))
+  (check-eq? (solver_result_status (scope_check scope (smt_eq (smt_result_at 0 32) sum))) 'unsat)
+  (define refuted (scope_check scope (smt_eq (smt_result_at 0 32) first)))
+  (check-eq? (solver_result_status refuted) 'sat)
+  (check-equal? (map car (solver_result_values refuted)) '("pille_v0" "pille_v_1"))
+  (check-equal? (by-hand (scope_goal_script scope (smt_eq (smt_result_at 0 32) sum))) "unsat")
+  (scope_close scope)
+  ;; an operation whose model requires something of its operand: a claim is not proved where the
+  ;; requirement may fail, and is where the scope assumes it holds
+  (define choice (dynamic-require (build-path fixtures "valid.rhm") 'choice))
+  (define before
+    (parse_module "module {\n  func.func @before(%a0: i32) -> i32 {\n    %r = \"choice.predecessor\"(%a0) : (i32) -> i32\n    return %r : i32\n  }\n}\n"
+                  (dialect_irdl choice) chain))
+  (define within (make_smt_scope s choice before "before" (list a32)))
+  (define trivial (smt_eq r32 r32))
+  (check-eq? (solver_result_status (scope_check within trivial)) 'sat)
+  (scope_assert within (smt_eq a32 (smt_const 2 32)))
+  (check-eq? (solver_result_status (scope_check within trivial)) 'unsat)
+  (check-eq? (solver_result_status (scope_check within (smt_eq r32 (smt_const 1 32)))) 'unsat)
+  (check-equal? (by-hand (scope_goal_script within trivial)) "unsat")
+  ;; and it is what a whole query says
+  (check-eq? (solver_result_status (query_check (make_smt_query choice before "before" (list a32) trivial '()) z3)) 'sat)
+  (scope_close within)
+  (close_session s))

@@ -10,7 +10,7 @@
                      [make-toolchain make_toolchain]
                      [mlir-module? is_module]
                      [parse-module parse_module]
-                     [mlir-module-ir module_ir]
+                     [module-ir module_ir]
                      [mlir-module-irdl module_irdl]
                      [module-generic module_generic]
                      [parse-stock-module parse_stock_module]
@@ -22,7 +22,15 @@
 ;; The toolchain is captured when a module is created: subsequent environment
 ;; changes cannot silently switch compiler installations halfway through lowering.
 (struct toolchain (bin dialect-plugins pass-plugins))
-(struct mlir-module (ir irdl toolchain))
+;; A verified module. It is kept in MLIR's generic form, which is what one run
+;; of mlir-opt verifies and prints, what the SMT lowering reads, and what
+;; every later tool is given: the tools read either form and answer the same.
+;; The custom form, the text a person reads, is printed when it is first
+;; asked for (`module-ir`).
+(struct mlir-module (generic irdl toolchain [custom #:mutable]))
+
+(define generic-arguments
+  '("--verify-each" "--mlir-print-op-generic" "--mlir-print-local-scope" "--mlir-print-debuginfo"))
 
 (define (executable-name name)
   (if (eq? (system-type) 'windows) (string-append name ".exe") name))
@@ -212,39 +220,40 @@
   (unless (string? irdl) (raise-argument-error 'parse-module "string?" irdl))
   (unless (toolchain? chain) (raise-argument-error 'parse-module "toolchain?" chain))
   (define definitions (string->immutable-string irdl))
-  (mlir-module (run-tool chain "mlir-opt" source '("--verify-each" "--mlir-print-debuginfo") #:irdl definitions)
-               definitions chain))
+  (mlir-module (run-tool chain "mlir-opt" source generic-arguments #:irdl definitions)
+               definitions chain #f))
+
+;; The module's text in the custom form. Locations are printed, so the text
+;; says where each operation of the source was.
+(define (module-ir module)
+  (unless (mlir-module? module) (raise-argument-error 'module_ir "mlir-module?" module))
+  (or (mlir-module-custom module)
+      (let ([text (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-generic module)
+                            '("--verify-each" "--mlir-print-debuginfo")
+                            #:irdl (mlir-module-irdl module))])
+        (set-mlir-module-custom! module text)
+        text)))
 
 (define (run-passes module pipeline)
   (unless (mlir-module? module) (raise-argument-error 'run-passes "mlir-module?" module))
   (unless (string? pipeline) (raise-argument-error 'run-passes "string?" pipeline))
   (mlir-module
-   (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
-             (list "--verify-each" "--mlir-print-debuginfo"
-                   (string-append "--pass-pipeline=" pipeline))
+   (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-generic module)
+             (append generic-arguments (list (string-append "--pass-pipeline=" pipeline)))
              #:irdl (mlir-module-irdl module))
-   (mlir-module-irdl module) (mlir-module-toolchain module)))
+   (mlir-module-irdl module) (mlir-module-toolchain module) #f))
 
 ;; The verified module in MLIR's generic form, which the SMT lowering reads.
-;; Locations, attributes and types are printed in place, without aliases. It
-;; is asked for once per module, however many queries are lowered over it.
-(define generic-texts (make-weak-hasheq))
-
+;; Locations, attributes and types are printed in place, without aliases.
 (define (module-generic module)
   (unless (mlir-module? module) (raise-argument-error 'module_generic "mlir-module?" module))
-  (or (hash-ref generic-texts module #f)
-      (let ([text (run-tool (mlir-module-toolchain module) "mlir-opt" (mlir-module-ir module)
-                            '("--verify-each" "--mlir-print-op-generic" "--mlir-print-local-scope"
-                              "--mlir-print-debuginfo")
-                            #:irdl (mlir-module-irdl module))])
-        (hash-set! generic-texts module text)
-        text)))
+  (mlir-module-generic module))
 
 ;; Translation requires LLVM-translatable dialects. Lowering is deliberately
 ;; explicit: tensor, memref, vector, GPU, etc. need different pipelines.
 (define (to-llvm-ir module)
   (unless (mlir-module? module) (raise-argument-error 'to-llvm-ir "mlir-module?" module))
-  (run-tool (mlir-module-toolchain module) "mlir-translate" (mlir-module-ir module)
+  (run-tool (mlir-module-toolchain module) "mlir-translate" (mlir-module-generic module)
             '("--mlir-to-llvmir")))
 
 (define (to-bitcode module)
@@ -253,7 +262,7 @@
 
 (define (to-smtlib module)
   (unless (mlir-module? module) (raise-argument-error 'to-smtlib "mlir-module?" module))
-  (run-tool (mlir-module-toolchain module) "mlir-translate" (mlir-module-ir module)
+  (run-tool (mlir-module-toolchain module) "mlir-translate" (mlir-module-generic module)
             '("--export-smtlib")))
 
 ;; Verify with the stock tools only: no IRDL definitions and no plugins. This

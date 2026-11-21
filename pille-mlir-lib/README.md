@@ -172,13 +172,18 @@ handles only the example operation; a language must supply its own semantics.
 | --- | --- |
 | `Toolchain(~prefix: path = #false, ~dialect_plugins: paths = [], ~pass_plugins: paths = [])` | Captured installation and optional plugin paths |
 | `Module(source, ~irdl: definitions = "", ~toolchain: chain = Toolchain())` | Verified module |
-| `module.to_ir()` | Stored MLIR text; no subprocess |
+| `module.to_ir()` | The module's MLIR text in the custom form, printed by `mlir-opt` when first asked for and kept |
 | `module.run_passes(pipeline)` | New verified module retaining definitions/toolchain |
 | `module.to_llvm_ir()` | LLVM IR text; input must already be lowered |
 | `module.to_bitcode()` | LLVM bitcode as `ImmutableBytes`; input must already be lowered |
 | `module.to_smtlib()` | SMT-LIB text from exportable SMT operations |
 
 The SMT verification API is listed [below](#api-summary).
+
+A module is verified, and kept, in MLIR's generic form: one run of `mlir-opt`
+gives what every later step reads (passes, translation, the SMT lowering), and
+the tools answer the same from either form. `to_ir()` is the only thing that
+needs the custom form, so it alone pays for printing it.
 
 There are no native handles to dispose. Each operation uses a private temporary
 directory, invokes executables directly without a shell, and removes the

@@ -538,6 +538,8 @@ veneer Session(this :: satisfying(session.is_session)):
 //                           for every input that satisfies what is assumed
 //                           (vacuously, where nothing does), `Counterexample`
 //                           with inputs for which it does not
+//   scope.check_all([property, ...])
+//                           the same for each, their formulas lowered together
 //   scope.close()           ends the scope; the session takes other questions
 //                           again
 //
@@ -573,3 +575,13 @@ veneer Scope(this :: satisfying(query.is_scope)):
     let script = query.scope_goal_script(this, property)
     solver_outcome(query.scope_check(this, property, timeout), function, dialect, property.describe(),
                    assumptions, script, timeout)
+
+  // Several claims, each answered as `check` answers one, in order. Their
+  // formulas are lowered together, in one pass of the MLIR tools, so asking
+  // twelve claims costs about what asking one does. `~timeout` bounds each
+  // question. A timeout or a failure ends the scope, and the claims after it
+  // are answered `Failure` of kind `#'closed_session`.
+  method check_all(properties :: List.of(Formula), ~timeout: timeout :: PosReal = 10) :: List.of(Outcome):
+    let held = assumptions
+    for List (property :: Formula in properties, entry :: List in (query.scope_check_all(this, properties, timeout) :: List)):
+      solver_outcome(entry[1], function, dialect, property.describe(), held, entry[0], timeout)

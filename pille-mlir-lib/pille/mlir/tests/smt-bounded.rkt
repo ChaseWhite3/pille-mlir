@@ -150,6 +150,16 @@
   (define plain (query calls "thrice" (list a32) (lt r32 13)))
   (rejects #rx"a scope is open on this session" (lambda () (query_session_check s plain)))
   (rejects #rx"a scope is open on this session" (lambda () (make_smt_scope s arithmetic calls "thrice" (list a32))))
+  ;; several questions asked together are each answered as alone, in order, counterexamples included, and
+  ;; leave the scope as it was; no question is no answer
+  (define several (treelist->list (scope_check_all scope (list (lt r32 13) (lt r32 12) (is r32 9)))))
+  (check-equal? (for/list ([entry (in-list several)]) (solver_result_status (treelist-ref entry 1)))
+                (list (scope-status scope (lt r32 13)) (scope-status scope (lt r32 12)) (scope-status scope (is r32 9))))
+  (check-equal? (solver_result_values (treelist-ref (cadr several) 1))
+                (solver_result_values (scope_check scope (lt r32 12))))
+  (check-equal? (treelist->list (scope_assumptions scope)) '("a <u 0x0000000a:bv32"))
+  (check-equal? (treelist->list (scope_check_all scope '())) '())
+  (rejects #rx"check_all: expected a Boolean predicate" (lambda () (scope_check_all scope (list (lt r32 13) a32))))
   (scope_close scope)
   (check-false (scope_is_open scope))
   (rejects #rx"the scope is closed" (lambda () (scope_check scope (lt r32 13))))
@@ -293,6 +303,11 @@
     (define deepened
       (for/list ([count (in-range 1 (add1 depth))]) (solver_result_status (scope_check scope (never count) 60))))
     (check-equal? deepened fresh)
+    ;; asked together, their formulas lowered in one pass: the same answers, and each one's script, run by
+    ;; hand, gives its answer
+    (define together (treelist->list (scope_check_all scope (for/list ([count (in-range 1 (add1 depth))]) (never count)) 60)))
+    (check-equal? (for/list ([entry (in-list together)]) (solver_result_status (treelist-ref entry 1))) fresh)
+    (check-equal? (for/list ([entry (in-list together)]) (string->symbol (by-hand (treelist-ref entry 0)))) fresh)
     ;; under an assumption kept in the scope: with no disconnect said, the faulty machine is sound too
     (scope_assert scope (smt_and (for/list ([kind (in-list kinds)]) (smt_not (is kind disconnect)))))
     (check-equal? (for/list ([count (in-range 1 (add1 depth))]) (solver_result_status (scope_check scope (never count) 60)))

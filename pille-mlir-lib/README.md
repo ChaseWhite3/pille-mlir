@@ -524,13 +524,17 @@ session.close()
 | `scope.assert(formula)` | An assumption, for every question until its frame is popped |
 | `scope.push()`, `scope.pop()` | A new frame of assumptions, and its end |
 | `scope.check(property, ~timeout: seconds = 10)` | `Proved` where the property holds for every input satisfying what is assumed, `Counterexample` with inputs for which it does not |
+| `scope.check_all([property, ...], ~timeout: seconds = 10)` | The same for each claim, in order, their formulas lowered together |
 | `scope.assumptions`, `.inputs`, `.function`, `.dialect`, `.is_open` | What the scope holds |
 | `scope.close()` | Ends it; the session takes other questions again |
 
 Each question is asked in a frame of its own that is popped again, so it leaves
 the scope as it found it. Each lowers its formula over the function anew; what
 is saved is the solver's process and what it has learned of the assertions it
-holds. To deepen a bounded check, select a function that returns what each step
+holds. Where several claims are known at once, `check_all` lowers them in one
+pass of the tools, so twelve cost about what one does; a timeout or failure
+ends the scope, and the claims after it are a `Failure` of kind
+`#'closed_session`. To deepen a bounded check, select a function that returns what each step
 gives (a step function called once for each step), assert what holds
 throughout, and check one claim for each depth.
 
@@ -625,7 +629,7 @@ In `pille/mlir/smt`:
 | `Query`, `ObjectiveQuery`, `ValuesQuery` | One question; `to_smtlib()`, and `check(...)` on the first two |
 | `Spec`, `Batch`, `ValuesSpec`, `ValuesBatch` | Several questions lowered together |
 | `Session` | One solver process: `check`, `values`, `close` |
-| `Scope` | Kept assumptions in a session: `assert`, `push`, `pop`, `check`, `close` |
+| `Scope` | Kept assumptions in a session: `assert`, `push`, `pop`, `check`, `check_all`, `close` |
 | `Outcome` | What every answer is: `Proved`, `Counterexample`, `Infeasible`, `Optimum`, `Unknown`, `Timeout`, `Failure` |
 | `Assignment(name, width, value)` | One input of a counterexample or an optimum |
 | `Values(values, complete)` | A result's possible values |

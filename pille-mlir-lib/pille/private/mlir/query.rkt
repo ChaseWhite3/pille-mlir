@@ -20,7 +20,7 @@
          make_smt_objective objective_check objective_inputs objective_assumptions objective_value
          objective_session_check
          make_smt_scope scope_assert scope_push scope_pop scope_check scope_close scope_is_open
-         scope_inputs scope_assumptions scope_goal_script
+         scope_inputs scope_assumptions scope_goal_script scope_check_all
          render_term render_formula
          make_smt_query
          smt_lower_text
@@ -736,6 +736,36 @@
 (define (scope_check value property [timeout 10])
   (session_scope_check (scope-session value) (scope-goal value property)
                        (expected-inputs (scope-inputs value)) timeout))
+
+;; Several questions, each as `scope_check` asks one, their formulas lowered
+;; together: one pass of the tools for all of them, where asking them one at a
+;; time takes a pass each. Gives each question's script and answer, in order.
+;; A question the scope did not live to be asked (an earlier one ended its
+;; solver) is answered 'closed-session.
+(define (scope_check_all value properties [timeout 10])
+  (define claims (entries 'check_all properties))
+  (for ([claim (in-list claims)]) (check-formula 'check_all claim))
+  (define goals
+    (if (null? claims)
+        '()
+        (for/list ([member (in-list (batch-queries
+                                     (make-batch (scope-dialect value) (scope-module value)
+                                                 (for/list ([claim (in-list claims)])
+                                                   (make_spec (scope-function value) (scope-inputs value) claim '()))
+                                                 #f)))])
+          (assertions-of (query-smtlib member)))))
+  (define held
+    (string-append "(set-logic QF_BV)\n" (scope-declarations value)
+                   (apply string-append (map cdr (scope-assumed value)))))
+  (define expected (expected-inputs (scope-inputs value)))
+  (list->treelist
+   (for/list ([goal (in-list goals)])
+     (treelist (string->immutable-string (string-append held goal "(check-sat)\n"))
+               (if (scope_is_open value)
+                   (session_scope_check (scope-session value) goal expected timeout)
+                   (solver-result 'closed-session '()
+                                  "the scope's solver ended on an earlier question of this list"
+                                  '() 0.0))))))
 
 (define (scope_inputs value)
   (list->treelist (for/list ([input (in-list (scope-inputs value))])

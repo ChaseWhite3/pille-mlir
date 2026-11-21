@@ -271,6 +271,16 @@ block:
   check scope.check(smt.eq(result, smt.const(4, ~width: 32))) ~is_a smt.Proved
   scope.pop()
   check scope.check(smt.eq(result, smt.const(4, ~width: 32))) ~is_a smt.Counterexample
+  // several claims asked together, in order
+  match scope.check_all([smt.ult(result, smt.const(11, ~width: 32)), smt.ult(result, smt.const(10, ~width: 32))])
+  | [proved, refuted :: smt.Counterexample]:
+      check proved ~is_a smt.Proved
+      check (for List (a in refuted.values): [a.name, a.value]) ~is [["x", 9]]
+      check refuted.property ~is "result <u 0x0000000a:bv32"
+      check refuted.assumptions ~is ["x <u 0x0000000a:bv32"]
+  | other:
+      check other ~is "a proof and a counterexample"
+  check scope.check_all([]) ~is []
   check scope.pop() ~throws "nothing was pushed on this scope"
   // the session takes nothing else while the scope is open
   check session.check(guarded) ~throws "a scope is open on this session"

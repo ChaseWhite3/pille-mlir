@@ -19,6 +19,8 @@
          run_solver_objective
          core-options
          parse-core
+         keeping-named
+         shrink-core
          (rename-out [solver-result? is_solver_result]
                      [solver-result-status solver_result_status]
                      [solver-result-values solver_result_values]
@@ -329,8 +331,9 @@
        (lambda () (delete-directory/files directory #:must-exist? #f)))]))
 
 ;; What a solver needs before its first assertion to report which named
-;; assertions cannot hold together, and to report a set none of which can be
-;; left out (minimal as the solver minimizes it, not necessarily smallest).
+;; assertions cannot hold together. The solver's minimizing is asked for, but
+;; is its best effort: `shrink-core` is what makes a core one none of whose
+;; names can be left out.
 (define core-options
   "(set-option :produce-unsat-cores true)\n(set-option :smt.core.minimize true)\n")
 
@@ -344,9 +347,46 @@
              (substring name 1 (sub1 (string-length name)))
              name))))
 
+;; `script` without the assertions that are named, other than those named in
+;; `keep`. Everything else stands as it was: options, declarations, assertions
+;; without a name, and the commands after them.
+(define (keeping-named script keep)
+  (define out (open-output-string))
+  (define end
+    (for/fold ([previous 0]) ([entry (in-list (smtlib-commands script))])
+      (define name
+        (match (car entry)
+          [(list "assert" (list "!" _ ":named" (? string? name))) (car (parse-core (list name)))]
+          [_ #f]))
+      (unless (and name (not (member name keep)))
+        (write-string (substring script previous (cdr entry)) out))
+      (cdr entry)))
+  (write-string (substring script end) out)
+  (get-output-string out))
+
+;; A solver's core is a set that cannot hold together, and may name more than
+;; is needed. This leaves each name out in turn and asks again: where the rest
+;; still cannot hold together, the name was not needed. `ask` takes the names
+;; to keep and gives the core of that question where it is unsatisfiable, #f
+;; where it is not or was not decided (the name is then kept, so the answer is
+;; always a set that cannot hold together). Where every question was decided,
+;; no name of the result can be left out. The solver's order is kept.
+(define (shrink-core names ask)
+  (for/fold ([core names]) ([name (in-list names)])
+    (cond
+      [(not (member name core)) core]
+      [else
+       (define rest (remove name core))
+       (define smaller (ask rest))
+       (if smaller
+           (filter (lambda (kept) (member kept smaller)) rest)
+           core)])))
+
 ;; Runs a feasibility script: named assertions, (check-sat), (get-unsat-core).
-;; Status 'infeasible carries the core's names; 'feasible means the assertions
-;; can hold together (the core request then fails, which is not an error here).
+;; Status 'infeasible carries the core's names, shrunk until none can be left
+;; out (`shrink-core`; each further question is a run of the solver, within
+;; the same bound); 'feasible means the assertions can hold together (the core
+;; request then fails, which is not an error here).
 (define (run_solver_core smtlib [executable #f] [timeout 10] [arguments '()])
   (unless (string? smtlib) (raise-argument-error 'run_solver_core "string?" smtlib))
   (define extra (text-list 'run_solver_core arguments))
@@ -368,22 +408,34 @@
      (dynamic-wind
        void
        (lambda ()
-         (define-values (state code stdout stderr)
-           (run-script solver extra directory "feasibility" smtlib deadline))
-         (define forms
-           (with-handlers ([exn:fail? (lambda (_error) #f)]) (map car (smtlib-commands stdout))))
+         (define (attempt script)
+           (define-values (state code stdout stderr)
+             (run-script solver extra directory "feasibility" script deadline))
+           (define forms
+             (with-handlers ([exn:fail? (lambda (_error) #f)]) (map car (smtlib-commands stdout))))
+           (cond
+             [(eq? state 'failed) (result 'missing-executable '() (format "cannot run the solver: ~a" stderr))]
+             [(eq? state 'timeout)
+              (result 'timeout '() (format "the solver did not answer within ~a seconds and was terminated" timeout))]
+             [(not (and forms (pair? forms)))
+              (result 'malformed-response '() "expected sat, unsat, or unknown from the feasibility check" stdout stderr)]
+             [(equal? (car forms) "sat") (result 'feasible '())]
+             [(equal? (car forms) "unknown") (result 'unknown '())]
+             [(and (equal? (car forms) "unsat") (pair? (cdr forms)) (parse-core (cadr forms)))
+              => (lambda (names) (result 'infeasible names))]
+             [else
+              (result 'malformed-response '() "the solver answered unsat, but its unsat core was malformed" stdout stderr)]))
+         (define first (attempt smtlib))
          (cond
-           [(eq? state 'failed) (result 'missing-executable '() (format "cannot run the solver: ~a" stderr))]
-           [(eq? state 'timeout)
-            (result 'timeout '() (format "the solver did not answer within ~a seconds and was terminated" timeout))]
-           [(not (and forms (pair? forms)))
-            (result 'malformed-response '() "expected sat, unsat, or unknown from the feasibility check" stdout stderr)]
-           [(equal? (car forms) "sat") (result 'feasible '())]
-           [(equal? (car forms) "unknown") (result 'unknown '())]
-           [(and (equal? (car forms) "unsat") (pair? (cdr forms)) (parse-core (cadr forms)))
-            => (lambda (names) (result 'infeasible names))]
-           [else
-            (result 'malformed-response '() "the solver answered unsat, but its unsat core was malformed" stdout stderr)]))
+           [(eq? (solver-result-status first) 'infeasible)
+            (result 'infeasible
+                    (shrink-core (solver-result-values first)
+                                 (lambda (keep)
+                                   (and (< (current-inexact-milliseconds) deadline)
+                                        (let ([again (attempt (keeping-named smtlib keep))])
+                                          (and (eq? (solver-result-status again) 'infeasible)
+                                               (solver-result-values again)))))))]
+           [else first]))
        (lambda () (delete-directory/files directory #:must-exist? #f)))]))
 
 ;; Runs an objective script: assertions, (minimize s) or (maximize s),

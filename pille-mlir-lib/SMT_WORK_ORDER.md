@@ -109,8 +109,9 @@ the policy above is unchanged, and so is everything a query could say before):
   `mul` still wrap.
 - `precondition(formula, ~named: name)`, and the outcome `Infeasible(core)`
   where a query's named preconditions cannot hold together. The core is
-  minimal as Z3 minimizes it. A query with no named precondition is as before:
-  inconsistent preconditions prove vacuously.
+  shrunk until no name of it can be left out (Z3's own minimizing is its
+  best effort). A query with no named precondition is as before: inconsistent
+  preconditions prove vacuously.
 - `Dialect.smt_objective(..., ~minimize: term)` or `~maximize:`, unsigned or
   `~signed`, with the outcome `Optimum(value, values)`. MLIR's SMT dialect has
   no objective; Z3's `minimize`/`maximize` is written into the exported

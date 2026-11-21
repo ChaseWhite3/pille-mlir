@@ -198,12 +198,16 @@ class Proved():
 
 // The query's named preconditions cannot hold together, so there is nothing
 // its property is about. `core` names a set of them whose conjunction no input
-// satisfies, as the solver reported it with core minimization on: none of them
-// can be left out, though a different or smaller set may also be unsatisfiable.
+// satisfies. None of them can be left out: a solver may name more than is
+// needed, so each name of its core is left out in turn and the question asked
+// again, and a name without which the rest still cannot hold together is
+// dropped. (A further question that the solver does not decide in time keeps
+// its name.) A different set, or a smaller one, may also be unsatisfiable.
 // Preconditions without a name are part of what was asked but are never
 // named, so `core` may be empty where they alone conflict. `smtlib` is the
 // feasibility question: the preconditions, `(check-sat)` and
-// `(get-unsat-core)`. A query none of whose preconditions is named is never
+// `(get-unsat-core)`; run by hand it answers `unsat`, and its core is the
+// solver's own, which holds every name of `core` and may hold more. A query none of whose preconditions is named is never
 // `Infeasible`: inconsistent ones make it `Proved`, vacuously, as before.
 class Infeasible(core :: List.of(String)):
   extends Outcome

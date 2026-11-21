@@ -457,9 +457,15 @@ def outcome:
 // smt.Infeasible, with outcome.core holding "page.md:22" and "page.md:31"
 ```
 
-The solver is given `produce-unsat-cores` and `smt.core.minimize`, so a core
-holds no name that could be left out; it is minimal as Z3 minimizes it, and a
-different or smaller conflicting set may exist. Preconditions without a name
+A core holds no name that could be left out. The solver is asked to minimize
+its core (`smt.core.minimize`), but that is its best effort, and it may name
+more than is needed. So each name of the solver's core is left out in turn and
+the question asked again; a name without which the rest still cannot hold
+together is dropped. That costs at most one further question for each name
+the solver gave, and only where the answer is `Infeasible`. A further question
+the solver does not decide within the bound keeps its name, so a core is
+always a set that cannot hold together. A different conflicting set, or a
+smaller one, may exist. Preconditions without a name
 are asserted but never named, so a core may be empty where they alone conflict.
 A query none of whose preconditions is named is unchanged: it has no
 feasibility question, and inconsistent preconditions make it `Proved`. `Proved`

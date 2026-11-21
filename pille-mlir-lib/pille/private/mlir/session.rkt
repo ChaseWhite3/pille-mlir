@@ -316,23 +316,48 @@
 ;; question to the next, and its usual options are put back. The answer is
 ;; 'infeasible with the core's names, 'feasible, or a failure as any check's.
 (define (core/internal s body timeout overall-deadline)
+  ;; 'unsat with the core's names, or another status with none
+  (define (ask body deadline)
+    (define status
+      (answer s (string-append "(reset)\n(set-option :print-success false)\n" core-options
+                               "(set-logic QF_BV)\n" (timeout-option timeout) body "\n(check-sat)")
+              deadline))
+    (values status
+            (and (eq? status 'unsat)
+                 (let* ([response (exchange s "(get-unsat-core)" deadline)]
+                        [forms (with-handlers ([exn:fail? (lambda (_) #f)]) (map car (smtlib-commands response)))]
+                        [names (and forms (= (length forms) 1) (parse-core (car forms)))])
+                   (unless names (protocol-error 'malformed-response "malformed get-unsat-core response: ~a" response))
+                   names))))
   (run-protected
    s timeout overall-deadline
    (lambda (deadline result)
-     (define status
-       (answer s (string-append "(reset)\n(set-option :print-success false)\n" core-options
-                                "(set-logic QF_BV)\n" (timeout-option timeout) body "\n(check-sat)")
-               deadline))
-     (define names
-       (and (eq? status 'unsat)
-            (let* ([response (exchange s "(get-unsat-core)" deadline)]
-                   [forms (with-handlers ([exn:fail? (lambda (_) #f)]) (map car (smtlib-commands response)))]
-                   [names (and forms (= (length forms) 1) (parse-core (car forms)))])
-              (unless names (protocol-error 'malformed-response "malformed get-unsat-core response: ~a" response))
-              names)))
-     (expect-empty s (string-append "(reset)\n" session-options) deadline)
+     (define-values (status names) (ask body deadline))
+     ;; The core, shrunk until no name can be left out (solver.rkt
+     ;; `shrink-core`). Each further question has the bound a question has.
+     ;; One that fails or is not answered in time ends the solver's process,
+     ;; which the next question starts again, and the shrinking with it: the
+     ;; preconditions are known not to hold together, and that stays the
+     ;; answer, with the names not yet shown to be unneeded kept.
+     (define alive? #t)
+     (define shrunk
+       (and names
+            (shrink-core
+             names
+             (lambda (keep)
+               (and alive?
+                    (with-handlers ([exn:fail? (lambda (_error) (set! alive? #f) (stop! s) #f)])
+                      (define-values (again smaller)
+                        (ask (keeping-named body keep)
+                             (min (+ (current-inexact-monotonic-milliseconds) (* timeout 1000.0)) overall-deadline)))
+                      (and (eq? again 'unsat) smaller)))))))
+     (when alive?
+       (expect-empty s (string-append "(reset)\n" session-options)
+                     (if names
+                         (min (+ (current-inexact-monotonic-milliseconds) (* timeout 1000.0)) overall-deadline)
+                         deadline)))
      (case status
-       [(unsat) (result 'infeasible names)]
+       [(unsat) (result 'infeasible shrunk)]
        [(sat) (result 'feasible)]
        [else (result status '() "the solver did not decide whether the named preconditions can hold together")]))))
 

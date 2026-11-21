@@ -252,7 +252,7 @@
 ;; A5. Named preconditions and unsat cores
 
 ;; What `z3` prints for a script, run by hand: no option but the file.
-(define (by-hand script)
+(define (by-hand script [z3 z3])
   (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
   (dynamic-wind
     void
@@ -313,6 +313,103 @@
   (define answers (treelist->list (batch_check batch z3)))
   (check-equal? (map solver_result_status answers) '(infeasible sat infeasible unsat))
   (check-equal? (core-of (first answers)) '("event-phases.md:22" "event-phases.md:31")))
+
+;; Z3, answering every (get-unsat-core) with all the names asserted, which is
+;; a set that cannot hold together and more than is needed: the worst a solver
+;; may answer. Given a file, it runs it; given -in, it passes lines both ways.
+(define (padding-solver directory)
+  (define executable (build-path directory "padding z3"))
+  (define python (or (find-executable-path "python3") (error 'smt-synthesis "python3 is required for the padding solver")))
+  (call-with-output-file executable #:exists 'truncate
+    (lambda (output)
+      (fprintf output "#!~a\nz3 = ~s\n" python (if (path? z3) (path->string z3) z3))
+      (display #<<PY
+import re, subprocess, sys, threading
+named = re.compile(r':named\s+(\|[^|]*\||[^\s()]+)')
+if sys.argv[-1] != '-in':
+    text = open(sys.argv[-1]).read()
+    out = subprocess.run([z3] + sys.argv[1:], capture_output=True, text=True).stdout.splitlines()
+    if len(out) > 1 and out[0] == 'unsat':
+        out[1] = '(' + ' '.join(named.findall(text)) + ')'
+    print('\n'.join(out))
+    sys.exit(0)
+child = subprocess.Popen([z3] + sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+names, awaited = [], [False]
+def answers():
+    for line in child.stdout:
+        if awaited[0] and line.startswith('('):
+            awaited[0] = False
+            line = '(' + ' '.join(names) + ')\n'
+        sys.stdout.write(line)
+        sys.stdout.flush()
+threading.Thread(target=answers, daemon=True).start()
+for line in sys.stdin:
+    if line.strip() == '(reset)':
+        del names[:]
+    names.extend(named.findall(line))
+    if line.strip() == '(get-unsat-core)':
+        awaited[0] = True
+    child.stdin.write(line)
+    child.stdin.flush()
+child.stdin.close()
+child.wait()
+PY
+               output)))
+  (file-or-directory-permissions executable #o755)
+  executable)
+
+(test-case "a core is shrunk until no name can be left out, whatever the solver named"
+  (define r32 (smt_result 32))
+  (define early (smt_named (smt_cmp 'ult a32 (smt_const 10 32)) "initial"))
+  (define late (smt_named (smt_cmp 'ugt a32 (smt_const 20 32)) "claim"))
+  (define aside (smt_named (smt_cmp 'ult b32 (smt_const 100 32)) "escalation"))
+  (define other (smt_named (smt_cmp 'ugt b32 (smt_const 3 32)) "re-escalation"))
+  (define value (query sums "sum" (list a32 b32) (smt_eq r32 r32) (list aside early other late)))
+  (define directory (make-temporary-file "pille padding solver ~a" 'directory))
+  (define padded (padding-solver directory))
+  ;; the padding solver does name all four
+  (check-equal? (by-hand (query_feasibility value) padded) "unsat\n(|escalation| |initial| |re-escalation| |claim|)")
+  ;; and the answer names the two that conflict: standalone, on a session, in a batch
+  (check-equal? (core-of (query_check value padded)) '("claim" "initial"))
+  (define s (make_session padded))
+  (check-equal? (core-of (query_session_check s value)) '("claim" "initial"))
+  ;; the session's solver is as it was after the further questions
+  (check-eq? (solver_result_status (query_session_check s (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32)))) 'sat)
+  (check-equal? (core-of (query_session_check s value)) '("claim" "initial"))
+  (close_session s)
+  (define batch
+    (make_smt_batch arithmetic sums (list (make_spec "sum" (list a32 b32) (smt_eq r32 r32) (list aside early other late))
+                                          (make_spec "sum" (list a32 b32) (smt_cmp 'uge r32 a32)))))
+  (check-equal? (core-of (car (treelist->list (batch_check batch padded)))) '("claim" "initial"))
+  ;; an objective's too
+  (check-equal? (core-of (objective_check (make_smt_objective arithmetic sums "sum" (list a32 b32) a32 'minimize #f
+                                                              (list aside early other late))
+                                          padded))
+                '("claim" "initial"))
+  ;; one name that conflicts with what has no name is the whole core, and where what has no name conflicts
+  ;; alone, no name is blamed
+  (define alone
+    (query sums "sum" (list a32 b32) (smt_eq r32 r32) (list aside early other (smt_cmp 'ugt a32 (smt_const 20 32)))))
+  (check-equal? (core-of (query_check alone padded)) '("initial"))
+  (define unnamed
+    (query sums "sum" (list a32 b32) (smt_eq r32 r32)
+           (list aside (smt_cmp 'ult a32 (smt_const 10 32)) other (smt_cmp 'ugt a32 (smt_const 20 32)))))
+  (check-equal? (core-of (query_check unnamed padded)) '())
+  ;; two ways to conflict: one of them is left, whole
+  (define twice
+    (query sums "sum" (list a32 b32) (smt_eq r32 r32)
+           (list early late aside (smt_named (smt_cmp 'ugt b32 (smt_const 200 32)) "auto-disconnect"))))
+  (check-not-false (member (core-of (query_check twice padded)) '(("claim" "initial") ("auto-disconnect" "escalation"))))
+  (delete-directory/files directory #:must-exist? #f)
+  ;; the pieces: a script without the named assertions not kept, everything else as it was
+  (define script "(set-logic QF_BV)\n(declare-const a (_ BitVec 8))\n(assert (! (= a #x01) :named |one name|))\n(assert (= a a))\n(assert (! (= a #x02) :named two))\n(check-sat)\n(get-unsat-core)\n")
+  (check-equal? (keeping-named script '("one name" "two")) script)
+  (check-equal? (keeping-named script '("two"))
+                "(set-logic QF_BV)\n(declare-const a (_ BitVec 8))\n(assert (= a a))\n(assert (! (= a #x02) :named two))\n(check-sat)\n(get-unsat-core)\n")
+  ;; a question that is not decided keeps its name: the core is still one that cannot hold together
+  (check-equal? (shrink-core '("a" "b" "c") (lambda (keep) #f)) '("a" "b" "c"))
+  ;; and a smaller core the solver gives on the way is taken
+  (check-equal? (shrink-core '("a" "b" "c" "d") (lambda (keep) (and (member "d" keep) '("d")))) '("d")))
 
 (test-case "named preconditions that can hold together change nothing but the text"
   (define r32 (smt_result 32))

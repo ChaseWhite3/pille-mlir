@@ -113,6 +113,18 @@
       (query_smtlib asked)))
   (check-equal? (text-in 'direct) (text-in 'tools))
   (check-equal? (text-in 'direct) (text-in 'both))
+  ;; where no tool ran the lowering wrote no SMT operations; asked for, the module is lowered then, and is
+  ;; the one the tools were given: a query's, and each member's of a batch
+  (define (modules-in mode)
+    (parameterize ([smt_export_mode mode])
+      (define specs (list (make_spec "thrice" (list a32) (smt_eq r32 (smt_binary 'add a32 (smt_const 3 32))) '())
+                          (make_spec "nested" (list a32 b32) (smt_eq (smt_result_at 0 32) a32) '())))
+      (define batch (make_smt_batch arithmetic calls specs))
+      (cons (module_ir (query_module (query calls "thrice" (list a32) (smt_eq r32 a32))))
+            (cons (module_ir (batch_module batch))
+                  (for/list ([member (in-treelist (batch_queries batch))]) (module_ir (query_module member)))))))
+  (check-equal? (modules-in 'direct) (modules-in 'tools))
+  (check-equal? (length (modules-in 'direct)) 4)
   (check-exn #rx"smt_export_mode" (lambda () (smt_export_mode 'neither))))
 
 (test-case "a call that cannot be inlined is refused, naming it"

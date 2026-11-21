@@ -449,14 +449,34 @@
 ;; The lowering is `lower.rhm`, over the module's generic form. It returns the
 ;; module of solvers and each solver as a module of its own, each a promise of
 ;; its text, and the SMT-LIB of each solver as the exporter writes it.
-(define (run-lowering module manifest)
-  (define-values (text members smtlib)
-    (if (string? manifest)
-        (lower_text (module_generic module) manifest)
-        (lower (module_generic module) manifest)))
-  (values (delay/sync (text))
-          (for/list ([member (in-treelist members)]) (delay/sync (member)))
-          (treelist->list smtlib)))
+;;
+;; Where the SMT-LIB alone is used (`smt_export_mode` 'direct), the lowering is
+;; quiet: it does not write the SMT dialect operations at all, and a promise,
+;; forced, lowers again aloud. In 'both the quiet text is held to the loud one.
+(define (run-lowering module manifest [quiet? (eq? (export-mode) 'direct)])
+  (define generic (module_generic module))
+  (define (lowered quiet?)
+    (define-values (text members smtlib)
+      (if (string? manifest)
+          (lower_text generic manifest quiet?)
+          (lower generic manifest quiet?)))
+    (list text members (treelist->list smtlib)))
+  (cond
+    [quiet?
+     (define scripts (caddr (lowered #t)))
+     (define aloud (delay/sync (lowered #f)))
+     (values (delay/sync ((car (force aloud))))
+             (for/list ([index (in-range (length scripts))])
+               (delay/sync ((treelist-ref (cadr (force aloud)) index))))
+             scripts)]
+    [else
+     (define aloud (lowered #f))
+     (when (eq? (export-mode) 'both)
+       (unless (equal? (caddr (lowered #t)) (caddr aloud))
+         (builder-error 'smt_query "internal error: the quiet lowering's SMT-LIB is not the loud one's")))
+     (values (delay/sync ((car aloud)))
+             (for/list ([member (in-treelist (cadr aloud))]) (delay/sync (member)))
+             (caddr aloud))]))
 
 ;; How a lowered question becomes SMT-LIB.
 ;;   'direct  the lowering's own text. No tool runs; the lowered module is
@@ -502,14 +522,14 @@
 (define (smt_lower_text module manifest)
   (unless (is_module module) (raise-argument-error 'smt_lower_text "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_text "string?" manifest))
-  (define-values (text _members _smtlib) (run-lowering module manifest))
+  (define-values (text _members _smtlib) (run-lowering module manifest #f))
   (force text))
 
 ;; The same, giving the SMT-LIB the lowering itself writes: no tool runs.
 (define (smt_lower_smtlib module manifest)
   (unless (is_module module) (raise-argument-error 'smt_lower_smtlib "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_smtlib "string?" manifest))
-  (define-values (_text _members smtlib) (run-lowering module manifest))
+  (define-values (_text _members smtlib) (run-lowering module manifest #t))
   (string->immutable-string (apply string-append smtlib)))
 
 ;; The lowering asserts a query's preconditions first, one assertion each, in
@@ -760,7 +780,7 @@
         (spec-manifest description)
         (hash-set (hash-remove (hash-remove (spec-manifest description) 'result_symbol) 'defined_symbol)
                   'mode "assume")))
-  (assertions-of (scope_lower (scope-context value) manifest)))
+  (string->immutable-string (scope_lower (scope-context value) manifest)))
 
 (define (scope-result who answer)
   (unless (eq? (solver_result_status answer) 'ok)

@@ -41,3 +41,25 @@ assumes it. With the definitions' operands written in the wrong order, three of 
 ## Documentation
 
 `pille-mlir-lib/README.md`, "Scopes". The Scribble manual has nothing on `pille/mlir`.
+
+## Addendum: what a question no longer does
+
+A profile after the above showed fixed work for every question, none of it the solver's. Removed the same day:
+
+- Where the SMT-LIB alone is used (`direct`), the lowering is quiet: it does not write the SMT dialect operations
+  at all. `Query.module`, `Batch.module` and a batch member's module lower again, aloud, when first asked for, and
+  are the modules the tools route gives (tested). In `both` the quiet lowering's text is held to the loud one's.
+- A question in a scope is written as its assertions alone and used as written: no declarations to write, and
+  no reading the text back for its assertions. The inputs are not registered again for each question.
+- A function's argument and result types are read once for a context.
+
+| stepped machine, cache off | 12 steps | 48 steps |
+| --- | --- | --- |
+| build a query, before | 6.3 ms | 13 ms |
+| build a query, now | 2.4 ms | 11 ms |
+| deepen 1 to depth with `check_all`, before | 6 ms | 79 ms |
+| deepen 1 to depth with `check_all`, now | 6 ms | 66 ms |
+
+At 48 steps, lowering the 48 claims is now at most 11 ms of the 66; the rest is the solver answering 48 questions,
+about a millisecond each. What a single query of a 48-step function costs to build, 11 ms, is the lowering of its
+body.

@@ -131,7 +131,17 @@ class Context(module :: generic.Module,
               manifest :: Map,
               lowered :: MutableMap,
               mutable models :: maybe(Map),
-              mutable unmodeled :: Set)
+              mutable unmodeled :: Set,
+              // Quiet: the SMT dialect operations are not written, only the
+              // SMT-LIB. A caller that wants the module lowers again, aloud.
+              quiet :: Boolean = #false,
+              // In a scope the body is the solver's already (`scope_begin`):
+              // a question is written as its assertions alone.
+              mutable scoped :: Boolean = #false,
+              // and the names its inputs have, which a `let` passes over
+              mutable taken :: maybe(Set) = #false,
+              // each function's argument and result types, read once
+              types :: MutableMap = MutableMap())
 
 class Spec(function :: String,
            inputs :: List.of(Bv),
@@ -217,9 +227,11 @@ fun quoted(text :: String) :: String:
       | ~else: "\\" ++ to_string(digits[byte div 16]) ++ to_string(digits[byte mod 16])
   "\"" ++ String.append(& parts) ++ "\""
 
-fun emit(q :: Query, text :: String, loc :: String):
-  let suffix = if loc == "" | "" | " " ++ loc
-  q.lines := q.lines.add("    " ++ text ++ suffix)
+// `text` is a function that gives the operation: where the lowering is quiet
+// it is never written.
+fun emit(q :: Query, text :~ Function, loc :: String):
+  unless q.context.quiet
+  | q.lines := q.lines.add("    " ++ text() ++ (if loc == "" | "" | " " ++ loc))
 
 fun fresh(q :: Query) :: String:
   let name = "%" ++ digits(q.next)
@@ -257,22 +269,22 @@ fun declaration(name :: String, display :: String, width :: Int, loc :: String) 
 
 fun declare_fun(q :: Query, display :: String, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
-  q.lines := q.lines.add(declaration(name, display, width, loc))
+  unless q.context.quiet
+  | q.lines := q.lines.add(declaration(name, display, width, loc))
   declared(q, name, display, width)
   Bv(name, width)
 
 fun bv_constant(q :: Query, value :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(width)
-  emit(q, name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" ++ digits(value) ++ "> : " ++ type ++ "}> : () -> " ++ type, loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" ++ digits(value) ++ "> : " ++ type ++ "}> : () -> " ++ type), loc)
   q.leaves := q.leaves ++ {name: literal(value, width)}
   Bv(name, width)
 
 fun bv_binary(q :: Query, operation :: String, lhs :: Bv, rhs :: Bv, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(lhs.width)
-  emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
-            ++ ") -> " ++ type, loc)
+  emit(q, fun (): (name ++ " = \"" ++ operation ++ "\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type ++ ") -> " ++ type), loc)
   // smt.bv.add is bvadd, and so for each
   define(q, name, "bv" ++ operation.substring(7, operation.length()), [lhs.name, rhs.name], lhs.width)
   Bv(name, lhs.width)
@@ -280,23 +292,21 @@ fun bv_binary(q :: Query, operation :: String, lhs :: Bv, rhs :: Bv, loc :: Stri
 fun bv_neg(q :: Query, input :: Bv, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(input.width)
-  emit(q, name ++ " = \"smt.bv.neg\"(" ++ input.name ++ ") : (" ++ type ++ ") -> " ++ type, loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.neg\"(" ++ input.name ++ ") : (" ++ type ++ ") -> " ++ type), loc)
   define(q, name, "bvneg", [input.name], input.width)
   Bv(name, input.width)
 
 fun bv_eq(q :: Query, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
   let name = fresh(q)
   let type = bv_type(lhs.width)
-  emit(q, name ++ " = \"smt.eq\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
-            ++ ") -> !smt.bool", loc)
+  emit(q, fun (): (name ++ " = \"smt.eq\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type ++ ") -> !smt.bool"), loc)
   define(q, name, "=", [lhs.name, rhs.name], 0)
   name
 
 fun bv_ite(q :: Query, test :: String, chosen :: Bv, otherwise :: Bv, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(chosen.width)
-  emit(q, name ++ " = \"smt.ite\"(" ++ test ++ ", " ++ chosen.name ++ ", " ++ otherwise.name ++ ") : (!smt.bool, "
-            ++ type ++ ", " ++ type ++ ") -> " ++ type, loc)
+  emit(q, fun (): (name ++ " = \"smt.ite\"(" ++ test ++ ", " ++ chosen.name ++ ", " ++ otherwise.name ++ ") : (!smt.bool, " ++ type ++ ", " ++ type ++ ") -> " ++ type), loc)
   define(q, name, "ite", [test, chosen.name, otherwise.name], chosen.width)
   Bv(name, chosen.width)
 
@@ -307,8 +317,7 @@ def cmp_heads :: List.of(String) = ["bvslt", "bvsle", "bvsgt", "bvsge", "bvult",
 fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
   let name = fresh(q)
   let type = bv_type(lhs.width)
-  emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " ++ digits(predicate) ++ " : i64}> : ("
-            ++ type ++ ", " ++ type ++ ") -> !smt.bool", loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " ++ digits(predicate) ++ " : i64}> : (" ++ type ++ ", " ++ type ++ ") -> !smt.bool"), loc)
   define(q, name, cmp_heads[predicate], [lhs.name, rhs.name], 0)
   name
 
@@ -319,23 +328,20 @@ fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) ::
 fun bv_concat(q :: Query, high :: Bv, low :: Bv, loc :: String) :: Bv:
   let name = fresh(q)
   let width = high.width + low.width
-  emit(q, name ++ " = \"smt.bv.concat\"(" ++ high.name ++ ", " ++ low.name ++ ") : (" ++ bv_type(high.width) ++ ", "
-            ++ bv_type(low.width) ++ ") -> " ++ bv_type(width), loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.concat\"(" ++ high.name ++ ", " ++ low.name ++ ") : (" ++ bv_type(high.width) ++ ", " ++ bv_type(low.width) ++ ") -> " ++ bv_type(width)), loc)
   define(q, name, "concat", [high.name, low.name], width)
   Bv(name, width)
 
 fun bv_extract(q :: Query, input :: Bv, low_bit :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
-  emit(q, name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " ++ digits(low_bit) ++ " : i32}> : ("
-            ++ bv_type(input.width) ++ ") -> " ++ bv_type(width), loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " ++ digits(low_bit) ++ " : i32}> : (" ++ bv_type(input.width) ++ ") -> " ++ bv_type(width)), loc)
   define(q, name, "(_ extract " +& (low_bit + width - 1) +& " " +& low_bit +& ")", [input.name], width)
   Bv(name, width)
 
 fun bv_repeat(q :: Query, input :: Bv, count :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   let width = input.width * count
-  emit(q, name ++ " = \"smt.bv.repeat\"(" ++ input.name ++ ") : (" ++ bv_type(input.width) ++ ") -> "
-            ++ bv_type(width), loc)
+  emit(q, fun (): (name ++ " = \"smt.bv.repeat\"(" ++ input.name ++ ") : (" ++ bv_type(input.width) ++ ") -> " ++ bv_type(width)), loc)
   define(q, name, "(_ repeat " +& count +& ")", [input.name], width)
   Bv(name, width)
 
@@ -376,21 +382,20 @@ fun bit_bool(q :: Query, bit :: Bv, loc :: String) :: String:
 
 fun bool_not(q :: Query, input :: String, loc :: String) :: String:
   let name = fresh(q)
-  emit(q, name ++ " = \"smt.not\"(" ++ input ++ ") : (!smt.bool) -> !smt.bool", loc)
+  emit(q, fun (): (name ++ " = \"smt.not\"(" ++ input ++ ") : (!smt.bool) -> !smt.bool"), loc)
   define(q, name, "not", [input], 0)
   name
 
 fun bool_connective(q :: Query, operation :: String, operands :: List.of(String), loc :: String) :: String:
   let name = fresh(q)
   let types = String.join(for List (_ in operands): "!smt.bool", ", ")
-  emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ String.join(operands, ", ") ++ ") : (" ++ types
-            ++ ") -> !smt.bool", loc)
+  emit(q, fun (): (name ++ " = \"" ++ operation ++ "\"(" ++ String.join(operands, ", ") ++ ") : (" ++ types ++ ") -> !smt.bool"), loc)
   // smt.and is and, smt.or is or
   define(q, name, operation.substring(4, operation.length()), operands, 0)
   name
 
 fun assert(q :: Query, input :: String, loc :: String):
-  emit(q, "\"smt.assert\"(" ++ input ++ ") : (!smt.bool) -> ()", loc)
+  emit(q, fun (): ("\"smt.assert\"(" ++ input ++ ") : (!smt.bool) -> ()"), loc)
   q.commands := q.commands.add(Asserted(input))
 
 //==============================================================================
@@ -404,14 +409,16 @@ fun assert(q :: Query, input :: String, loc :: String):
 // last first. The names are tmp, tmp_0, tmp_1 and so on, going on from one
 // assertion to the next and passing over any a declared symbol has. Constants
 // and declared symbols are written where they are used.
-fun smtlib_of(q :: Query, index :: Int) :: String:
+fun smtlib_of(q :: Query, index :: Int, only_assertions :: Boolean) :: String:
   let out = rkt.#{open-output-string}()
   fun put(text :~ String): rkt.#{write-string}(text, out)
-  put("; solver scope " +& index +& "\n(set-logic QF_BV)\n")
+  unless only_assertions
+  | put("; solver scope " ++ digits(index) ++ "\n(set-logic QF_BV)\n")
   let taken :: Set:
-    for Set (command in q.commands):
-      keep_when command is_a Declared
-      (command :~ Declared).display
+    q.context.taken
+      || (for Set (command in q.commands):
+            keep_when command is_a Declared
+            (command :~ Declared).display)
   let mutable bound = 0
   fun next_name() :: String:
     let name = if bound == 0 | "tmp" | "tmp_" ++ digits(bound - 1)
@@ -420,7 +427,8 @@ fun smtlib_of(q :: Query, index :: Int) :: String:
   for (command in q.commands):
     match command
     | Declared(display, width):
-        put("(declare-const " ++ display ++ " (_ BitVec " +& width +& "))\n")
+        unless only_assertions
+        | put("(declare-const " ++ display ++ " (_ BitVec " ++ digits(width) ++ "))\n")
     | Asserted(root):
         let names = MutableMap()
         let expanded = MutableSet()
@@ -455,7 +463,8 @@ fun smtlib_of(q :: Query, index :: Int) :: String:
                 unless names.has_key(each) || q.leaves.has_key(each)
                 | stack := stack.add(each)
         put((if bindings == 0 | "" | "        ") ++ written(root) ++ String.make(bindings, Char")") ++ ")\n")
-  put("(check-sat)\n(reset)\n")
+  unless only_assertions
+  | put("(check-sat)\n(reset)\n")
   to_string(rkt.#{get-output-string}(out))
 
 //==============================================================================
@@ -607,9 +616,15 @@ fun check_function(q :: Query, spec :: Spec) :: Function:
   | q.error(loc, "SMT query: unsupported control flow: function @" ++ name ++ " has " +& blocks.length()
                    +& " blocks, but only straight-line single-block bodies are supported")
   let (input_types :: List.of(String), result_types :: List.of(String)):
-    match function.property("function_type")
-    | type :: String: generic.split_types(type)
-    | ~else: q.error(loc, "SMT query: function @" ++ name ++ " has no function type")
+    match q.context.types.get(name, #false)
+    | [inputs, results]: values(inputs, results)
+    | ~else:
+        match function.property("function_type")
+        | type :: String:
+            let (inputs, results) = generic.split_types(type)
+            q.context.types[name] := [inputs, results]
+            values(inputs, results)
+        | ~else: q.error(loc, "SMT query: function @" ++ name ++ " has no function type")
   when result_types.length() == 0
   | q.error(loc, "SMT query: function @" ++ name ++ " returns no value; at least one scalar result is needed")
   for (type in result_types):
@@ -1083,7 +1098,7 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
   let spec = read_spec(q)
   let function = check_function(q, spec)
   let loc = function.op.loc
-  emit(q, "\"smt.set_logic\"() <{logic = \"QF_BV\"}> : () -> ()", loc)
+  emit(q, fun (): ("\"smt.set_logic\"() <{logic = \"QF_BV\"}> : () -> ()"), loc)
   let (inputs :: List.of(Bv), returned :: List.of(Bv)):
     cond
     | context.lowered.has_key(spec.function):
@@ -1093,8 +1108,11 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
         let inputs :: List.of(Bv):
           for List (input in spec.inputs, width in prepared.widths, position in 0 ..):
             let name = "%" +& position
-            q.lines := q.lines.add(declaration(name, input.name, width, loc))
-            declared(q, name, input.name, width)
+            unless context.quiet
+            | q.lines := q.lines.add(declaration(name, input.name, width, loc))
+            // a scope's inputs are declared, under these names, already
+            unless context.scoped
+            | declared(q, name, input.name, width)
             Bv(name, width)
         q.lines := q.lines ++ prepared.body
         q.next := prepared.next
@@ -1106,7 +1124,7 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
         // line is set_logic, whose scope belongs to each query, and the
         // inputs are declared again under each query's own names.
         let widths :: List.of(Int) = for List (input in inputs): input.width
-        let body = q.lines.drop(1 + inputs.length())
+        let body = if context.quiet | [] | q.lines.drop(1 + inputs.length())
         context.lowered[spec.function] := Lowered(body, q.next, widths, returned, q.obligations, q.defs, q.leaves)
         values(inputs, returned)
   // Assert the preconditions and the negation of what is to be shown: the
@@ -1179,7 +1197,7 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
      "  }) : () -> ()" ++ suffix]
   // the solver's lines: its text is made only where the module is wanted
   values(["  \"smt.solver\"() ({"] ++ q.lines ++ check,
-         smtlib_of(q, index || 0))
+         smtlib_of(q, index || 0, context.scoped))
 
 fun module_of(solvers :: List.of(String), loc :: String) :: String:
   let suffix = if loc == "" | "" | " " ++ loc
@@ -1203,7 +1221,7 @@ fun module_read(text :: String) :: generic.Module:
 // module of its own, and the SMT-LIB the exporter writes for each solver. The
 // modules are functions that give their text: a caller that uses the SMT-LIB
 // alone never pays for it. The source operations are in none of them.
-fun lower(text :: String, manifest) :: values(Any, List, List):
+fun lower(text :: String, manifest, quiet :: Boolean = #false) :: values(Any, List, List):
   let module = module_read(text)
   fun malformed(message :: String):
     fail(module.loc, "malformed SMT query manifest: " ++ message)
@@ -1214,7 +1232,7 @@ fun lower(text :: String, manifest) :: values(Any, List, List):
   let version = as_integer(get(root, #'version))
   unless as_string(get(root, #'format)) == "pille-smt-query" && (version == 1 || version == 2)
   | malformed("expected format \"pille-smt-query\" version 1 or 2")
-  let context = Context(module, root, MutableMap(), #false, Set{})
+  let context = Context(module, root, MutableMap(), #false, Set{}, quiet)
   let built :: List:
     cond
     | version == 1:
@@ -1237,13 +1255,13 @@ fun lower(text :: String, manifest) :: values(Any, List, List):
          for List (entry :~ List in built): entry[1])
 
 // The same, from the manifest's JSON text.
-fun lower_text(text :: String, manifest :: ReadableString) :: values(Any, List, List):
+fun lower_text(text :: String, manifest :: ReadableString, quiet :: Boolean = #false) :: values(Any, List, List):
   let document:
     try:
       rjson.#{string->jsexpr}(to_string(manifest))
       ~catch exn :: Exn.Fail:
         fail(module_read(text).loc, "malformed SMT query manifest: " ++ exn.message)
-  lower(text, document)
+  lower(text, document, quiet)
 
 //==============================================================================
 // 5. A function's body, sent to a solver once
@@ -1265,7 +1283,7 @@ fun scope_begin(text :: String, manifest) :: values(Any, String, String):
     match manifest
     | root :: Map: root
     | ~else: fail(module.loc, "malformed SMT query manifest: expected an object")
-  let context = Context(module, root, MutableMap(), #false, Set{})
+  let context = Context(module, root, MutableMap(), #false, Set{}, #true)
   let (_, declarations) = build_query(context, root, #false)
   let function :: String = as_string(get(root, #'function))
   let prepared :: Lowered = context.lowered[function]
@@ -1298,10 +1316,13 @@ fun scope_begin(text :: String, manifest) :: values(Any, String, String):
     shared := shared ++ {name: global}
   context.lowered[function] := Lowered(prepared.body, prepared.next, prepared.widths, prepared.returned,
                                        prepared.obligations, prepared.defs, shared)
+  context.scoped := #true
+  context.taken := (for Set (input :~ Bv in read_spec(Query(context, root, #false, [], 0, MutableMap(), [])).inputs):
+                      input.name)
   values(context, declarations, to_string(rkt.#{get-output-string}(out)))
 
-// One question in a scope's context: the SMT-LIB of a query object (a version
-// 2 manifest's entry), its assertions written over the body's definitions.
+// One question in a scope's context: the assertions of a query object (a
+// version 2 manifest's entry), written over the body's definitions.
 fun scope_lower(context :: Context, specification) :: String:
   match specification
   | specification :: Map:

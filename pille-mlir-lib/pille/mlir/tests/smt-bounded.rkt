@@ -23,6 +23,10 @@
 (define arithmetic (dynamic-require (build-path fixtures "valid.rhm") 'arithmetic))
 
 (define chain (make_toolchain))
+
+;; Every question here is exported both ways, by the lowering itself and by
+;; mlir-translate, and the two texts must be the same.
+(smt_export_mode 'both)
 (define z3
   (or (getenv "PILLE_Z3")
       (find-executable-path "z3")
@@ -65,6 +69,17 @@
    "  func.func private @adds(%a0: i32) -> i32 {\n    %r = arith.addi %a0, %a0 : i32\n    return %r : i32\n  }\n"
    "  func.func @unmodeled(%a0: i32) -> i32 {\n    %r = func.call @adds(%a0) : (i32) -> i32\n    return %r : i32\n  }\n"))
 
+;; What `z3` prints for a script, run by hand.
+(define (by-hand script)
+  (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
+  (dynamic-wind
+    void
+    (lambda ()
+      (display-to-file script file #:exists 'truncate)
+      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (system* z3 (path->string file))))
+                                    "\n")))
+    (lambda () (delete-file file))))
+
 (test-case "a call is the called function's body, where the call stands"
   (check-eq? (status (query calls "thrice" (list a32) (smt_eq r32 (smt_binary 'add a32 (smt_const 3 32))))) 'unsat)
   (check-eq? (status (query calls "thrice" (list a32) (smt_eq r32 (smt_binary 'add a32 (smt_const 2 32))))) 'sat)
@@ -79,6 +94,26 @@
   (check-eq? (status nested) 'unsat)
   ;; nothing of the calls or the dialect is left in what the solver is given
   (check-false (regexp-match? #rx"func\\.|arithmetic\\.|arith\\." (module_ir (query_module nested)))))
+
+(test-case "the lowering's own SMT-LIB is the exporter's, whatever the inputs are called, and each mode gives one text"
+  ;; the exporter names what it binds tmp, tmp_0, tmp_1, ..., passing over a name an input has
+  (for ([names (in-list '(("tmp" "tmp_0") ("tmp_0" "tmp") ("tmp_1" "tmp_3") ("tmp_2" "b")))])
+    (define first (smt_input (car names) 32))
+    (define second (smt_input (cadr names) 32))
+    (define sum (smt_binary 'add (smt_binary 'add first (smt_const 2 32)) second))
+    (define asked (query calls "nested" (list first second) (smt_eq (smt_result_at 0 32) sum)
+                         (list (smt_cmp 'ult first (smt_const 9 32)))))
+    (check-eq? (status asked) 'unsat)
+    (check-equal? (by-hand (query_smtlib asked)) "unsat"))
+  ;; the three modes: the same text, and the module verified when it is asked for
+  (define (text-in mode)
+    (parameterize ([smt_export_mode mode])
+      (define asked (query calls "thrice" (list a32) (smt_eq r32 (smt_binary 'add a32 (smt_const 3 32)))))
+      (check-true (is_module (query_module asked)))
+      (query_smtlib asked)))
+  (check-equal? (text-in 'direct) (text-in 'tools))
+  (check-equal? (text-in 'direct) (text-in 'both))
+  (check-exn #rx"smt_export_mode" (lambda () (smt_export_mode 'neither))))
 
 (test-case "a call that cannot be inlined is refused, naming it"
   (define trivial (smt_eq r32 r32))
@@ -98,17 +133,6 @@
 
 ;;==============================================================================
 ;; B2. A scope on a session, and objectives asked of one
-
-;; What `z3` prints for a script, run by hand.
-(define (by-hand script)
-  (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
-  (dynamic-wind
-    void
-    (lambda ()
-      (display-to-file script file #:exists 'truncate)
-      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (system* z3 (path->string file))))
-                                    "\n")))
-    (lambda () (delete-file file))))
 
 (define (scope-status scope property) (solver_result_status (scope_check scope property)))
 (define (lt term value) (smt_cmp 'ult term (smt_const value 32)))

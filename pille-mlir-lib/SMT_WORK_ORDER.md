@@ -132,6 +132,12 @@ Slice B of the same order added, also on 2026-11-20:
   a scope is open.
 - `Session.check` takes an `ObjectiveQuery`.
 
+Since 2026-11-20 the lowering also writes the SMT-LIB itself, the text
+`mlir-translate --export-smtlib` gives for the module it lowers to, so a query
+is built without starting a tool. `PILLE_MLIR_SMT_EXPORT=tools` restores the
+verified and exported route, and `both` compares the two; the tests run in
+`both`.
+
 Still unsupported: control flow, recursion, regions, memory, floating point,
 `index`, quantifiers and attribute-dependent semantics.
 

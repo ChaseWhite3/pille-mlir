@@ -221,8 +221,9 @@ one place, and then ask questions of ordinary programs that use it:
 Rhombus operation declaration with an smt: clause
     -> expansion validates and records the schema and the semantic model
     -> IRDL registers the operation and verifies each instance's structure
-    -> dialect.smt_query lowers a function and a property to the SMT dialect
-    -> query.to_smtlib() exports SMT-LIB with the existing exporter
+    -> dialect.smt_query lowers a function and a property to the SMT dialect,
+       and writes the SMT-LIB MLIR's exporter gives for it
+    -> query.to_smtlib() is that text
     -> query.check() runs Z3: proved, counterexample, or inconclusive
 ```
 
@@ -274,8 +275,8 @@ expression forms are described in the
 The lowering is written in Rhombus (`pille/private/mlir/lower.rhm`) and is
 driven by a manifest generated from the `Dialect` value. It names no custom
 operation: a new or renamed operation, another namespace, or a different model
-needs no change to it. Nothing is built, and the only tools are `mlir-opt`,
-`mlir-translate` and, to answer a question, Z3.
+needs no change to it. Nothing is built. Building a query runs no tool at all;
+`mlir-opt` verifies a module once, and Z3 answers a question.
 
 There are four kinds of question, each over one function of a module:
 
@@ -394,7 +395,7 @@ without bars, backslashes or line breaks, distinct within a query.
 
 `dialect.smt_query(module, ~function: name, ~inputs: [...], ~property: formula,
 ~preconditions: [...])` returns an immutable `smt.Query`. Constructing one
-lowers, verifies and exports; it never runs a solver.
+lowers and exports; it never runs a solver.
 
 - The module must have been verified against this dialect's generated IRDL, as
   `dialect.module(...)` does. A module holds only MLIR and IRDL text, so the
@@ -411,15 +412,31 @@ lowers, verifies and exports; it never runs a solver.
 
 | Form | Result |
 | --- | --- |
-| `query.module` | The verified SMT dialect `mlir.Module`; it contains no custom operations |
+| `query.module` | The SMT dialect `mlir.Module`, verified by stock `mlir-opt` when it is first asked for; it contains no custom operations |
 | `query.to_smtlib()` | The SMT-LIB text; no solver runs |
 | `query.feasibility_smtlib()` | The question asked first where a precondition is named, else `#false` |
 | `query.function`, `.dialect`, `.inputs`, `.property`, `.assumptions` | What the query asks, as data and text |
 | `query.check(~solver: path = #false, ~timeout: seconds = 10, ~arguments: [])` | An `smt.Outcome` from running a standalone solver |
 
-The SMT module is produced by the lowering and then verified by stock
-`mlir-opt` with no IRDL definitions and no plugins, which is exactly what
-`mlir-translate` accepts. A residual custom operation would fail there.
+**How the SMT-LIB is made.** The lowering writes two things for a question:
+the SMT dialect module, and the SMT-LIB that `mlir-translate --export-smtlib`
+gives for that module, character for character. A query uses the second, so
+building one starts no process: under a millisecond, where verifying the
+module with `mlir-opt` and exporting it with `mlir-translate` takes about 28.
+`PILLE_MLIR_SMT_EXPORT` chooses for a process:
+
+| Value | What a query's SMT-LIB is |
+| --- | --- |
+| `direct` (the default) | The lowering's own text. The SMT module is verified only when `query.module` is asked for |
+| `tools` | The module is verified by stock `mlir-opt`, with no IRDL definitions and no plugins, and exported by `mlir-translate` |
+| `both` | Both are made, and it is an error where the two texts differ |
+
+The tests run in `both`, so every question they ask is made both ways and
+compared, and `smt-lowering.rkt` holds the lowering's own text to the
+exporter's for each of its 645 recorded questions. What `direct` gives up is
+that check on the question at hand: a fault in the lowering that stock MLIR
+would have refused is no longer refused when the query is built. Use `tools`
+or `both` where that matters more than the time.
 
 **Named preconditions.** A proof with preconditions is an implication. If the
 preconditions are inconsistent, no input satisfies them, the solver answers
@@ -529,12 +546,12 @@ session.close()
 | `scope.close()` | Ends it; the session takes other questions again |
 
 Each question is asked in a frame of its own that is popped again, so it leaves
-the scope as it found it. Each lowers its formula over the function anew; what
-is saved is the solver's process and what it has learned of the assertions it
-holds. Where several claims are known at once, `check_all` lowers them in one
-pass of the tools, so twelve cost about what one does; a timeout or failure
-ends the scope, and the claims after it are a `Failure` of kind
-`#'closed_session`. To deepen a bounded check, select a function that returns what each step
+the scope as it found it. Each lowers its formula over the function anew, and
+the solver keeps its process and what it has learned of the assertions it
+holds. `check_all` lowers several claims together, which matters where the
+tools export them (`PILLE_MLIR_SMT_EXPORT=tools`): one pass for all of them. A
+timeout or failure ends the scope, and the claims after it are a `Failure` of
+kind `#'closed_session`. To deepen a bounded check, select a function that returns what each step
 gives (a step function called once for each step), assert what holds
 throughout, and check one claim for each depth.
 

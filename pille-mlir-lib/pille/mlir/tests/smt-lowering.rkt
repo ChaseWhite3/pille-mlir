@@ -17,7 +17,9 @@
 ;; the plugin made of each was recorded: a refusal's message, or the digests of
 ;; the verified SMT module and of the SMT-LIB exported from it. This holds the
 ;; lowering to that record, request by request. It needs MLIR tools and no
-;; solver: equal SMT-LIB text is the same question.
+;; solver: equal SMT-LIB text is the same question. The SMT-LIB the lowering
+;; writes by itself, which is what a query uses, is held to the exporter's
+;; text for every request as well.
 (define-runtime-path recorded "fixtures/smt-lowering/plugin-recorded.json.gz")
 
 (define record
@@ -54,6 +56,8 @@
           ;; Verified with the stock tools alone, then exported by them.
           (define verified (parse_stock_module text module))
           (define smtlib (to_smtlib verified))
+          ;; and what the lowering writes itself, with no tool, is that text
+          (check-equal? (smt_lower_smtlib module (hash-ref request 'manifest)) smtlib (format "request ~a" index))
           (hasheq 'mlir_sha256 (digest (module_ir verified))
                   'smtlib_sha256 (digest smtlib)
                   'questions (length (regexp-match* #rx"[(]check-sat[)]" smtlib)))))

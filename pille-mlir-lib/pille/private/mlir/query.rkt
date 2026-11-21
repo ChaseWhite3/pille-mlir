@@ -21,9 +21,10 @@
          objective_session_check
          make_smt_scope scope_assert scope_push scope_pop scope_check scope_close scope_is_open
          scope_inputs scope_assumptions scope_goal_script scope_check_all
+         smt_export_mode
          render_term render_formula
          make_smt_query
-         smt_lower_text
+         smt_lower_text smt_lower_smtlib
          make_spec make_values_spec make_smt_batch make_smt_values_batch make_smt_values_query
          batch_queries batch_check batch_session_check query_session_check values_query_check
          values_query_inputs values_query_assumptions
@@ -106,11 +107,11 @@
 (struct scope (session dialect module function inputs declarations [frames #:mutable]))
 (define (scope-dialect-name value) (dialect_name (scope-dialect value)))
 
-(define (get-objective-module value) (objective-module value))
+(define (get-objective-module value) (force (objective-module value)))
 (define (get-query-module value) (force (query-module value)))
 (define (get-values-query-module value) (force (values-query-module value)))
 (define (get-batch-module value)
-  (if (batch? value) (batch-module value) (values-batch-module value)))
+  (force (if (batch? value) (batch-module value) (values-batch-module value))))
 (define (get-batch-smtlib value)
   (if (batch? value) (batch-smtlib value) (values-batch-smtlib value)))
 (define (batch_queries value)
@@ -446,19 +447,59 @@
 ;; The lowering is `lower.rhm`, over the module's generic form. It returns the
 ;; module of solvers and each solver as a module of its own.
 (define (run-lowering module manifest)
-  (define-values (text members)
+  (define-values (text members smtlib)
     (if (string? manifest)
         (lower_text (module_generic module) manifest)
         (lower (module_generic module) manifest)))
-  (values text (treelist->list members)))
+  (values text (treelist->list members) (string->immutable-string smtlib)))
+
+;; How a lowered question becomes SMT-LIB.
+;;   'direct  the lowering's own text. No tool runs; the lowered module is
+;;            verified by stock mlir-opt only when it is asked for.
+;;   'tools   the module is verified by stock mlir-opt and exported by
+;;            mlir-translate, as it was before the lowering wrote SMT-LIB.
+;;   'both    both, and an error where the two texts differ: the tests' mode.
+;; PILLE_MLIR_SMT_EXPORT sets it for a process; 'direct where nothing does.
+(define smt_export_mode
+  (make-parameter #f (lambda (mode)
+                       (unless (memq mode '(#f direct tools both))
+                         (raise-argument-error 'smt_export_mode "(or/c 'direct 'tools 'both #f)" mode))
+                       mode)))
+
+(define (export-mode)
+  (or (smt_export_mode)
+      (match (getenv "PILLE_MLIR_SMT_EXPORT")
+        [(or #f "" "direct") 'direct]
+        ["tools" 'tools]
+        ["both" 'both]
+        [other (builder-error 'smt_query "PILLE_MLIR_SMT_EXPORT is ~s; expected direct, tools or both" other)])))
+
+;; The verified SMT module, as a promise, and the SMT-LIB.
+(define (export-smtlib who lowered smtlib module)
+  (case (export-mode)
+    [(direct) (values (delay/sync (parse_stock_module lowered module)) smtlib)]
+    [else
+     (define verified (parse_stock_module lowered module))
+     (define text (to_smtlib verified))
+     (when (and (eq? (export-mode) 'both) (not (equal? text smtlib)))
+       (builder-error who "internal error: the lowering's SMT-LIB is not what mlir-translate exports\n--- lowering\n~a--- mlir-translate\n~a"
+                      smtlib text))
+     (values (delay/sync verified) text)]))
 
 ;; Lowers a manifest given as JSON text, bypassing the manifest this module
 ;; derives from a dialect: for tests of what the lowering itself checks.
 (define (smt_lower_text module manifest)
   (unless (is_module module) (raise-argument-error 'smt_lower_text "module" module))
   (unless (string? manifest) (raise-argument-error 'smt_lower_text "string?" manifest))
-  (define-values (text _members) (run-lowering module manifest))
+  (define-values (text _members _smtlib) (run-lowering module manifest))
   text)
+
+;; The same, giving the SMT-LIB the lowering itself writes: no tool runs.
+(define (smt_lower_smtlib module manifest)
+  (unless (is_module module) (raise-argument-error 'smt_lower_smtlib "module" module))
+  (unless (string? manifest) (raise-argument-error 'smt_lower_smtlib "string?" manifest))
+  (define-values (_text _members smtlib) (run-lowering module manifest))
+  smtlib)
 
 ;; The lowering asserts a query's preconditions first, one assertion each, in
 ;; order. Gives the script with each named precondition's assertion named
@@ -513,10 +554,10 @@
     (for/fold ([manifest (context-manifest dialect 1)])
               ([(key value) (in-hash (spec-manifest description))])
       (hash-set manifest key value)))
-  (define-values (lowered _members) (run-lowering module manifest))
-  (define verified (parse_stock_module lowered module))
+  (define-values (lowered _members direct) (run-lowering module manifest))
+  (define-values (verified text) (export-smtlib 'smt_query lowered direct module))
   (define-values (smtlib feasibility feasibility-body)
-    (named-scripts 'smt_query (to_smtlib verified) (spec-preconditions description)))
+    (named-scripts 'smt_query text (spec-preconditions description)))
   (unless (equal? (smtlib-declarations smtlib) (expected-inputs (spec-inputs description)))
     (builder-error 'smt_query "internal error: the exported SMT-LIB does not declare exactly the query's inputs:\n~a" smtlib))
   (query verified smtlib (dialect_name dialect) (spec-function description)
@@ -551,9 +592,8 @@
           (raise-argument-error who (if values? "ValuesSpec" "Spec") value))
         (spec-manifest value))))
   (define manifest (hash-set (context-manifest dialect 2) 'queries descriptions))
-  (define-values (lowered standalone) (run-lowering module manifest))
-  (define verified (parse_stock_module lowered module))
-  (define text (to_smtlib verified))
+  (define-values (lowered standalone direct) (run-lowering module manifest))
+  (define-values (verified text) (export-smtlib who lowered direct module))
   (define chunks (split-queries text))
   (unless (and (= (length specs) (length chunks)) (= (length specs) (length standalone)))
     (builder-error who "internal error: lowered/exported query count does not match the specs"))
@@ -609,10 +649,10 @@
                                                'objective_symbol symbol
                                                'signed signed?))])
       (hash-set manifest key value)))
-  (define-values (lowered _members) (run-lowering module manifest))
-  (define verified (parse_stock_module lowered module))
+  (define-values (lowered _members direct) (run-lowering module manifest))
+  (define-values (verified text) (export-smtlib 'smt_objective lowered direct module))
   (define-values (exported feasibility feasibility-body)
-    (named-scripts 'smt_objective (to_smtlib verified) (values-spec-preconditions description)))
+    (named-scripts 'smt_objective text (values-spec-preconditions description)))
   (define expected (append (expected-inputs declared) (list (cons symbol (term-width term)))))
   (unless (equal? (smtlib-declarations exported) expected)
     (builder-error 'smt_objective "internal error: the exported SMT-LIB does not declare exactly the inputs and the objective:\n~a" exported))
@@ -665,8 +705,9 @@
                                                            'defined_symbol)
                                               'mode "assume"))])
       (hash-set manifest key value)))
-  (define-values (lowered _members) (run-lowering module manifest))
-  (to_smtlib (parse_stock_module lowered module)))
+  (define-values (lowered _members direct) (run-lowering module manifest))
+  (define-values (_verified text) (export-smtlib 'smt_scope lowered direct module))
+  text)
 
 ;; Opens a scope on `session`: the function's inputs are declared in its
 ;; solver, once, and stay declared until the scope is closed.

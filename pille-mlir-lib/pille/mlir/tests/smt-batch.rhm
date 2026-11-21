@@ -5,7 +5,12 @@ import:
   pille/mlir/dialect
   pille/mlir/schema
   pille/mlir/smt
+  lib("pille/private/mlir/query.rkt") as lowering
   "../examples/bench-batch-support.rkt" as fixtures
+
+// Every question here is exported both ways, by the lowering itself and by
+// mlir-translate, and the two texts must be the same.
+lowering.smt_export_mode(#'both)
 
 // Public API integration: no skipped solver tests and no fake lowering. These
 // tests require MLIR and Z3, like smt-api.rhm.

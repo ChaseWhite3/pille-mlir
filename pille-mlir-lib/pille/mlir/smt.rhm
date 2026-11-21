@@ -248,12 +248,16 @@ class Failure(kind :: Symbol):
   override method describe() :: String:
     "solver failure (" ++ to_string(kind) ++ ") on " ++ subject() ++ ": " ++ diagnostics
 
-// A verified SMT dialect query: `preconditions && !property` over one function
-// under one dialect's declared model. Constructing a query never runs a solver.
+// An SMT dialect query: `preconditions && !property` over one function under
+// one dialect's declared model. Constructing a query never runs a solver, and
+// by default no tool: the lowering writes the SMT-LIB that MLIR's exporter
+// gives for the module (PILLE_MLIR_SMT_EXPORT: direct, tools or both; see
+// private/mlir/query.rkt `smt_export_mode`).
 veneer Query(this :: satisfying(query.is_query)):
   constructor ~error
 
-  // The verified SMT dialect module; it contains no custom operations.
+  // The SMT dialect module, verified by stock mlir-opt when first asked for;
+  // it contains no custom operations.
   property module :: mlir.Module:
     query.query_module(this)
 
@@ -577,9 +581,8 @@ veneer Scope(this :: satisfying(query.is_scope)):
                    assumptions, script, timeout)
 
   // Several claims, each answered as `check` answers one, in order. Their
-  // formulas are lowered together, in one pass of the MLIR tools, so asking
-  // twelve claims costs about what asking one does. `~timeout` bounds each
-  // question. A timeout or a failure ends the scope, and the claims after it
+  // formulas are lowered together, so the MLIR tools, where they export the
+  // SMT-LIB, run once for all of them. `~timeout` bounds each question. A timeout or a failure ends the scope, and the claims after it
   // are answered `Failure` of kind `#'closed_session`.
   method check_all(properties :: List.of(Formula), ~timeout: timeout :: PosReal = 10) :: List.of(Outcome):
     let held = assumptions

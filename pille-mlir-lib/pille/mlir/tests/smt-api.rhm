@@ -4,6 +4,11 @@ import:
   pille/mlir
   pille/mlir/dialect open
   pille/mlir/smt
+  lib("pille/private/mlir/query.rkt") as lowering
+
+// Every question here is exported both ways, by the lowering itself and by
+// mlir-translate, and the two texts must be the same.
+lowering.smt_export_mode(#'both)
 
 // Exercises the public static-language API end to end. Like the integration
 // tests, this requires MLIR and Z3 (z3 on PATH or PILLE_Z3).

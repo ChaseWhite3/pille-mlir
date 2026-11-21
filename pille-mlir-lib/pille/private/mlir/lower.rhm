@@ -120,7 +120,9 @@ class Lowered(body :: List.of(String),
               next :: Int,
               widths :: List.of(Int),
               returned :: List.of(Bv),
-              obligations :: List.of(String))
+              obligations :: List.of(String),
+              defs :: Map,
+              leaves :: Map)
 
 // One manifest, and so one model, over one module.
 class Context(module :: generic.Module,
@@ -169,7 +171,15 @@ class Query(context :: Context,
             mutable values :: MutableMap,
             mutable obligations :: List.of(String),
             // the functions being lowered, the selected one first: a call's way in
-            mutable calls :: List.of(String) = []):
+            mutable calls :: List.of(String) = [],
+            // The same question as SMT-LIB, kept beside the operations written
+            // into `lines`. `defs`: each operation's value, its name to
+            // [head, operand name, ...]. `leaves`: each constant's and each
+            // declared symbol's name to its SMT-LIB text. `commands`: the
+            // declarations and assertions, in order.
+            mutable defs :: Map = {},
+            mutable leaves :: Map = {},
+            mutable commands :: List = []):
   method prefix() :: String:
     match index
     | position :: Int: "SMT batch spec " +& position +& ": "
@@ -207,6 +217,24 @@ fun fresh(q :: Query) :: String:
   q.next := q.next + 1
   name
 
+fun define(q :: Query, name :: String, head :: String, operands :: List.of(String)):
+  q.defs := q.defs ++ {name: [head] ++ operands}
+
+fun declared(q :: Query, name :: String, display :: String, width :: Int):
+  q.leaves := q.leaves ++ {name: display}
+  q.commands := q.commands.add(["declare", display, width])
+
+// A constant as the exporter writes it: hexadecimal where the width is a
+// whole number of hexadecimal digits, binary otherwise.
+fun literal(value :: Int, width :: Int) :: String:
+  let residue = value mod (2 ** width)
+  let (base, digits, mark):
+    if width mod 4 == 0
+    | values(16, width div 4, "#x")
+    | values(2, width, "#b")
+  let text :: String = to_string(rkt.#{number->string}(residue, base))
+  mark ++ String.make(digits - text.length(), Char"0") ++ text
+
 fun declaration(name :: String, display :: String, width :: Int, loc :: String) :: String:
   let suffix = if loc == "" | "" | " " ++ loc
   "    " ++ name ++ " = \"smt.declare_fun\"() <{namePrefix = " ++ quoted(display) ++ "}> : () -> "
@@ -215,12 +243,14 @@ fun declaration(name :: String, display :: String, width :: Int, loc :: String) 
 fun declare_fun(q :: Query, display :: String, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   q.lines := q.lines.add(declaration(name, display, width, loc))
+  declared(q, name, display, width)
   Bv(name, width)
 
 fun bv_constant(q :: Query, value :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(width)
   emit(q, name ++ " = \"smt.bv.constant\"() <{value = #smt.bv<" +& value +& "> : " ++ type ++ "}> : () -> " ++ type, loc)
+  q.leaves := q.leaves ++ {name: literal(value, width)}
   Bv(name, width)
 
 fun bv_binary(q :: Query, operation :: String, lhs :: Bv, rhs :: Bv, loc :: String) :: Bv:
@@ -228,12 +258,15 @@ fun bv_binary(q :: Query, operation :: String, lhs :: Bv, rhs :: Bv, loc :: Stri
   let type = bv_type(lhs.width)
   emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
             ++ ") -> " ++ type, loc)
+  // smt.bv.add is bvadd, and so for each
+  define(q, name, "bv" ++ operation.substring(7, operation.length()), [lhs.name, rhs.name])
   Bv(name, lhs.width)
 
 fun bv_neg(q :: Query, input :: Bv, loc :: String) :: Bv:
   let name = fresh(q)
   let type = bv_type(input.width)
   emit(q, name ++ " = \"smt.bv.neg\"(" ++ input.name ++ ") : (" ++ type ++ ") -> " ++ type, loc)
+  define(q, name, "bvneg", [input.name])
   Bv(name, input.width)
 
 fun bv_eq(q :: Query, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
@@ -241,6 +274,7 @@ fun bv_eq(q :: Query, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
   let type = bv_type(lhs.width)
   emit(q, name ++ " = \"smt.eq\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") : (" ++ type ++ ", " ++ type
             ++ ") -> !smt.bool", loc)
+  define(q, name, "=", [lhs.name, rhs.name])
   name
 
 fun bv_ite(q :: Query, test :: String, chosen :: Bv, otherwise :: Bv, loc :: String) :: Bv:
@@ -248,16 +282,19 @@ fun bv_ite(q :: Query, test :: String, chosen :: Bv, otherwise :: Bv, loc :: Str
   let type = bv_type(chosen.width)
   emit(q, name ++ " = \"smt.ite\"(" ++ test ++ ", " ++ chosen.name ++ ", " ++ otherwise.name ++ ") : (!smt.bool, "
             ++ type ++ ", " ++ type ++ ") -> " ++ type, loc)
+  define(q, name, "ite", [test, chosen.name, otherwise.name])
   Bv(name, chosen.width)
 
 // smt.bv.cmp's predicates, by the names arith.cmpi and the builders give them.
 def cmp_predicates :: Map = {"slt": 0, "sle": 1, "sgt": 2, "sge": 3, "ult": 4, "ule": 5, "ugt": 6, "uge": 7}
+def cmp_heads :: List.of(String) = ["bvslt", "bvsle", "bvsgt", "bvsge", "bvult", "bvule", "bvugt", "bvuge"]
 
 fun bv_cmp(q :: Query, predicate :: Int, lhs :: Bv, rhs :: Bv, loc :: String) :: String:
   let name = fresh(q)
   let type = bv_type(lhs.width)
   emit(q, name ++ " = \"smt.bv.cmp\"(" ++ lhs.name ++ ", " ++ rhs.name ++ ") <{pred = " +& predicate +& " : i64}> : ("
             ++ type ++ ", " ++ type ++ ") -> !smt.bool", loc)
+  define(q, name, cmp_heads[predicate], [lhs.name, rhs.name])
   name
 
 // The dialect has no extend operation. A value is widened by `extra` bits with
@@ -269,12 +306,14 @@ fun bv_concat(q :: Query, high :: Bv, low :: Bv, loc :: String) :: Bv:
   let width = high.width + low.width
   emit(q, name ++ " = \"smt.bv.concat\"(" ++ high.name ++ ", " ++ low.name ++ ") : (" ++ bv_type(high.width) ++ ", "
             ++ bv_type(low.width) ++ ") -> " ++ bv_type(width), loc)
+  define(q, name, "concat", [high.name, low.name])
   Bv(name, width)
 
 fun bv_extract(q :: Query, input :: Bv, low_bit :: Int, width :: Int, loc :: String) :: Bv:
   let name = fresh(q)
   emit(q, name ++ " = \"smt.bv.extract\"(" ++ input.name ++ ") <{lowBit = " +& low_bit +& " : i32}> : ("
             ++ bv_type(input.width) ++ ") -> " ++ bv_type(width), loc)
+  define(q, name, "(_ extract " +& (low_bit + width - 1) +& " " +& low_bit +& ")", [input.name])
   Bv(name, width)
 
 fun bv_repeat(q :: Query, input :: Bv, count :: Int, loc :: String) :: Bv:
@@ -282,6 +321,7 @@ fun bv_repeat(q :: Query, input :: Bv, count :: Int, loc :: String) :: Bv:
   let width = input.width * count
   emit(q, name ++ " = \"smt.bv.repeat\"(" ++ input.name ++ ") : (" ++ bv_type(input.width) ++ ") -> "
             ++ bv_type(width), loc)
+  define(q, name, "(_ repeat " +& count +& ")", [input.name])
   Bv(name, width)
 
 fun widened(q :: Query, value :: Bv, extra :: Int, signed :: Boolean, loc :: String) :: Bv:
@@ -322,6 +362,7 @@ fun bit_bool(q :: Query, bit :: Bv, loc :: String) :: String:
 fun bool_not(q :: Query, input :: String, loc :: String) :: String:
   let name = fresh(q)
   emit(q, name ++ " = \"smt.not\"(" ++ input ++ ") : (!smt.bool) -> !smt.bool", loc)
+  define(q, name, "not", [input])
   name
 
 fun bool_connective(q :: Query, operation :: String, operands :: List.of(String), loc :: String) :: String:
@@ -329,10 +370,74 @@ fun bool_connective(q :: Query, operation :: String, operands :: List.of(String)
   let types = String.join(for List (_ in operands): "!smt.bool", ", ")
   emit(q, name ++ " = \"" ++ operation ++ "\"(" ++ String.join(operands, ", ") ++ ") : (" ++ types
             ++ ") -> !smt.bool", loc)
+  // smt.and is and, smt.or is or
+  define(q, name, operation.substring(4, operation.length()), operands)
   name
 
 fun assert(q :: Query, input :: String, loc :: String):
   emit(q, "\"smt.assert\"(" ++ input ++ ") : (!smt.bool) -> ()", loc)
+  q.commands := q.commands.add(["assert", input])
+
+//==============================================================================
+// The question as SMT-LIB
+
+// What MLIR's exporter (mlir-translate --export-smtlib) writes for the solver
+// `q.lines` holds, character for character: the tests hold the two together.
+// A declaration is written where it stands. An assertion binds each operation
+// its formula is made of with a `let`, once, in the order the exporter visits
+// them: an operation after its operands, and of an operation's operands the
+// last first. The names are tmp, tmp_0, tmp_1 and so on, going on from one
+// assertion to the next and passing over any a declared symbol has. Constants
+// and declared symbols are written where they are used.
+fun smtlib_of(q :: Query, index :: Int) :: String:
+  let out = rkt.#{open-output-string}()
+  fun put(text :: String): rkt.display(text, out)
+  put("; solver scope " +& index +& "\n(set-logic QF_BV)\n")
+  let taken :: Set:
+    for Set (command :: List in q.commands):
+      keep_when command[0] == "declare"
+      command[1]
+  let mutable bound = 0
+  fun next_name() :: String:
+    let name = if bound == 0 | "tmp" | "tmp_" +& (bound - 1)
+    bound := bound + 1
+    if name in taken | next_name() | name
+  for (command :: List in q.commands):
+    match command
+    | ["declare", display :: String, width :: Int]:
+        put("(declare-const " ++ display ++ " (_ BitVec " +& width +& "))\n")
+    | ["assert", root :: String]:
+        let names = MutableMap()
+        let expanded = MutableSet()
+        fun written(name :: String) :: String:
+          if q.leaves.has_key(name) | q.leaves[name] | names[name]
+        let mutable stack :: List.of(String) = [root]
+        let mutable bindings = 0
+        put("(assert ")
+        while stack.length() > 0:
+          let top = stack.last
+          cond
+          | names.has_key(top) || q.leaves.has_key(top):
+              stack := stack.drop_last(1)
+          | expanded.contains(top):
+              let [head :: String, operand :: String, ...] = q.defs[top]
+              let name = next_name()
+              put((if bindings == 0 | "" | "        ") ++ "(let ((" ++ name ++ " (" ++ head)
+              for (each in [operand, ...]):
+                put(" " ++ written(each))
+              put(")))\n")
+              bindings := bindings + 1
+              names[top] := name
+              stack := stack.drop_last(1)
+          | ~else:
+              expanded.add(top)
+              let [_, operand :: String, ...] = q.defs[top]
+              for (each in [operand, ...]):
+                unless names.has_key(each) || q.leaves.has_key(each)
+                | stack := stack.add(each)
+        put((if bindings == 0 | "" | "        ") ++ written(root) ++ String.make(bindings, Char")") ++ ")\n")
+  put("(check-sat)\n(reset)\n")
+  to_string(rkt.#{get-output-string}(out))
 
 //==============================================================================
 // 1. The manifest's description of one query, and the function it selects
@@ -954,7 +1059,7 @@ fun lower_block(q :: Query, function_name :: String, block :: generic.Block, fun
 
 def yield_line = "\"smt.yield\"() : () -> ()"
 
-fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :: String:
+fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :: values(String, String):
   let q = Query(context, specification, index, [], 0, MutableMap(), [])
   let spec = read_spec(q)
   let function = check_function(q, spec)
@@ -964,10 +1069,13 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
     cond
     | context.lowered.has_key(spec.function):
         let prepared :: Lowered = context.lowered[spec.function]
+        q.defs := prepared.defs
+        q.leaves := prepared.leaves
         let inputs :: List.of(Bv):
           for List (input in spec.inputs, width in prepared.widths, position in 0 ..):
             let name = "%" +& position
             q.lines := q.lines.add(declaration(name, input.name, width, loc))
+            declared(q, name, input.name, width)
             Bv(name, width)
         q.lines := q.lines ++ prepared.body
         q.next := prepared.next
@@ -980,7 +1088,7 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
         // inputs are declared again under each query's own names.
         let widths :: List.of(Int) = for List (input in inputs): input.width
         let body = q.lines.drop(1 + inputs.length())
-        context.lowered[spec.function] := Lowered(body, q.next, widths, returned, q.obligations)
+        context.lowered[spec.function] := Lowered(body, q.next, widths, returned, q.obligations, q.defs, q.leaves)
         values(inputs, returned)
   // Assert the preconditions and the negation of what is to be shown: the
   // property, and that every operation was used within what its model
@@ -1050,7 +1158,8 @@ fun build_query(context :: Context, specification :: Map, index :: maybe(Int)) :
      "    }) : () -> ()" ++ suffix,
      "    " ++ yield_line,
      "  }) : () -> ()" ++ suffix]
-  String.join(["  \"smt.solver\"() ({"] ++ q.lines ++ check, "\n")
+  values(String.join(["  \"smt.solver\"() ({"] ++ q.lines ++ check, "\n"),
+         smtlib_of(q, index || 0))
 
 fun module_of(solvers :: List.of(String), loc :: String) :: String:
   let suffix = if loc == "" | "" | " " ++ loc
@@ -1070,9 +1179,10 @@ fun module_read(text :: String) :: generic.Module:
 
 // Lowers every query of a manifest (version 1: the manifest is the one query;
 // version 2: its `queries`) over the module whose generic form is `text`.
-// Returns the module holding one solver per query, in order, and each solver
-// as a module of its own. The source operations are in neither.
-fun lower(text :: String, manifest) :: values(String, List.of(String)):
+// Returns the module holding one solver per query, in order, each solver as a
+// module of its own, and the SMT-LIB the exporter writes for the first of
+// those. The source operations are in none of them.
+fun lower(text :: String, manifest) :: values(String, List.of(String), String):
   let module = module_read(text)
   fun malformed(message :: String):
     fail(module.loc, "malformed SMT query manifest: " ++ message)
@@ -1084,22 +1194,28 @@ fun lower(text :: String, manifest) :: values(String, List.of(String)):
   unless as_string(get(root, #'format)) == "pille-smt-query" && (version == 1 || version == 2)
   | malformed("expected format \"pille-smt-query\" version 1 or 2")
   let context = Context(module, root, MutableMap(), #false, Set{})
-  let solvers :: List.of(String):
+  let built :: List:
     cond
-    | version == 1: [build_query(context, root, #false)]
+    | version == 1:
+        let (solver, smtlib) = build_query(context, root, #false)
+        [[solver, smtlib]]
     | ~else:
         match as_array(get(root, #'queries))
         | queries :: PairList:
             for List (entry in queries, index in 0 ..):
               match entry
-              | specification :: Map: build_query(context, specification, index)
+              | specification :: Map:
+                  let (solver, smtlib) = build_query(context, specification, index)
+                  [solver, smtlib]
               | ~else: fail(module.loc, "SMT batch spec " +& index +& ": expected a query object")
         | ~else: malformed("missing queries array")
+  let solvers :: List.of(String) = for List (entry :: List in built): entry[0]
   values(module_of(solvers, module.loc),
-         for List (solver in solvers): module_of([solver], module.loc))
+         for List (solver in solvers): module_of([solver], module.loc),
+         String.append(& for List (entry :: List in built): entry[1]))
 
 // The same, from the manifest's JSON text.
-fun lower_text(text :: String, manifest :: ReadableString) :: values(String, List.of(String)):
+fun lower_text(text :: String, manifest :: ReadableString) :: values(String, List.of(String), String):
   let document:
     try:
       rjson.#{string->jsexpr}(to_string(manifest))

@@ -24,6 +24,10 @@
 (define arithmetic (dynamic-require (build-path fixtures "valid.rhm") 'arithmetic))
 
 (define chain (make_toolchain))
+
+;; Every question here is exported both ways, by the lowering itself and by
+;; mlir-translate, and the two texts must be the same.
+(smt_export_mode 'both)
 (define z3
   (or (getenv "PILLE_Z3")
       (find-executable-path "z3")

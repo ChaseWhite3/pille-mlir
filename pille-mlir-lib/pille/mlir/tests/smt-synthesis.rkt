@@ -13,7 +13,8 @@
          "../../private/mlir/session.rkt"
          "../../private/mlir/solver.rkt"
          "../../private/mlir/tools.rkt"
-         "machine-fixture.rkt")
+         "machine-fixture.rkt"
+         "fakes.rkt")
 
 ;; What a query needs to ask about a small machine whose step is comparisons
 ;; and choices (CLOSER_TIMED_MACHINE_WORK_ORDER.md, Slice A): orderings,
@@ -252,14 +253,14 @@
 ;; A5. Named preconditions and unsat cores
 
 ;; What `z3` prints for a script, run by hand: no option but the file.
-(define (by-hand script [z3 z3])
+(define (by-hand script [z3 z3] . before)
   (define file (make-temporary-file "pille-smt-by-hand-~a.smt2"))
   (dynamic-wind
     void
     (lambda ()
       (display-to-file script file #:exists 'truncate)
       ;; (z3 on Windows ends its lines with a carriage return and a newline)
-      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (system* z3 (path->string file))))
+      (string-trim (regexp-replace* #rx"\r\n" (with-output-to-string (lambda () (apply system* z3 (append before (list (path->string file))))))
                                     "\n")))
     (lambda () (delete-file file))))
 
@@ -317,12 +318,12 @@
 ;; Z3, answering every (get-unsat-core) with all the names asserted, which is
 ;; a set that cannot hold together and more than is needed: the worst a solver
 ;; may answer. Given a file, it runs it; given -in, it passes lines both ways.
+;; It is a script run as `python SCRIPT` (fakes.rkt): this gives the script.
 (define (padding-solver directory)
-  (define executable (build-path directory "padding z3"))
-  (define python (or (find-executable-path "python3") (error 'smt-synthesis "python3 is required for the padding solver")))
+  (define executable (build-path directory "padding z3.py"))
   (call-with-output-file executable #:exists 'truncate
     (lambda (output)
-      (fprintf output "#!~a\nz3 = ~s\n" python (if (path? z3) (path->string z3) z3))
+      (fprintf output "z3 = ~s\n" (if (path? z3) (path->string z3) z3))
       (display #<<PY
 import re, subprocess, sys, threading
 named = re.compile(r':named\s+(\|[^|]*\||[^\s()]+)')
@@ -331,7 +332,7 @@ if sys.argv[-1] != '-in':
     out = subprocess.run([z3] + sys.argv[1:], capture_output=True, text=True).stdout.splitlines()
     if len(out) > 1 and out[0] == 'unsat':
         out[1] = '(' + ' '.join(named.findall(text)) + ')'
-    print('\n'.join(out))
+    print('\n'.join(out), flush=True)
     sys.exit(0)
 child = subprocess.Popen([z3] + sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 names, awaited = [], [False]
@@ -355,8 +356,7 @@ child.stdin.close()
 child.wait()
 PY
                output)))
-  (file-or-directory-permissions executable #o755)
-  executable)
+  (path->string executable))
 
 (test-case "a core is shrunk until no name can be left out, whatever the solver named"
   (define r32 (smt_result 32))
@@ -368,10 +368,10 @@ PY
   (define directory (make-temporary-file "pille padding solver ~a" 'directory))
   (define padded (padding-solver directory))
   ;; the padding solver does name all four
-  (check-equal? (by-hand (query_feasibility value) padded) "unsat\n(|escalation| |initial| |re-escalation| |claim|)")
+  (check-equal? (by-hand (query_feasibility value) python padded) "unsat\n(|escalation| |initial| |re-escalation| |claim|)")
   ;; and the answer names the two that conflict: standalone, on a session, in a batch
-  (check-equal? (core-of (query_check value padded)) '("claim" "initial"))
-  (define s (make_session padded))
+  (check-equal? (core-of (query_check value python 10 (list padded))) '("claim" "initial"))
+  (define s (make_session python (list padded)))
   (check-equal? (core-of (query_session_check s value)) '("claim" "initial"))
   ;; the session's solver is as it was after the further questions
   (check-eq? (solver_result_status (query_session_check s (query sums "sum" (list a32 b32) (smt_cmp 'uge r32 a32)))) 'sat)
@@ -380,26 +380,26 @@ PY
   (define batch
     (make_smt_batch arithmetic sums (list (make_spec "sum" (list a32 b32) (smt_eq r32 r32) (list aside early other late))
                                           (make_spec "sum" (list a32 b32) (smt_cmp 'uge r32 a32)))))
-  (check-equal? (core-of (car (treelist->list (batch_check batch padded)))) '("claim" "initial"))
+  (check-equal? (core-of (car (treelist->list (batch_check batch python 10 (list padded))))) '("claim" "initial"))
   ;; an objective's too
   (check-equal? (core-of (objective_check (make_smt_objective arithmetic sums "sum" (list a32 b32) a32 'minimize #f
                                                               (list aside early other late))
-                                          padded))
+                                          python 10 (list padded)))
                 '("claim" "initial"))
   ;; one name that conflicts with what has no name is the whole core, and where what has no name conflicts
   ;; alone, no name is blamed
   (define alone
     (query sums "sum" (list a32 b32) (smt_eq r32 r32) (list aside early other (smt_cmp 'ugt a32 (smt_const 20 32)))))
-  (check-equal? (core-of (query_check alone padded)) '("initial"))
+  (check-equal? (core-of (query_check alone python 10 (list padded))) '("initial"))
   (define unnamed
     (query sums "sum" (list a32 b32) (smt_eq r32 r32)
            (list aside (smt_cmp 'ult a32 (smt_const 10 32)) other (smt_cmp 'ugt a32 (smt_const 20 32)))))
-  (check-equal? (core-of (query_check unnamed padded)) '())
+  (check-equal? (core-of (query_check unnamed python 10 (list padded))) '())
   ;; two ways to conflict: one of them is left, whole
   (define twice
     (query sums "sum" (list a32 b32) (smt_eq r32 r32)
            (list early late aside (smt_named (smt_cmp 'ugt b32 (smt_const 200 32)) "auto-disconnect"))))
-  (check-not-false (member (core-of (query_check twice padded)) '(("claim" "initial") ("auto-disconnect" "escalation"))))
+  (check-not-false (member (core-of (query_check twice python 10 (list padded))) '(("claim" "initial") ("auto-disconnect" "escalation"))))
   (delete-directory/files directory #:must-exist? #f)
   ;; the pieces: a script without the named assertions not kept, everything else as it was
   (define script "(set-logic QF_BV)\n(declare-const a (_ BitVec 8))\n(assert (! (= a #x01) :named |one name|))\n(assert (= a a))\n(assert (! (= a #x02) :named two))\n(check-sat)\n(get-unsat-core)\n")

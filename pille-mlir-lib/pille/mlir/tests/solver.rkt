@@ -7,11 +7,13 @@
          racket/string
          racket/system
          "../../private/mlir/solver.rkt"
-         "../../private/mlir/temporary.rkt")
+         "../../private/mlir/temporary.rkt"
+         "fakes.rkt")
 
-;; Solver protocol tests. They use deterministic fake executables to reach
-;; every outcome, including ones a real solver produces only by accident. They
-;; need neither MLIR nor Z3; smt-integration.rkt covers the real solver.
+;; Solver protocol tests. They use deterministic fake solvers to reach every
+;; outcome, including ones a real solver produces only by accident. They need
+;; neither MLIR nor Z3; smt-integration.rkt covers the real solver. A fake is
+;; a Python script run as `python SCRIPT` (fakes.rkt).
 (define query
   #<<SMT
 ; solver scope 0
@@ -40,23 +42,28 @@ SMT
         (body root work)))
     (lambda () (delete-directory/files root #:must-exist? #f))))
 
-;; A fake solver is a shell script. $query is the script it was asked to run,
-;; which is always the last argument.
+;; A fake solver is a Python script. `query` is the text of the script it was
+;; asked to run, which is always the last argument, and `emit` prints the
+;; words of a line written as a shell would read it, one a line.
 (define (fake-solver root name . lines)
-  (define path (build-path root name))
-  (display-lines-to-file
-   (append '("#!/bin/sh" "for query; do :; done") lines)
-   path #:exists 'truncate)
-  (file-or-directory-permissions path #o755)
-  path)
+  (apply python-script (build-path root (string-append name ".py"))
+         (append '("import os, shlex, sys, time"
+                   "query = open(sys.argv[-1]).read() if os.path.exists(sys.argv[-1]) else ''"
+                   "def emit(line):"
+                   "    print('\\n'.join(shlex.split(line)), flush=True)")
+                 lines)))
 
 (define (answering root first-answer model-answer)
   (fake-solver root "fake z3"
-               "if grep -q get-value \"$query\"; then"
-               (format "  printf '%s\\n' ~a" model-answer)
-               "else"
-               (format "  printf '%s\\n' ~a" first-answer)
-               "fi"))
+               "if 'get-value' in query:"
+               (format "    emit(~s)" model-answer)
+               "else:"
+               (format "    emit(~s)" first-answer)))
+
+;; The solver run on a fake: the interpreter is the executable, and the fake
+;; the first of its arguments.
+(define (run-fake fake #:inputs [inputs inputs] [timeout 10] [arguments '()])
+  (run_solver query inputs python timeout (cons fake arguments)))
 
 (define (status result) (solver_result_status result))
 (define (diagnostics result) (solver_result_diagnostics result))
@@ -112,24 +119,23 @@ SMT
 (test-case "unsat, unknown, and sat with a model are distinguished"
   (call-with-scratch
    (lambda (root work)
-     (define unsat (run_solver query inputs (answering root "unsat" "unused")))
+     (define unsat (run-fake (answering root "unsat" "unused")))
      (check-eq? (status unsat) 'unsat)
      (check-equal? (solver_result_values unsat) '())
-     (define unknown (run_solver query inputs (answering root "unknown" "unused")))
+     (define unknown (run-fake (answering root "unknown" "unused")))
      (check-eq? (status unknown) 'unknown)
      (check-regexp-match #rx"unknown" (diagnostics unknown))
      (define sat
-       (run_solver query inputs
-                   (answering root "sat" "sat '((x #x00000001)' ' (flag #b0))'")))
+       (run-fake (answering root "sat" "sat '((x #x00000001)' ' (flag #b0))'")))
      (check-eq? (status sat) 'sat)
      (check-equal? (solver_result_values sat) '(("x" 32 1) ("flag" 1 0)))
      ;; The command names the executable that was run, for reproduction.
      (check-equal? (solver_result_command sat)
-                   (list (path->string (build-path root "fake z3")) "<query.smt2>"))
+                   (list python (path->string (build-path root "fake z3.py")) "<query.smt2>"))
      (check-true (>= (solver_result_seconds sat) 0))
      ;; A query without inputs needs no model and no second run.
      (define closed
-       (run_solver query '() (answering root "sat" "'unsat'")))
+       (run-fake (answering root "sat" "'unsat'") #:inputs '()))
      (check-eq? (status closed) 'sat)
      (check-equal? (solver_result_values closed) '())
      ;; Every run cleaned up after itself.
@@ -147,17 +153,18 @@ SMT
                     "unsat"                                 ; contradicts the first run
                     "sat '(error \"model is not available\")'"
                     "garbage")])
-       (define result (run_solver query inputs (answering root "sat" model)))
+       (define result (run-fake (answering root "sat" model)))
        (check-eq? (status result) 'bad-model model)
        (check-equal? (solver_result_values result) '() model)
        (check-regexp-match #rx"the solver answered sat, but" (diagnostics result) model))
      ;; A model run that fails outright is reported with its diagnostics.
      (define failing
        (fake-solver root "fails on model"
-                    "if grep -q get-value \"$query\"; then"
-                    "  echo 'model generation exploded' >&2; exit 3"
-                    "else echo sat; fi"))
-     (define result (run_solver query inputs failing))
+                    "if 'get-value' in query:"
+                    "    print('model generation exploded', file=sys.stderr)"
+                    "    sys.exit(3)"
+                    "print('sat')"))
+     (define result (run-fake failing))
      (check-eq? (status result) 'bad-model)
      (check-regexp-match #rx"failed with status 3" (diagnostics result))
      (check-regexp-match #rx"model generation exploded" (diagnostics result))
@@ -167,18 +174,18 @@ SMT
   (call-with-scratch
    (lambda (root work)
      (for ([output '("" "maybe" "sat unsat" "'(error \"line 1: bad\")' sat" "SAT" "unsat extra")])
-       (define result (run_solver query inputs (answering root output "unused")))
+       (define result (run-fake (answering root output "unused")))
        (check-eq? (status result) 'malformed-response output)
        (check-regexp-match #rx"expected exactly one of sat, unsat, or unknown"
                            (diagnostics result) output))
      ;; Z3 prints an error and still answers; the exit status must win.
      (define erroring
        (fake-solver root "errors"
-                    "echo '(error \"line 3 column 9: invalid declaration\")'"
-                    "echo unsat"
-                    "echo 'internal detail' >&2"
-                    "exit 1"))
-     (define result (run_solver query inputs erroring))
+                    "print('(error \"line 3 column 9: invalid declaration\")')"
+                    "print('unsat')"
+                    "print('internal detail', file=sys.stderr)"
+                    "sys.exit(1)"))
+     (define result (run-fake erroring))
      (check-eq? (status result) 'nonzero-exit)
      (check-regexp-match #rx"exited with status 1" (diagnostics result))
      (check-regexp-match #rx"invalid declaration" (diagnostics result))
@@ -198,8 +205,9 @@ SMT
        ;; when a working z3 might be on PATH.
        (putenv "PILLE_Z3" (path->string missing))
        (check-eq? (status (run_solver query inputs)) 'missing-executable)
-       (putenv "PILLE_Z3" (path->string (answering root "unsat" "unused")))
-       (check-eq? (status (run_solver query inputs)) 'unsat)
+       ;; (the interpreter is what the environment names; the fake follows as an argument)
+       (putenv "PILLE_Z3" python)
+       (check-eq? (status (run_solver query inputs #f 10 (list (answering root "unsat" "unused")))) 'unsat)
        ;; An explicit executable takes precedence over the environment.
        (check-eq? (status (run_solver query inputs missing)) 'missing-executable)
        (environment-variables-set! (current-environment-variables) #"PILLE_Z3" #f)
@@ -207,18 +215,17 @@ SMT
        (define absent (run_solver query inputs))
        (check-eq? (status absent) 'missing-executable)
        (check-regexp-match #rx"cannot find z3 on PATH" (diagnostics absent))
-       ;; z3 on PATH is the final fallback.
-       (copy-file (answering root "unsat" "unused") (build-path work "z3"))
-       (check-eq? (status (run_solver query inputs)) 'unsat)
-       (delete-file (build-path work "z3")))
+       ;; z3 on PATH is the final fallback. What is found there has to be a program of that name: the
+       ;; interpreter, under it. (Not on Windows, where a program cannot be run apart from its libraries.)
+       (unless windows?
+         (make-file-or-directory-link python (build-path work "z3"))
+         (check-eq? (status (run_solver query inputs #f 10 (list (answering root "unsat" "unused")))) 'unsat)
+         (delete-file (build-path work "z3"))))
      ;; A file that cannot be executed is not a solver either.
      (define inert (build-path root "inert"))
      (display-to-file "not a program" inert)
      (check-eq? (status (run_solver query inputs inert)) 'missing-executable)
      (check-equal? (directory-list work) '()))))
-
-(define (process-alive? pid)
-  (system* (find-executable-path "kill") "-0" (number->string pid)))
 
 (test-case "a timeout terminates the child process and removes temporary files"
   (call-with-scratch
@@ -226,26 +233,27 @@ SMT
      (define pid-file (build-path root "pid"))
      (define hanging
        (fake-solver root "hangs"
-                    (format "echo $$ > '~a'" (path->string pid-file))
-                    "exec sleep 600"))
+                    (format "open(~s, 'w').write(str(os.getpid()))" (path->string pid-file))
+                    "time.sleep(600)"))
      (define started (current-inexact-milliseconds))
-     (define result (run_solver query inputs hanging 0.5))
+     (define result (run-fake hanging 0.5))
      (define elapsed (- (current-inexact-milliseconds) started))
      (check-eq? (status result) 'timeout)
      (check-regexp-match #rx"did not answer within 0.5 seconds and was terminated"
                          (diagnostics result))
      (check-true (< elapsed 10000) "the wait is bounded")
      (define pid (string->number (string-trim (file->string pid-file))))
-     (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                    (process-alive? pid))
+     (check-false (process-alive? pid)
                   "the solver process was terminated")
      (check-equal? (directory-list work) '())
      ;; The bound covers both runs: a model that never arrives is a timeout,
      ;; not a counterexample.
      (define slow-model
        (fake-solver root "slow model"
-                    "if grep -q get-value \"$query\"; then exec sleep 600; else echo sat; fi"))
-     (define late (run_solver query inputs slow-model 0.5))
+                    "if 'get-value' in query:"
+                    "    time.sleep(600)"
+                    "print('sat')"))
+     (define late (run-fake slow-model 0.5))
      (check-eq? (status late) 'timeout)
      (check-regexp-match #rx"answered sat, but did not report a model" (diagnostics late))
      (check-equal? (solver_result_values late) '())
@@ -257,14 +265,14 @@ SMT
      (define pid-file (build-path root "pid"))
      (define hanging
        (fake-solver root "hangs"
-                    (format "echo $$ > '~a'" (path->string pid-file))
-                    "exec sleep 600"))
+                    (format "open(~s, 'w').write(str(os.getpid()))" (path->string pid-file))
+                    "time.sleep(600)"))
      (define base (current-temporary-base))
      (define worker
        (thread (lambda ()
                  (with-handlers ([exn:break? void])
                    (parameterize ([current-temporary-base base])
-                     (run_solver query inputs hanging 600))))))
+                     (run-fake hanging 600))))))
      (let wait ([attempts 0])
        (unless (or (file-exists? pid-file) (> attempts 200))
          (sleep 0.05)
@@ -273,8 +281,7 @@ SMT
      (define pid (string->number (string-trim (file->string pid-file))))
      (break-thread worker)
      (thread-wait worker)
-     (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                    (process-alive? pid))
+     (check-false (process-alive? pid)
                   "cancellation terminated the solver process")
      (check-equal? (directory-list work) '()))))
 
@@ -285,9 +292,9 @@ SMT
      (define log (build-path root "argument log"))
      (define recording
        (fake-solver root "records arguments"
-                    (format "printf '%s\\n' \"$@\" > '~a'" (path->string log))
-                    "echo unsat"))
-     (define result (run_solver query inputs recording 10 '("-v:0" "model.completion=true two words")))
+                    (format "open(~s, 'w').write(''.join(argument + '\\n' for argument in sys.argv[1:]))" (path->string log))
+                    "print('unsat')"))
+     (define result (run-fake recording 10 '("-v:0" "model.completion=true two words")))
      (check-eq? (status result) 'unsat)
      (define arguments (file->lines log))
      (check-equal? (take arguments 2) '("-v:0" "model.completion=true two words"))
@@ -296,7 +303,7 @@ SMT
      (check-regexp-match #rx"query\\.smt2$" (third arguments))
      (check-equal? (length arguments) 3)
      (check-equal? (solver_result_command result)
-                   (list (path->string recording) "-v:0" "model.completion=true two words"
+                   (list python recording "-v:0" "model.completion=true two words"
                          "<query.smt2>"))
      (check-equal? (directory-list work) '()))))
 

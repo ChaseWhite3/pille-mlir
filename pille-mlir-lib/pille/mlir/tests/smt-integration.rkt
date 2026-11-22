@@ -15,7 +15,8 @@
          "../../private/mlir/schema.rkt"
          "../../private/mlir/solver.rkt"
          "../../private/mlir/temporary.rkt"
-         "../../private/mlir/tools.rkt")
+         "../../private/mlir/tools.rkt"
+         "fakes.rkt")
 
 ;; End-to-end tests of declaration-driven SMT verification. They require real
 ;; MLIR tools and a real Z3. A missing tool is a test failure, not a skip.
@@ -823,10 +824,12 @@
     (lambda ()
       (define work (build-path root "temporary files"))
       (make-directory work)
-      ;; A solver reached through a path with spaces. The wrapper only forwards.
-      (define wrapper (build-path root "my z3"))
-      (display-lines-to-file (list "#!/bin/sh" (format "exec '~a' \"$@\"" z3)) wrapper)
-      (file-or-directory-permissions wrapper #o755)
+      ;; A solver reached through a path with spaces. The wrapper only forwards; it is a script run as
+      ;; `python SCRIPT` (fakes.rkt), so the path with the spaces is the first of the solver's arguments.
+      (define wrapper
+        (python-script (build-path root "my z3.py")
+                       "import subprocess, sys"
+                       (format "sys.exit(subprocess.call([~s] + sys.argv[1:]))" (if (path? z3) (path->string z3) z3))))
       (parameterize ([current-temporary-base work])
         (define module
           (program arithmetic
@@ -836,12 +839,12 @@
         (define proved
           (query arithmetic module "successor" (list x32)
                  (same r32 (smt_binary 'add x32 (literal 1 32)))))
-        (check-eq? (solver_result_status (query_check proved wrapper)) 'unsat)
+        (check-eq? (solver_result_status (query_check proved python 10 (list wrapper))) 'unsat)
         (define refuted
-          (query_check (query arithmetic module "successor" (list x32) (same r32 x32)) wrapper))
+          (query_check (query arithmetic module "successor" (list x32) (same r32 x32)) python 10 (list wrapper)))
         (check-eq? (solver_result_status refuted) 'sat)
         (check-equal? (map car (solver_result_values refuted)) '("x"))
-        (check-equal? (car (solver_result_command refuted)) (path->string wrapper))
+        (check-equal? (take (solver_result_command refuted) 2) (list python wrapper))
         ;; Failures clean up as well.
         (check-exn #rx"was not found"
                    (lambda () (query arithmetic module "missing" (list x32) (same r32 x32)))))

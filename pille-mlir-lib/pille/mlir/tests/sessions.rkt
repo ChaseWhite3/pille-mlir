@@ -8,7 +8,8 @@
          racket/system
          racket/treelist
          "../../private/mlir/session.rkt"
-         "../../private/mlir/solver.rkt")
+         "../../private/mlir/solver.rkt"
+         "fakes.rkt")
 
 (define expected '(("x" . 8)))
 (define (question assertion)
@@ -24,15 +25,15 @@
                 (lambda () (delete-directory/files directory #:must-exist? #f))))
 
 ;; Every fake speaks the same line-framed protocol as Z3. Startup, question,
-;; model, pop, and exit failures can therefore be tested independently.
+;; model, pop, and exit failures can therefore be tested independently. A fake
+;; is a script run as `python SCRIPT` (fakes.rkt): this gives the script, the
+;; first of the solver's arguments.
 (define (fake directory mode)
-  (define executable (build-path directory (string-append "fake solver " mode)))
+  (define executable (build-path directory (string-append "fake solver " mode ".py")))
   (define log (build-path directory "processes"))
   (define flag (build-path directory "already hung"))
-  (define python (or (find-executable-path "python3") (error 'test "python3 is required for protocol fixtures")))
   (call-with-output-file executable #:exists 'truncate
     (lambda (output)
-      (fprintf output "#!~a\n" python)
       (fprintf output "mode = ~s\nlog = ~s\nflag = ~s\n" mode (path->string log) (path->string flag))
       (display #<<PY
 import sys, os, time
@@ -76,8 +77,14 @@ for line in sys.stdin:
         sys.exit(9 if mode == 'bad-exit' else 0)
 PY
                output)))
-  (file-or-directory-permissions executable #o755)
-  executable)
+  (path->string executable))
+
+;; A session, and a batch, asked of a fake.
+(define (fake-session script . more) (make_session python (cons script more)))
+(define (fake-batch requests script [timeout 10] [overall #f])
+  (if overall
+      (run_solver_batch requests python timeout (list script) overall)
+      (run_solver_batch requests python timeout (list script))))
 
 (test-case "batch and session answers retain isolation and counterexample assignments"
   (define batch (run_solver_batch (list (list yes expected) (list no expected)
@@ -107,7 +114,7 @@ PY
   (scratch
    (lambda (directory)
      (define executable (fake directory "soft-timeout"))
-     (define results (run_solver_batch (make-list 4 (list yes expected)) executable))
+     (define results (fake-batch (make-list 4 (list yes expected)) executable))
      (check-equal? (map status results) '(timeout unsat unsat unsat))
      (check-equal? (length (file->lines (build-path directory "processes"))) 1)
      (check-regexp-match #rx"question 0" (solver_result_diagnostics (car results))))))
@@ -116,7 +123,7 @@ PY
   (scratch
    (lambda (directory)
      (define executable (fake directory "soft-timeout-late"))
-     (define results (run_solver_batch (make-list 3 (list yes expected)) executable 0.05 '() 2))
+     (define results (fake-batch (make-list 3 (list yes expected)) executable 0.05 2))
      (check-equal? (map status results) '(timeout unsat unsat))
      (check-equal? (length (file->lines (build-path directory "processes"))) 1))))
 
@@ -124,13 +131,12 @@ PY
   (scratch
    (lambda (directory)
      (define executable (fake directory "hang-once"))
-     (define s (make_session executable))
+     (define s (fake-session executable))
      (dynamic-wind void
        (lambda ()
          (check-eq? (status (session_check s yes expected 0.3)) 'timeout)
          (define old-pid (car (file->lines (build-path directory "processes"))))
-         (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                        (system* (find-executable-path "kill") "-0" old-pid)))
+         (check-false (process-alive? old-pid))
          (check-eq? (status (session_check s yes expected 3)) 'unsat)
          (check-equal? (length (file->lines (build-path directory "processes"))) 2))
        (lambda () (close_session s))))))
@@ -141,18 +147,18 @@ PY
      (for ([mode '("unknown" "malformed" "short" "nonzero" "bad-model")]
            [wanted '(unknown malformed-response malformed-response nonzero-exit bad-model)])
        (define executable (fake directory mode))
-       (define s (make_session executable))
+       (define s (fake-session executable))
        (dynamic-wind void
          (lambda () (check-eq? (status (session_check s no expected)) wanted mode))
          (lambda () (close_session s)))
-       (define batch (run_solver_batch (make-list 2 (list no expected)) executable))
+       (define batch (fake-batch (make-list 2 (list no expected)) executable))
        (check-eq? (status (car batch)) wanted mode)
        (check-regexp-match #rx"question 0" (solver_result_diagnostics (car batch)))
        (unless (eq? wanted 'unknown)
          (check-eq? (status (cadr batch)) 'malformed-response mode)
          (check-regexp-match #rx"question 1.*question 0" (solver_result_diagnostics (cadr batch)))))
      (define bad-exit (fake directory "bad-exit"))
-     (check-equal? (map status (run_solver_batch (make-list 2 (list yes expected)) bad-exit))
+     (check-equal? (map status (fake-batch (make-list 2 (list yes expected)) bad-exit))
                    '(nonzero-exit nonzero-exit)))))
 
 (test-case "missing executable never falls back and empty batches start no process"
@@ -171,8 +177,9 @@ PY
      (define executable (fake directory "hang-once"))
      (parameterize ([current-environment-variables
                      (environment-variables-copy (current-environment-variables))])
-       (putenv "PILLE_Z3" (path->string executable))
-       (define s (make_session #f '("argument containing spaces")))
+       ;; the solver the environment names is the interpreter; the fake and the argument follow it
+       (putenv "PILLE_Z3" python)
+       (define s (make_session #f (list executable "argument containing spaces")))
        (dynamic-wind void
          (lambda ()
            (check-eq? (status (session_check s yes expected 0.3)) 'timeout)
@@ -188,7 +195,7 @@ PY
    (lambda (directory)
      (define executable (fake directory "hang-once"))
      (define started (current-inexact-monotonic-milliseconds))
-     (define results (run_solver_batch (make-list 3 (list yes expected)) executable 10 '() 0.3))
+     (define results (fake-batch (make-list 3 (list yes expected)) executable 10 0.3))
      (check-true (< (- (current-inexact-monotonic-milliseconds) started) 3000))
      (check-equal? (map status results) '(timeout malformed-response malformed-response))
      (check-equal? (length (file->lines (build-path directory "processes"))) 1))))
@@ -198,20 +205,19 @@ PY
    (lambda (directory)
      (define executable (fake directory "unsat"))
      (define owner (make-custodian))
-     (define s (parameterize ([current-custodian owner]) (make_session executable)))
+     (define s (parameterize ([current-custodian owner]) (fake-session executable)))
      (check-eq? (status (session_check s yes expected)) 'unsat)
      (define pid (car (file->lines (build-path directory "processes"))))
      (custodian-shutdown-all owner)
      (check-eq? (status (session_check s yes expected)) 'closed-session)
-     (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                    (system* (find-executable-path "kill") "-0" pid)))
+     (check-false (process-alive? pid))
      (close_session s))))
 
 (test-case "writing a large question to a nonreading solver also obeys the deadline"
   (scratch
    (lambda (directory)
      (define executable (fake directory "no-read"))
-     (define s (make_session executable))
+     (define s (fake-session executable))
      (define large
        (string-append "(set-logic QF_BV)\n(declare-const x (_ BitVec 8))\n;"
                       (make-string (* 2 1024 1024) #\x)
@@ -220,15 +226,14 @@ PY
      (check-eq? (status (session_check s large expected 0.3)) 'timeout)
      (check-true (< (- (current-inexact-monotonic-milliseconds) started) 3000))
      (define pid (car (file->lines (build-path directory "processes"))))
-     (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                    (system* (find-executable-path "kill") "-0" pid)))
+     (check-false (process-alive? pid))
      (close_session s))))
 
 (test-case "cancelling a waiting question kills its child and permits a later restart"
   (scratch
    (lambda (directory)
      (define executable (fake directory "hang-once"))
-     (define s (make_session executable))
+     (define s (fake-session executable))
      (define worker
        (thread (lambda ()
                  (with-handlers ([exn:break? void])
@@ -240,8 +245,7 @@ PY
      (define pid (car (file->lines (build-path directory "processes"))))
      (break-thread worker)
      (thread-wait worker)
-     (check-false (parameterize ([current-error-port (open-output-nowhere)])
-                    (system* (find-executable-path "kill") "-0" pid)))
+     (check-false (process-alive? pid))
      (check-eq? (status (session_check s yes expected)) 'unsat)
      (close_session s))))
 

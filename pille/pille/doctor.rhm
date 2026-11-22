@@ -7,7 +7,8 @@ import:
 export:
   doctor
 
-// `raco pille doctor`: whether Pille can run here, each thing it needs checked in turn, and for each that is not
+// `raco pille doctor`, or where Pille is used from a checkout and not installed (through PLTCOLLECTS, so that raco
+// does not know the command), `racket -l pille/doctor.rhm`: whether Pille can run here, each thing it needs checked in turn, and for each that is not
 // right, what to do. The checks that need LLVM load what they test only when they run, so that a missing piece is
 // reported, not raised before anything is said.
 
@@ -46,7 +47,9 @@ fun check_jit():
 fun check_callbacks():
   if dynamic("pille/private/runtime/rhombus_interop.rhm", "callbacks_work")()
   | [#'ok, "Pille called a Rhombus function and got " +& dynamic("pille/private/doctor_jit.rhm", "callback_answer")()]
-  | [#'fail, "this Racket's FFI cannot call back into Rhombus"]
+  | // not what stops Pille: compiling and running Pille code, and all of pille/mlir, work without it
+    [#'missing, "this Racket's FFI cannot call back into Rhombus. Only Pille code that calls a Rhombus function "
+                  ++ "(the `rhombus` form) needs it; pille/mlir does not"]
 
 fun check_mlir():
   let chain = dynamic("pille/private/mlir/tools.rkt", "make_toolchain")()
@@ -60,7 +63,7 @@ fun check_z3():
 
 def llvm_fix = "install LLVM 23 with its shared library (on macOS, `brew install llvm@23`), or set PILLE_LLVM_PREFIX to one"
 def jit_fix = "see the message; `raco setup --pkgs pille-llvm-lib pille-lib pille-spmd-lib pille-mlir-lib pille` rebuilds stale compiled files"
-def callbacks_fix = "use Racket built from Git or a recent snapshot (the README suggests rackup): Pille tracks unreleased Racket and Rhombus changes"
+def callbacks_fix = "use Racket built from Git or a recent snapshot (the README suggests rackup); the 9.3 release is too old for it"
 def mlir_fix = "only pille/mlir needs them: install LLVM 23 with MLIR (Homebrew's llvm@23 has it), or set PILLE_MLIR_PREFIX"
 def z3_fix = "only pille/mlir's SMT queries need it: `brew install z3`, or set PILLE_Z3"
 
@@ -73,7 +76,7 @@ fun checks() :: List:
     | Check("JIT", #'skipped, "needs LLVM", #false)
   let callbacks:
     if jit.status == #'ok
-    | with_fix(run("Callbacks", #true, check_callbacks), callbacks_fix)
+    | with_fix(run("Callbacks", #false, check_callbacks), callbacks_fix)
     | Check("Callbacks", #'skipped, "needs the JIT", #false)
   let mlir = with_fix(run("MLIR tools", #false, check_mlir), mlir_fix)
   let z3 = with_fix(run("Z3", #false, check_z3), z3_fix)
@@ -86,7 +89,8 @@ fun mark(status :: Symbol) :: String:
   | #'missing: "missing "
   | #'skipped: "skipped "
 
-// Prints each check, and gives #true when everything Pille needs is there (the MLIR tools and Z3 are optional).
+// Prints each check, and gives #true when everything Pille needs is there (callbacks into Rhombus, the MLIR tools
+// and Z3 are each needed by a part of it only).
 fun doctor() :: Boolean:
   println("Pille: checking what it needs")
   let results = checks()
@@ -104,5 +108,5 @@ module main:
       unless doctor()
       | racket.exit(1)
   | ~else:
-      println("usage: raco pille doctor")
+      println("usage: raco pille doctor   (or, from a checkout: racket -l pille/doctor.rhm)")
       racket.exit(2)

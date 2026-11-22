@@ -694,8 +694,7 @@ From the repository root, without installing the package:
 ```sh
 export PLTCOLLECTS="$PWD/pille-mlir-lib:${PLTCOLLECTS:-}"
 export PILLE_MLIR_PREFIX=/path/to/llvm-23.1
-raco make pille-mlir-lib/pille/mlir.rhm pille-mlir-lib/pille/mlir/dialect.rhm \
-  pille-mlir-lib/pille/mlir/smt.rhm
+racket pille/pille/make.rkt -j 4 pille-mlir-lib/pille/mlir   # compile what changed
 raco test pille-mlir-lib/pille/mlir/tests
 racket pille-mlir-lib/pille/mlir/examples/add.rhm
 racket pille-mlir-lib/pille/mlir/examples/irdl.rhm
@@ -708,16 +707,31 @@ raco test pille/pille/tests/mlir.rhm
 
 Keep the trailing separator in `PLTCOLLECTS` so that Racket's default
 collections remain visible. With the package installed, the first line is
-unnecessary. Compiling first matters only for speed.
+unnecessary.
+
+Compile before testing: `raco test` does not rebuild a compiled file whose
+dependencies changed, and then fails to load it. `pille/pille/make.rkt` takes
+folders (and files) and compiles every `.rhm` and `.rkt` file under them, as
+`raco make` does for files named one by one; a few folder names stay within a
+command line's length where a folder's files, named, may not (on Windows `raco
+make` given too long a line builds nothing).
+
+Whether a machine has what Pille needs: `raco pille doctor` where the packages
+are installed, and from a checkout used through `PLTCOLLECTS`, where `raco`
+does not know the command, `racket -l pille/doctor.rhm` (with every package's
+folder in `PLTCOLLECTS`). Its "Callbacks" line is about Pille code that calls
+a Rhombus function; nothing in `pille/mlir` does, so that line may say
+"missing", as it does on the Racket 9.3 release, with everything here working.
 
 The suite is not divided into optional parts: a missing tool is a failure, not a
 skip. What each file needs:
 
 | Tests | Requirements |
 | --- | --- |
-| `schema.rkt`, `schema-api.rhm`, `semantics.rkt`, `smt-declarations.rkt`, `solver.rkt`, `sessions.rkt`, `toolchain.rkt` | None. They also assert that descriptors, expansion, and IRDL generation work with MLIR and Z3 absent |
+| `schema.rkt`, `schema-api.rhm`, `semantics.rkt`, `smt-declarations.rkt`, `toolchain.rkt` | None. They also assert that descriptors, expansion, and IRDL generation work with MLIR and Z3 absent |
+| `solver.rkt`, `sessions.rkt` | Python 3, which runs their stand-in solvers |
 | `api.rhm`, `declarations.rkt`, `integration.rkt`, `smt-lowering.rkt` | MLIR |
-| `smt-integration.rkt`, `smt-synthesis.rkt`, `smt-bounded.rkt`, `smt-api.rhm`, `smt-batch.rhm` | MLIR and Z3 |
+| `smt-integration.rkt`, `smt-synthesis.rkt`, `smt-bounded.rkt`, `smt-api.rhm`, `smt-batch.rhm` | MLIR and Z3; the first two also Python 3, for a solver wrapped in a script |
 
 The tests find the tools as the library does. They find Z3 through `PILLE_Z3`
 or `PATH`, and the `.rkt` files that need it stop with "these tests require Z3"
@@ -732,8 +746,11 @@ raco test pille-mlir-lib/pille/mlir/tests/smt-integration.rkt \
 ```
 
 `solver.rkt` and `sessions.rkt` cover the solver protocol with deterministic
-fake executables: every outcome, malformed and incomplete models, termination
-on timeout and interruption, cleanup, and paths containing spaces.
+stand-in solvers: every outcome, malformed and incomplete models, termination
+on timeout and interruption, cleanup, and paths containing spaces. A stand-in
+is a Python script run as `python SCRIPT`, the script the first of the
+solver's arguments (`tests/fakes.rkt`): nothing is marked executable, which
+Windows cannot do to a script, so the tests take one path on every platform.
 `smt-integration.rkt` repeats the semantic outcomes with real Z3, including a
 real `unknown` (under a resource limit) and a real timeout, and compares lowered
 expressions with an independent evaluator. `smt-lowering.rkt` holds the lowering

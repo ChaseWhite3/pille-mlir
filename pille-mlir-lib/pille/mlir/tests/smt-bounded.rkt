@@ -425,3 +425,78 @@
   (check-eq? (solver_result_status (query_check (make_smt_query choice before "before" (list a32) trivial '()) z3)) 'sat)
   (scope_close within)
   (close_session s))
+
+;;==============================================================================
+;; Objectives in a scope
+
+;; The value z3's own optimizer prints for a script: the first of its get-value.
+(define (optimizer-value script)
+  (define answer (by-hand script))
+  (define found (regexp-match #rx"^sat\n[(][(][^ ]+ #x([0-9a-f]+)[)]" answer))
+  (and found (string->number (cadr found) 16)))
+
+(test-case "an objective in a scope is the query's, and the solver's own optimizer's, and leaves the scope as it was"
+  (define s (make_session z3))
+  (define three (smt_const 3 32))
+  (define (asked scope term direction signed?)
+    (define entry (scope_objective scope term direction signed?))
+    (list (solver_result_status (treelist-ref entry 0)) (treelist-ref entry 3) (treelist-ref entry 1) (treelist-ref entry 2)))
+  (define (standalone term direction signed? preconditions)
+    (define value (make_smt_objective arithmetic calls "thrice" (list a32) term direction signed? preconditions))
+    (define answer (objective_check value z3))
+    (and (eq? (solver_result_status answer) 'optimum)
+         (objective_value value (caddr (car (solver_result_values answer))))))
+  (define scope (make_smt_scope s arithmetic calls "thrice" (list a32)))
+  (define no-wrap (smt_no_overflow 'add a32 three #f))
+  (scope_assert scope no-wrap)
+  ;; the greatest a for which a + 3 does not wrap, and the least and greatest result
+  (for ([term (list a32 r32 r32)] [direction '(maximize minimize maximize)]
+        [expected (list (- (expt 2 32) 4) 3 (sub1 (expt 2 32)))])
+    (define answer (asked scope term direction #f))
+    (check-equal? (take answer 2) (list 'optimum expected))
+    (check-equal? (cadr answer) (standalone term direction #f (list no-wrap)))
+    ;; the script is the question whole, and z3's (minimize) or (maximize) gives the same value
+    (check-equal? (optimizer-value (caddr answer)) expected))
+  (check-equal? (cadddr (asked scope a32 'maximize #f)) "greatest unsigned a")
+  ;; the scope is as it was: its assumptions, and a claim's answer
+  (check-equal? (treelist->list (scope_assumptions scope)) '("no_overflow(a + 0x00000003:bv32, unsigned)"))
+  (check-eq? (scope-status scope (smt_cmp 'uge r32 a32)) 'unsat)
+  ;; in a frame: signed, the least a + 3 with a >= -7 is -4 where the sum may not wrap as a signed number
+  (scope_push scope)
+  (scope_assert scope (smt_cmp 'sge a32 (smt_const -7 32)))
+  (scope_assert scope (smt_no_overflow 'add a32 three #t))
+  (define signed (asked scope r32 'minimize #t))
+  (check-equal? (take signed 2) '(optimum -4))
+  (check-equal? (cadddr signed) "least signed result")
+  ;; the model reaches it: a is -7
+  (define entry (scope_objective scope r32 'minimize #t))
+  (check-equal? (cdr (solver_result_values (treelist-ref entry 0))) (list (list "a" 32 (- (expt 2 32) 7))))
+  ;; what cannot hold has no best value
+  (scope_assert scope (lt a32 3))
+  (scope_assert scope (smt_cmp 'ugt a32 (smt_const 9 32)))
+  (check-equal? (take (asked scope a32 'minimize #f) 2) '(infeasible #f))
+  (scope_pop scope)
+  (check-equal? (take (asked scope a32 'maximize #f) 2) (list 'optimum (- (expt 2 32) 4)))
+  (scope_close scope)
+  (rejects #rx"the scope is closed" (lambda () (scope_objective scope a32 'maximize #f)))
+  ;; an input named as the objective's symbol would be
+  (define named (smt_input "pille_objective" 32))
+  (define other (make_smt_scope s arithmetic calls "thrice" (list named)))
+  (scope_assert other (lt named 9))
+  (check-equal? (take (asked other (smt_result 32) 'maximize #f) 2) '(optimum 11))
+  (scope_close other)
+  ;; the machine: the durations a scope's assumptions admit are those separate queries find
+  (define machine-scope (make_smt_scope s arithmetic sound "run" run-inputs))
+  (define assumptions
+    (append (list (is (car kinds) on))
+            (for/list ([kind (in-list (cdr kinds))]) (is kind time))
+            (for/list ([amount (in-list amounts)]) (lt amount 10))
+            (list (is (smt_result_at (sub1 depth) 32) escalation) (lt I 100000) (lt E 100000))))
+  (for ([assumption (in-list assumptions)]) (scope_assert machine-scope assumption))
+  (for* ([term (list I E)] [direction '(minimize maximize)])
+    (define value (make_smt_objective arithmetic sound "run" run-inputs term direction #f assumptions))
+    (define alone (objective_check value z3 60))
+    (check-equal? (cadr (asked machine-scope term direction #f))
+                  (objective_value value (caddr (car (solver_result_values alone))))))
+  (scope_close machine-scope)
+  (close_session s))

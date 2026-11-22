@@ -505,6 +505,21 @@ for an unbounded one. Without an overflow guard an optimum may be a value that
 only wrapping arithmetic reaches; that is what the function computes, and a
 guard among the preconditions excludes it.
 
+`check` does not run that script. Z3's optimizer searches a bitvector's value
+slowly, so the best value is found by halving: the assertions go to the solver
+once, and each step asks whether the symbol can be on the better side of the
+middle of what is left, at most one question for each bit. `~timeout` bounds
+the whole search. The script is still the question, and Z3's own optimizer,
+run on it by hand, prints the same value (the inputs it prints may be others
+that reach it).
+
+Where several best values are wanted over one function and the same
+preconditions, the least and the greatest of each duration, say, ask them in
+a [scope](#scopes): `scope.minimize(term)` and `scope.maximize(term)`. The
+function's body and the assumptions are the solver's already, and each
+objective adds only its own term. Six objectives over a 98-step function take
+about 1.3 s in one scope where six queries of their own take about 3.
+
 `objective.function`, `.dialect`, `.inputs`, `.assumptions`, `.direction`,
 `.is_signed`, `.describe()`, `.to_smtlib()` and `.feasibility_smtlib()` say what
 is asked.
@@ -553,6 +568,7 @@ session.close()
 | `scope.push()`, `scope.pop()` | A new frame of assumptions, and its end |
 | `scope.check(property, ~timeout: seconds = 10)` | `Proved` where the property holds for every input satisfying what is assumed, `Counterexample` with inputs for which it does not |
 | `scope.check_all([property, ...], ~timeout: seconds = 10)` | The same for each claim, in order, their formulas lowered together |
+| `scope.minimize(term, ~signed: #false, ~timeout: seconds = 10)`, `scope.maximize(...)` | `Optimum`: the least or greatest value the term can take under what is assumed, with inputs that reach it; `Infeasible`, with no core, where nothing satisfies what is assumed |
 | `scope.assumptions`, `.inputs`, `.function`, `.dialect`, `.is_open` | What the scope holds |
 | `scope.close()` | Ends it; the session takes other questions again |
 
@@ -666,7 +682,7 @@ In `pille/mlir/smt`:
 | `Query`, `ObjectiveQuery`, `ValuesQuery` | One question; `to_smtlib()`, and `check(...)` on the first two |
 | `Spec`, `Batch`, `ValuesSpec`, `ValuesBatch` | Several questions lowered together |
 | `Session` | One solver process: `check`, `values`, `close` |
-| `Scope` | Kept assumptions in a session: `assert`, `push`, `pop`, `check`, `check_all`, `close` |
+| `Scope` | Kept assumptions in a session: `assert`, `push`, `pop`, `check`, `check_all`, `minimize`, `maximize`, `close` |
 | `Outcome` | What every answer is: `Proved`, `Counterexample`, `Infeasible`, `Optimum`, `Unknown`, `Timeout`, `Failure` |
 | `Assignment(name, width, value)` | One input of a counterexample or an optimum |
 | `Values(values, complete)` | A result's possible values |

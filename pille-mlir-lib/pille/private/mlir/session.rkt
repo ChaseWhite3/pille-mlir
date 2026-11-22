@@ -11,7 +11,7 @@
 (provide make_session close_session session_check session_check_batch run_solver_batch
          session_values session_objective
          session_scope_open session_scope_assert session_scope_push session_scope_pop
-         session_scope_check session_scope_close session_scope_depth
+         session_scope_check session_scope_objective session_scope_close session_scope_depth
          (rename-out [session? is_session]
                      [enumeration? is_enumeration]
                      [enumeration-complete enumeration_complete])
@@ -537,6 +537,53 @@
 ;; after, as for a feasibility question. 'optimum with the values, 'infeasible
 ;; (with a core where `feasibility-body` is given and its named assertions
 ;; cannot hold together), or as any check's.
+;; The best value of `symbol`, the first of `expected`, over what the solver
+;; holds, which `first` says can be satisfied or not. The solver's own
+;; (minimize s) and (maximize s) search a bitvector's value slowly, so the
+;; value is found by halving: each step asks, in a frame of its own, whether
+;; the symbol can be on the better side of the middle of what is left. A model
+;; moves the bound to the value it has, which is at least that good; no model
+;; moves the other bound past the middle. At most one question for each bit of
+;; the symbol after the first. Gives the status and the best model.
+(define (best-value s direction symbol expected first deadline)
+  (define width (cdar expected))
+  (define minimize? (eq? direction 'minimize))
+  (define (found) (assignments s expected deadline))
+  (define (value-of model) (caddr (car model)))
+  (cond
+    [(not (eq? first 'sat)) (values first '())]
+    [else
+     (let loop ([low 0] [high (sub1 (expt 2 width))] [best (found)])
+       ;; the best value lies in [low, high], and `best` is a model at one end of it
+       (define-values (low* high*)
+         (if minimize? (values low (value-of best)) (values (value-of best) high)))
+       (cond
+         [(= low* high*) (values 'sat best)]
+         [else
+          (define middle (if minimize? (quotient (+ low* high*) 2) (quotient (+ low* high* 1) 2)))
+          (define step
+            (answer s (format "(push 1)\n(assert (~a ~a (_ bv~a ~a)))\n(check-sat)"
+                              (if minimize? "bvule" "bvuge") symbol middle width)
+                    deadline))
+          (case step
+            [(sat)
+             (define better (found))
+             (expect-empty s "(pop 1)" deadline)
+             (loop low* high* better)]
+            [(unsat)
+             (expect-empty s "(pop 1)" deadline)
+             ;; nothing on the better side of the middle: `best` stays, at its end
+             (if minimize?
+                 (loop (add1 middle) high* best)
+                 (loop low* (sub1 middle) best))]
+            [else (values step '())])]))]))
+
+(define (optimum-result result status model)
+  (case status
+    [(sat) (result 'optimum model)]
+    [(unsat) (result 'infeasible '())]
+    [else (result status '() "the solver did not find the objective's best value")]))
+
 (define (session_objective s body direction symbol expected [timeout 10] [feasibility-body #f])
   (check-session 'check s)
   (positive-seconds 'check timeout)
@@ -549,16 +596,33 @@
           (run-protected
            s timeout +inf.0
            (lambda (deadline result)
-             (define status
-               (answer s (string-append "(reset)\n" session-options "\n" (timeout-option timeout) body
-                                        (format "\n(~a ~a)\n(check-sat)" direction symbol))
+             ;; the assertions are given once; the whole search has the one bound
+             (define first
+               (answer s (string-append "(reset)\n" session-options "\n" (timeout-option timeout) body "\n(check-sat)")
                        deadline))
-             (define values (if (eq? status 'sat) (assignments s expected deadline) '()))
+             (define-values (status model) (best-value s direction symbol expected first deadline))
              (expect-empty s (string-append "(reset)\n" session-options) deadline)
-             (case status
-               [(sat) (result 'optimum values)]
-               [(unsat) (result 'infeasible '())]
-               [else (result status '() "the solver did not find the objective's best value")])))))))
+             (optimum-result result status model)))))))
+
+;; An objective under a scope's assertions. `setup` declares the symbol and
+;; asserts what binds it; it and the search are in a frame that is popped, so
+;; the scope is left as it was.
+(define (session_scope_objective s setup direction symbol expected [timeout 10])
+  (check-session 'check s)
+  (positive-seconds 'check timeout)
+  (call-with-semaphore (session-lock s)
+    (lambda ()
+      (in-scope 'check s)
+      (run-protected
+       s timeout +inf.0
+       (lambda (deadline result)
+         (define first
+           (answer s (string-append "(push 1)\n" (timeout-option timeout) setup "\n(check-sat)") deadline))
+         (define-values (status model) (best-value s direction symbol expected first deadline))
+         (finish-scope s deadline)
+         (define outcome (optimum-result result status model))
+         (when (eq? status 'timeout) (stop! s))
+         outcome)))))
 
 (define (run_solver_batch requests [executable #f] [timeout 10] [arguments '()] [overall-timeout #f])
   (define-values (inputs overall) (validated-batch requests timeout overall-timeout))

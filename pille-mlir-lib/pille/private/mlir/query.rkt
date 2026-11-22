@@ -20,7 +20,7 @@
          make_smt_objective objective_check objective_inputs objective_assumptions objective_value
          objective_session_check
          make_smt_scope scope_assert scope_push scope_pop scope_check scope_close scope_is_open
-         scope_inputs scope_assumptions scope_goal_script scope_check_all
+         scope_inputs scope_assumptions scope_goal_script scope_check_all scope_objective
          smt_export_mode
          render_term render_formula
          make_smt_query
@@ -872,6 +872,55 @@
                                   "the scope's solver ended on an earlier question of this list"
                                   '() 0.0))))))
 
+;; The least or greatest value of `term` over the inputs that satisfy what the
+;; scope assumes and keep every operation within its model's requirements.
+;; The body and the assumptions are the solver's already, so several
+;; objectives of one scope share them and what the solver has learned. Gives
+;; the answer ('optimum with the symbol's value first, 'infeasible, or as any
+;; check's), the question as one script, what was optimized, and the optimum
+;; as the number asked for (#f where there is none).
+(define (scope_objective value term direction signed? [timeout 10])
+  (unless (term? term) (raise-argument-error 'smt_objective "term" term))
+  (unless (memq direction '(minimize maximize))
+    (raise-argument-error 'smt_objective "'minimize or 'maximize" direction))
+  (unless (scope-context value)
+    (builder-error 'smt_objective
+                   "an objective in a scope needs the lowering's own SMT-LIB; PILLE_MLIR_SMT_EXPORT is tools"))
+  (define inputs (scope-inputs value))
+  (define width (term-width term))
+  (define symbol (fresh-name "pille_objective" inputs))
+  (define description (make_values_spec (scope-function value) inputs '()))
+  (define manifest
+    (hash-set* (hash-remove (hash-remove (spec-manifest description (list term)) 'result_symbol) 'defined_symbol)
+               'mode "objective"
+               'objective (term->manifest term inputs)
+               'objective_symbol symbol
+               'signed (and signed? #t)))
+  (define setup
+    (string-append (format "(declare-const ~a (_ BitVec ~a))\n" symbol width)
+                   (scope_lower (scope-context value) manifest)))
+  (define expected (cons (cons symbol width) (expected-inputs inputs)))
+  (define script
+    (string->immutable-string
+     (string-append "(set-option :produce-models true)\n(set-logic QF_BV)\n" (scope-declarations value)
+                    (apply string-append (map cdr (scope-assumed value)))
+                    setup
+                    (format "(~a ~a)\n(check-sat)\n(get-value (~a))\n" direction symbol
+                            (string-join (map car expected) " ")))))
+  (define answer (session_scope_objective (scope-session value) setup direction symbol expected timeout))
+  (define residue
+    (and (eq? (solver_result_status answer) 'optimum) (caddr (car (solver_result_values answer)))))
+  (treelist answer script
+            (string->immutable-string
+             (format "~a ~a ~a" (if (eq? direction 'minimize) "least" "greatest") (if signed? "signed" "unsigned")
+                     (render-term term)))
+            (and residue
+                 (cond
+                   [signed?
+                    (define plain (bitwise-xor residue (expt 2 (sub1 width))))
+                    (if (>= plain (expt 2 (sub1 width))) (- plain (expt 2 width)) plain)]
+                   [else residue]))))
+
 (define (scope_inputs value)
   (list->treelist (for/list ([input (in-list (scope-inputs value))])
                    (treelist (car (term-args input)) (term-width input)))))
@@ -882,23 +931,16 @@
 ;; 'optimum with the symbol's value first, then the inputs'; 'infeasible with a
 ;; core where named preconditions cannot hold together, or with none where no
 ;; input satisfies the preconditions and nothing says which.
+;; Standalone, an objective has a solver process of its own for as long as the
+;; search takes: the search is questions asked one after another
+;; (`session_objective`), which a script run once cannot be.
 (define (objective_check value [executable #f] [timeout 10] [arguments '()])
   (unless (objective? value) (raise-argument-error 'check "objective query" value))
-  (define core
-    (and (objective-feasibility value)
-         (run_solver_core (objective-feasibility value) executable timeout arguments)))
-  (cond
-    [(and core (not (memq (solver_result_status core) '(feasible unknown timeout)))) core]
-    [else
-     (define answer
-       (run_solver_objective (objective-smtlib value)
-                             (cons (cons (objective-symbol value) (term-width (objective-term value)))
-                                   (expected-inputs (objective-inputs value)))
-                             executable timeout arguments))
-     (if (eq? (solver_result_status answer) 'unsat)
-         (solver-result 'infeasible '() (solver_result_diagnostics answer) (solver_result_command answer)
-                        (solver_result_seconds answer))
-         answer)]))
+  (define session (make_session executable arguments))
+  (dynamic-wind
+    void
+    (lambda () (objective_session_check session value timeout))
+    (lambda () (close_session session))))
 
 ;; The optimum as the number asked for: the symbol's residue with the sign bit
 ;; flipped back and read as two's complement where the objective is signed.

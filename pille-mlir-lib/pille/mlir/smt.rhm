@@ -356,7 +356,9 @@ class Optimum(value :: Int, values :: List.of(Assignment)):
 // the verified SMT module, and Z3's `(minimize s)` or `(maximize s)` is
 // written into the exported SMT-LIB before its `(check-sat)`, with
 // `(get-value ...)` after it: `to_smtlib` is that text, and running it
-// through z3 prints the answer. Z3 orders bitvectors as unsigned numbers, so
+// through z3 prints the answer. `check` finds the same value another way,
+// since Z3's optimizer is slow on bitvectors: by halving, with one ordinary
+// question for each bit at most (private/mlir/session.rkt `best-value`). Z3 orders bitvectors as unsigned numbers, so
 // a signed objective's symbol is the term with its sign bit flipped, which
 // keeps the signed order; `Optimum.value` is flipped back.
 veneer ObjectiveQuery(this :: satisfying(query.is_objective)):
@@ -548,6 +550,8 @@ veneer Session(this :: satisfying(session.is_session)):
 //                           with inputs for which it does not
 //   scope.check_all([property, ...])
 //                           the same for each, their formulas lowered together
+//   scope.minimize(term), scope.maximize(term)
+//                           the least or greatest value a term can take there
 //   scope.close()           ends the scope; the session takes other questions
 //                           again
 //
@@ -566,6 +570,20 @@ veneer Session(this :: satisfying(session.is_session)):
 // says whether it is still there. An outcome's `smtlib` is the question as one
 // script, what the solver held and the goal, which gives the same answer run
 // by itself.
+fun scope_optimum(scope, entry :: List, timeout :: Real) :: Outcome:
+  let [answer, script :: String, described :: String, value] = entry
+  let function :: String = query.scope_function(scope)
+  let dialect :: String = query.scope_dialect(scope)
+  let assumptions :: List.of(String) = query.scope_assumptions(scope)
+  match solver.solver_result_status(answer)
+  | #'optimum:
+      let [_, [name, width, each], ...] = solver.solver_result_assignments(answer)
+      Optimum(function, dialect, described, assumptions, script,
+              solver.solver_result_diagnostics(answer), solver.solver_result_command_line(answer),
+              value, [Assignment(name, width, each), ...])
+  | ~else:
+      solver_outcome(answer, function, dialect, described, assumptions, script, timeout)
+
 veneer Scope(this :: satisfying(query.is_scope)):
   constructor ~error
 
@@ -586,6 +604,19 @@ veneer Scope(this :: satisfying(query.is_scope)):
     let script = query.scope_goal_script(this, property)
     solver_outcome(query.scope_check(this, property, timeout), function, dialect, property.describe(),
                    assumptions, script, timeout)
+
+  // The least or greatest value of a term over the inputs that satisfy what
+  // the scope assumes and keep every operation within its model's
+  // requirements: `Optimum`, or `Infeasible` (with no core) where no input
+  // does. The body and the assumptions are the solver's already, so the
+  // objectives of one scope share them: ask the least and the greatest of
+  // each of several terms here, not as queries of their own. A term is read
+  // as an unsigned number, or with `~signed: #true` as a two's complement one.
+  method minimize(term :: Term, ~signed: signed :: Boolean = #false, ~timeout: timeout :: PosReal = 10) :: Outcome:
+    scope_optimum(this, query.scope_objective(this, term, #'minimize, signed, timeout), timeout)
+
+  method maximize(term :: Term, ~signed: signed :: Boolean = #false, ~timeout: timeout :: PosReal = 10) :: Outcome:
+    scope_optimum(this, query.scope_objective(this, term, #'maximize, signed, timeout), timeout)
 
   // Several claims, each answered as `check` answers one, in order. Their
   // formulas are lowered together, so the MLIR tools, where they export the

@@ -44,3 +44,15 @@ fails. A few folder names stay within a command line's length.
 
 `pille-mlir-lib/README.md`, "Checks and examples". The repository's root `README.md` (human-written, not edited)
 would be the place to say `racket -l pille/doctor.rhm` and `racket pille/pille/make.rkt` for a checkout.
+
+## Addendum: the Windows run at 57f45b0, and a file that is no program
+
+Reported from Windows: the build script, the doctor and the stand-in solvers work (no `chmod` and no
+`sessions.rkt` failures; 3 of 3,571 fail, two of them that machine's missing `llvm-as.exe`). Objectives in a scope
+on the 98-step page, least and greatest of each duration: 1.8 to 3.4 s a duration, where it was about 20 s.
+
+The third failure was Pille's: a solver path naming a file that is not a program was reported `nonzero_exit` on
+Windows, not `missing_executable`. Windows gives every file the execute permission, which was the whole check.
+There, a file is now a solver if it is a program or a command script by its extension (`.exe`, `.com`, `.bat`,
+`.cmd`), or a program by its first two bytes (`private/mlir/solver.rkt` `windows-program?`). The rule is tested on
+every system; that it gives `missing_executable` on Windows is for the Windows run to confirm.

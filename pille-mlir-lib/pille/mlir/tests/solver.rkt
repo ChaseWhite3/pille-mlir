@@ -225,6 +225,23 @@ SMT
      (define inert (build-path root "inert"))
      (display-to-file "not a program" inert)
      (check-eq? (status (run_solver query inputs inert)) 'missing-executable)
+     (check-regexp-match #rx"is not an executable file" (diagnostics (run_solver query inputs inert)))
+     ;; Windows calls every file executable, so there what a file is decides: a program by its extension
+     ;; or its first two bytes, or a command script by its extension. (The rule is checked here on every
+     ;; system.)
+     (check-false (windows-program? inert))
+     (define program (build-path root "program"))
+     (display-to-file "MZ\x90 and the rest" program)
+     (check-true (windows-program? program))
+     ;; (an .exe may be an alias with nothing in it to read)
+     (define alias (build-path root "alias.EXE"))
+     (display-to-file "" alias)
+     (check-true (windows-program? alias))
+     (check-false (windows-program? (build-path root "missing.exe")))
+     (define script (build-path root "run.cmd"))
+     (display-to-file "@echo unsat" script)
+     (check-true (windows-program? script))
+     (check-false (windows-program? (build-path root "no such file")))
      (check-equal? (directory-list work) '()))))
 
 (test-case "a timeout terminates the child process and removes temporary files"

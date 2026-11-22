@@ -1,6 +1,7 @@
 #lang racket/base
 
-(require racket/file
+(require racket/path
+         racket/file
          racket/list
          racket/match
          racket/port
@@ -13,6 +14,7 @@
          model-script
          parse-model
          find-solver
+         windows-program?
          solver-result
          run_solver
          run_solver_core
@@ -182,6 +184,25 @@
   (if (eq? (system-type) 'windows) (string-append name ".exe") name))
 
 ;; An explicit or environment selection must work; it never falls back.
+;; Whether a file is one the system can run. Elsewhere that is its execute
+;; permission. Windows gives every file that permission, so there it is what
+;; the file is: a program or a command script by its extension (an .exe may
+;; be an alias with nothing in it to read), or a program by its first two
+;; bytes, MZ. Without this a file that is no program is found, started, and
+;; reported as a solver that exited with an error.
+(define (windows-program? path)
+  (define extension (path-get-extension path))
+  (or (and extension
+           (member (string-downcase (bytes->string/utf-8 extension #\?)) '(".exe" ".com" ".bat" ".cmd"))
+           (file-exists? path))
+      (with-handlers ([exn:fail? (lambda (_) #f)])
+        (equal? (call-with-input-file path (lambda (in) (read-bytes 2 in))) #"MZ"))))
+
+(define (runnable? path)
+  (if (eq? (system-type) 'windows)
+      (windows-program? path)
+      (and (memq 'execute (file-or-directory-permissions path)) #t)))
+
 (define (find-solver explicit)
   (define selected (or explicit (getenv "PILLE_Z3")))
   (cond
@@ -190,7 +211,7 @@
      (cond
        [(not (file-exists? path))
         (values #f (format "cannot find the solver executable ~a" path))]
-       [(not (memq 'execute (file-or-directory-permissions path)))
+       [(not (runnable? path))
         (values #f (format "the solver ~a is not an executable file" path))]
        [else (values path #f)])]
     [(find-executable-path (executable-name "z3")) => (lambda (path) (values path #f))]
